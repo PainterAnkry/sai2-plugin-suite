@@ -497,6 +497,21 @@ ImageBuffer BridgeCore::RenderEffect(int winIdx, float scale, bool recordUndo,
         host_->SetParam("liquify.cy", strokeY_);
         host_->SetParam("liquify.dirX", pendingZeroDir_ ? 0.0f : pendingDirX_);
         host_->SetParam("liquify.dirY", pendingZeroDir_ ? 0.0f : pendingDirY_);
+        // 笔级撤销协议：本笔开始前先让插件快照置换场；撤销时回退一笔
+        if (strokeBeginPending_) {
+            host_->SetParam("liquify.begin", 1);
+            strokeBeginPending_ = false;
+            const std::string& sid = sessionIds_[static_cast<size_t>(wi)];
+            if (liquifyStrokeSession_ != sid) {
+                liquifyStrokeSession_ = sid;
+                liquifyStrokeCount_ = 0;
+            }
+            ++liquifyStrokeCount_;
+        }
+        if (liquifyUndoPending_) {
+            host_->SetParam("liquify.undo", 1);
+            liquifyUndoPending_ = false;
+        }
     }
 
     host_->SetRecordingUndo(recordUndo);
@@ -702,6 +717,8 @@ void BridgeCore::StrokeBegin(float nx, float ny, int winIdx) {
     pendingDirX_ = 0.0f;
     pendingDirY_ = 0.0f;
     pendingZeroDir_ = true;
+    // 通知插件在应用本笔前快照置换场（供 Ctrl+Z 撤销上一笔）
+    strokeBeginPending_ = true;
     // 单击也算一笔（膨胀/收缩/旋转不需要拖动方向）
     lastStrokeRenderAt_ = Clock::now();
     UpdatePreview(w);
@@ -761,6 +778,28 @@ void BridgeCore::StrokeMove(float nx, float ny, int winIdx) {
 void BridgeCore::StrokeEnd(int winIdx) {
     (void)winIdx;
     strokeActive_ = false;
+}
+
+bool BridgeCore::UndoStroke(int winIdx) {
+    const int w = Norm(winIdx);
+    if (w != kWinLiquify) return false; // 非液化窗口走应用级撤销
+    UiPreview* win = Win(w);
+    const int eidx = win->effectIndex >= 0 ? win->effectIndex : current_;
+    if (eidx < 0 || eidx >= static_cast<int>(effects_.size()) ||
+        effects_[static_cast<size_t>(eidx)].group != kGroupLiquify)
+        return false;
+    if (liquifyStrokeSession_ != sessionIds_[static_cast<size_t>(w)] ||
+        liquifyStrokeCount_ <= 0) {
+        status_ = "没有可撤销的笔画";
+        return true;
+    }
+    --liquifyStrokeCount_;
+    liquifyUndoPending_ = true;
+    UpdatePreview(w);
+    status_ = "已撤销上一笔";
+    Log("liquify stroke undo, remaining=" +
+        std::to_string(liquifyStrokeCount_));
+    return true;
 }
 
 // ---------------------------------------------------------------------------

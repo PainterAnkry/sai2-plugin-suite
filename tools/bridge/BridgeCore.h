@@ -146,6 +146,9 @@ public:
     void StrokeBegin(float nx, float ny, int winIdx = kWinLiquify);
     void StrokeMove(float nx, float ny, int winIdx = kWinLiquify);
     void StrokeEnd(int winIdx = kWinLiquify);
+    // 撤销液化窗口里的上一笔（插件侧置换场快照回退）。
+    // 仅对液化窗口生效（返回 false = 非液化窗口，调用方可回退到 Undo）。
+    bool UndoStroke(int winIdx = kWinLiquify);
     bool StrokeActive() const { return strokeActive_; }
     // 供界面绘制笔刷指示圈（归一化坐标 + 半径比例）
     float StrokeX() const { return strokeX_; }
@@ -244,6 +247,11 @@ private:
     float strokeDX_ = 0.0f, strokeDY_ = 0.0f;
     float pendingDirX_ = 0.0f, pendingDirY_ = 0.0f;
     bool pendingZeroDir_ = true;
+    // 笔级撤销：下一帧液化渲染时告知插件「本笔开始（先快照）/ 回退一笔」
+    bool strokeBeginPending_ = false;
+    bool liquifyUndoPending_ = false;
+    int liquifyStrokeCount_ = 0;          // 当前会话内已开始的笔画数
+    std::string liquifyStrokeSession_;    // 笔画计数所属的会话
     // 拖笔节流：上次预览渲染的时刻（鼠标移动频率远高于屏幕刷新率时跳帧）
     std::chrono::steady_clock::time_point lastStrokeRenderAt_{};
 

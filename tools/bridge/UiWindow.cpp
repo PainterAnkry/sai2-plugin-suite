@@ -441,7 +441,8 @@ void RunCmd(UiWindow& win, int cmd) {
         DoApply(win);
         break;
     case CMD_UNDO:
-        DoUndo(win);
+        // 液化窗口：撤销上一笔；其他窗口：撤销上一次"应用"
+        if (!S().core->UndoStroke(win.id)) DoUndo(win);
         break;
     case CMD_RESET:
         DoReset(win);

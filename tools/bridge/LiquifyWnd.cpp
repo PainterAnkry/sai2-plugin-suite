@@ -161,40 +161,16 @@ void DrawLiquifyPanel(HDC dc, UiWindow& win, const UiLayout& L,
         y += 56;
     }
 
-    // 参数之下：笔刷预览圈 + 笔刷尺寸说明。
-    // 注意给 DrawPanelFrame 的提示文字留出底部空间（提示占最下面 ~46px），
-    // 否则两者会叠字。
+    // 参数之下：只保留笔刷尺寸文字。
+    // （原来的笔刷大小示意圈已去掉 —— 大图上圈的半径会超出面板宽度，画出框外。）
     {
         const float rnorm = s.core->StrokeRadiusNorm();
-        const int availTop = y + Scale(12);
-        const int availBottom = L.panel.bottom - Scale(58);
-        const int cx = L.panel.left + RectW(L.panel) / 2;
-        const int cy = (availTop + availBottom) / 2;
-        if (availBottom - availTop > Scale(40)) {
-            // 圈的显示半径按"图像最短边的一半"归一化，最大不超过可用高度一半
-            const ImageBuffer& img =
-                s.core->DisplayImage(BridgeCore::kWinLiquify);
-            const int minSide = img.IsValid()
-                                    ? std::min(img.Width(), img.Height())
-                                    : 600;
-            const int maxR = std::max(Scale(8), (availBottom - availTop) / 2 - Scale(10));
-            const int r = std::max(
-                Scale(4), std::min(maxR, static_cast<int>(rnorm * minSide * 0.5f)));
-            HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
-            HGDIOBJ op = SelectObject(dc, pen);
-            HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
-            SelectObject(dc, ob);
-            SelectObject(dc, op);
-            DeleteObject(pen);
-
-            wchar_t buf[96];
-            swprintf(buf, 96, L"笔刷 半径 %.1f%%（图像最短边）", rnorm * 100.0f);
-            RECT cr = {L.panel.left + 10, availBottom - Scale(18),
-                       L.panel.right - 10, availBottom};
-            TextC(dc, buf, cr, C_DIM, s.fSmall,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        }
+        wchar_t buf[96];
+        swprintf(buf, 96, L"笔刷 半径 %.1f%%（图像最短边）", rnorm * 100.0f);
+        RECT cr = {L.panel.left + 10, L.panel.bottom - Scale(76),
+                   L.panel.right - 10, L.panel.bottom - Scale(58)};
+        TextC(dc, buf, cr, C_DIM, s.fSmall,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
     SyncParamEdits(win, rowY, L.panel);
@@ -262,7 +238,8 @@ bool LiquifyMsg(UiWindow& win, UINT msg, WPARAM wp, LPARAM lp) {
         return true;
     case 'Z':
         if (GetKeyState(VK_CONTROL) & 0x8000) {
-            DoUndo(win);
+            // 液化窗口里 Ctrl+Z = 撤销上一笔（置换场快照回退）
+            S().core->UndoStroke(BridgeCore::kWinLiquify);
             return true;
         }
         break;

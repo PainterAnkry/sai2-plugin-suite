@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -40,7 +41,7 @@ public:
         PluginInfo info;
         info.id = "com.sai2.liquify";
         info.name = "Liquify";
-        info.version = "1.1.0";
+        info.version = "1.2.0";
         info.author = "SAI2 Plugin Team";
         info.type = "image-effect";
         info.description =
@@ -74,6 +75,29 @@ public:
         }
 
         BeginSessionIfNeeded(*canvas);
+
+        // 笔级撤销协议（宿主 Ctrl+Z / 撤销按钮）：
+        //   liquify.undo = 1 → 置换场回退到上一笔开始前的快照并重渲染
+        //   liquify.begin = 1 → 本笔应用前先快照当前置换场
+        // 撤销时不产生新的形变，直接渲染回退后的场。
+        if (GetParamBool(*host_, "liquify.undo", false)) {
+            if (!undoStack_.empty()) {
+                field_ = undoStack_.back();
+                undoStack_.pop_back();
+            }
+            liquify::RenderLiquify(original_, field_, *canvas,
+                                   host_->GetSelection());
+            host_->Log(LogLevel::Info,
+                       ("Liquify stroke undo, stack=" +
+                        std::to_string(undoStack_.size()))
+                           .c_str());
+            host_->RefreshCanvas();
+            return true;
+        }
+        if (GetParamBool(*host_, "liquify.begin", false)) {
+            undoStack_.push_back(field_);
+            if (undoStack_.size() > 30) undoStack_.erase(undoStack_.begin());
+        }
 
         host_->BeginUndoGroup("Liquify");
         host_->SnapshotForUndo("Liquify");
@@ -156,6 +180,7 @@ private:
         original_ = canvas.Clone();
         field_ = liquify::DisplacementField(original_.Width(),
                                             original_.Height());
+        undoStack_.clear();
         session_ = session;
         host_->Log(LogLevel::Info,
                    ("Liquify session started: " + session).c_str());
@@ -188,6 +213,7 @@ private:
     IHostContext* host_ = nullptr;
     ImageBuffer original_;            // 会话原始图像（画质无损的基准）
     liquify::DisplacementField field_; // 跨笔累积的置换场
+    std::vector<liquify::DisplacementField> undoStack_; // 笔级撤销快照（最多 30）
     std::string session_;
 };
 
