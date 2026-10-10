@@ -1,22 +1,5 @@
 # SAI2 Plugin System
 
-SAI2 插件源与插件系统实现（依据《SAI2_插件源与插件系统_Coding_Agent规划》规格书）。
-
-**当前进度：Phase 1～6 + MVP 后增强（GPU 加速 / 签名 / 液化引擎 / 缩略图墙）+ 接入 SAI2（伴随宿主）+ SAI2 注入路线（图层识别）+ 多窗口功能界面（一功能一窗口）全部完成并验证（14/14 测试套件通过，伴随宿主自检 58/58 通过，UI 冒烟测试 4 窗口全通过，注入自检 8/8 通过，4 个插件端到端验证，DX11 硬件加速 169 FPS，真机 SAI2 图层识别实测通过）**
-
-- **Phase 1 插件框架** ✅：Plugin Manager / Manifest / Loader / Installer / Enable-Disable / Uninstall / Logging / HelloWorld 插件
-- **Phase 2 Image API** ✅：ImageBuffer(RGBA8/RGBA16) / PixelFormat / Selection / Undo(UndoGroup) / Preview / Canvas Refresh
-- **Phase 3 Blur 插件** ✅：Gaussian（可分离卷积）/ Box / Motion / Radial，支持 Selection 与 Undo
-- **Phase 4 Liquify 插件** ✅：Displacement Field + Inverse Mapping + Bilinear Sampling；Forward Warp / Bloat / Pinch / Twirl / Smooth / Reconstruct
-- **Phase 5 Filter Gallery 插件** ✅：FilterRegistry + 分类（Artistic/Sketch/Texture/Stylize）+ 声明式参数 + 10 个滤镜（油画/水彩/粗糙蜡笔/素描/炭笔/粉笔/纹理化/颗粒/浮雕/查找边缘）
-- **Phase 6 插件源** ✅：index.json 解析/搜索 / CheckUpdates / 下载(IDownloader: WinHTTP + File) / SHA-256 校验 / minApiVersion 检查 / 安装与更新
-- **MVP 后：插件签名** ✅：自带 BigInt + RSA PKCS#1 v1.5（SHA-256），manifest/index.json 支持 signature + signerPubKey，安装链路强制验签
-- **MVP 后：GPU 加速** ✅：IComputeBackend 抽象（DX11 compute shader 优先、WARP 兜底、CPU SIMD fallback），4K 预览高斯 169 FPS（目标 30~60）；液化笔刷 ROI 预览 1474 FPS
-- **MVP 后：液化工作流引擎** ✅：LiquifySession（笔刷大小/压力/速度、增量 ROI 预览、Commit/Cancel、整体重建），UI 无关可接 Qt/Win32
-- **MVP 后：滤镜缩略图墙** ✅：GalleryViewModel + ThumbnailGenerator（规范样本图、惰性缓存、分类树、参数面板 JSON）
-- **接入 SAI2：伴随宿主 + 剪贴板桥** ✅：`sai2_bridge.exe`（Win32 自绘，零第三方依赖）——实测 SAI2 **无任何插件 SDK / 扩展接口 / 外部调用机制**，故按规格书补充章节（第 108-113 行）走"自研宿主 / 兼容层"路线：在 SAI2 里点功能（或 Ctrl+C）→ 自动选中并抓取当前图层 → 弹出该功能的**独立窗口** → 调参/涂抹 → 应用回写剪贴板 → 自动切回 SAI2 发 Ctrl+V。新增宿主参数通道（Plugin API **1.1**，向后兼容，1.0 插件无需改动）**详见 [docs/SAI2Integration.md](docs/SAI2Integration.md)**
-- **多窗口功能界面** ✅（本轮重做）：不再把几个功能堆在一个窗口共用一块小面板，改为**一个功能一个独立窗口**。主面板只当启动器（预览 + SAI2 图层列表 + 四个功能按钮）；「模糊」「滤镜」「调整」「液化」各开各的窗口：液化窗口 = 左侧竖排 7 工具 + 全画布涂抹 + 参数面板（PS 液化风格），滤镜窗口 = 缩略图墙 + 参数面板，模糊/调整窗口 = 效果条 + 参数面板。每个窗口持有独立预览会话（缩放/平移/液化置换场互不干扰），窗口位置记入注册表。SAI2 内「插件」入口也从下拉菜单改成**一排功能按钮**。
-
 ## 快速开始（免构建）
 
 到 [Releases](../../releases) 下载 `sai2-plugin-suite-win64-*.zip`，解压后：
