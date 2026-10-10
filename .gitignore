@@ -1,0 +1,30 @@
+# ---- 构建产物 ----
+build-zig/
+build/
+out/
+*.obj
+*.pdb
+*.lib
+*.ilk
+
+# ---- 发布产物（exe 统一走 GitHub Releases，不进仓库）----
+dist/
+demo-frames/
+selftest-out/
+
+# ---- 日志与临时文件 ----
+*.log
+*.pid
+sai2pid.txt
+__pycache__/
+*.pyc
+
+# ---- 运行时生成的测试图 / 截图 ----
+*.bmp
+sai_final.png
+sai2_test_*/
+bf.png
+submenu.bmp
+
+# ---- 本地工作区数据 ----
+.workbuddy/

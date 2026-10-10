@@ -1,0 +1,11 @@
+{
+    "id": "com.sai2.blur",
+    "name": "Blur",
+    "version": "1.1.0",
+    "author": "SAI2 Plugin Team",
+    "apiVersion": "1.0",
+    "minHostVersion": "0.1.0",
+    "entry": "blur.dll",
+    "type": "image-effect",
+    "description": "模糊插件：Gaussian / Box / Motion / Radial 四种模糊，Gaussian 使用可分离卷积，支持实时预览与 Undo。"
+}

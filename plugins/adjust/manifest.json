@@ -1,0 +1,11 @@
+{
+    "id": "com.sai2.adjust",
+    "name": "Adjust",
+    "version": "1.0.0",
+    "author": "SAI2 Plugin Team",
+    "apiVersion": "1.0",
+    "minHostVersion": "0.1.0",
+    "entry": "adjust.dll",
+    "type": "image-effect",
+    "description": "PS 风格调整：反相 / 去色 / 亮度对比度 / 色相饱和度 / 色阶，支持选区与 Undo。"
+}

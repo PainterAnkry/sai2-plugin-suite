@@ -1,0 +1,7 @@
+{
+  "plugins": {
+    "com.sai2.blur": {"enabled": true, "version": "1.1.0"},
+    "com.sai2.filter-gallery": {"enabled": true, "version": "1.1.0"},
+    "com.sai2.liquify": {"enabled": true, "version": "1.1.0"}
+  }
+}

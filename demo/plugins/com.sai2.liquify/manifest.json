@@ -1,0 +1,11 @@
+{
+    "id": "com.sai2.liquify",
+    "name": "Liquify",
+    "version": "1.1.0",
+    "author": "SAI2 Plugin Team",
+    "apiVersion": "1.0",
+    "minHostVersion": "0.1.0",
+    "entry": "liquify.dll",
+    "type": "image-effect",
+    "description": "液化插件：Displacement Field + Inverse Mapping + Bilinear Sampling，支持 Forward Warp / Bloat / Pinch / Twirl / Smooth / Reconstruct。"
+}

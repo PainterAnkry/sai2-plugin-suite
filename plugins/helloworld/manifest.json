@@ -1,0 +1,11 @@
+{
+    "id": "com.sai2.helloworld",
+    "name": "Hello World",
+    "version": "1.0.0",
+    "author": "SAI2 Plugin Team",
+    "apiVersion": "1.0",
+    "minHostVersion": "0.1.0",
+    "entry": "helloworld.dll",
+    "type": "image-effect",
+    "description": "SAI2 首个示例插件：在画布上绘制一块演示色块，演示 UndoGroup / 快照 / 画布刷新的完整链路。"
+}
