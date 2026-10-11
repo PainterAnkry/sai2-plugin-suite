@@ -153,12 +153,17 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
           DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     {
         const ImageBuffer& img = core.DisplayImage(BridgeCore::kWinMain);
-        wchar_t sub[200];
-        swprintf(sub, 200, L"%s   %d x %d", (core.HasImage() ? L"已抓取图层" : L"等待抓取"),
+        wchar_t sub[220];
+        const int pLoaded = core.PluginLoadedCount();
+        const int pTotal = core.PluginTotalCount();
+        swprintf(sub, 220, L"%s   %d x %d   插件 %d/%d%s",
+                 (core.HasImage() ? L"已抓取图层" : L"等待抓取"),
                  img.IsValid() ? img.Width() : 0,
-                 img.IsValid() ? img.Height() : 0);
+                 img.IsValid() ? img.Height() : 0, pLoaded, pTotal,
+                 (pLoaded < pTotal) ? L"（未全载，见日志）" : L"");
         RECT rr = {Scale(300), 0, client.right - Scale(140), Scale(38)};
-        TextC(dc, sub, rr, core.HasImage() ? C_OK : C_DIM, s.fSmall,
+        TextC(dc, sub, rr,
+              (core.HasImage() && pLoaded >= pTotal) ? C_OK : C_DIM, s.fSmall,
               DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
     // 主题按钮（跟随系统 → 浅色 → 深色 循环）

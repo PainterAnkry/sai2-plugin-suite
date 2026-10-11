@@ -189,6 +189,9 @@ public:
     double LastApplyMs() const { return lastApplyMs_; }
     // "com.sai2.blur 1.1.0 [loaded], ..." 形式的一行摘要
     std::string PluginSummary() const;
+    // 主面板状态栏用：已加载/应加载 的插件数量（应加载 = registry 扫到的全部）
+    int PluginLoadedCount() const;
+    int PluginTotalCount() const;
 
     void Log(const std::string& line);
 

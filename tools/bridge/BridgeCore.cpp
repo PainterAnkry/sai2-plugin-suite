@@ -949,6 +949,22 @@ std::string BridgeCore::PluginSummary() const {
     return s.empty() ? "(无插件)" : s;
 }
 
+int BridgeCore::PluginLoadedCount() const {
+    if (!manager_) return 0;
+    int n = 0;
+    for (const auto& item : manager_->ListPlugins())
+        if (item.loaded && item.id != "com.sai2.helloworld") ++n; // 示例不计
+    return n;
+}
+
+int BridgeCore::PluginTotalCount() const {
+    if (!manager_) return 0;
+    int n = 0;
+    for (const auto& item : manager_->ListPlugins())
+        if (item.id != "com.sai2.helloworld") ++n; // helloworld 是示例，不计
+    return n;
+}
+
 void BridgeCore::Log(const std::string& line) {
     logLines_.push_back(line);
     if (logLines_.size() > 300) logLines_.erase(logLines_.begin());

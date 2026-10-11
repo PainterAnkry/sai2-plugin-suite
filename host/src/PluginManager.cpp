@@ -25,7 +25,11 @@ bool PluginManager::Startup(std::string& error) {
     registry_.LoadState();
 
     for (auto& record : registry_.All()) {
-        if (!record.enabled) continue;
+        // 不跳过 enabled=false 的插件：禁用标记只来自"上次启动失败"的自动
+        // 隔离（UI 没有手动启用入口）。若在这里永久跳过，首次失败（典型：
+        // 杀毒软件锁定/拦截了新解压的 DLL）之后插件永远不会恢复 —— 用户
+        // 现象就是"抓取正常但液化/滤镜全部不可用"。改为每次启动都重试，
+        // 失败才再次禁用；环境恢复后（如杀软放行）重启即自愈。
         Instance inst;
         inst.record = record;
         if (!StartInstance(inst, error)) {
@@ -36,6 +40,13 @@ bool PluginManager::Startup(std::string& error) {
             registry_.SetEnabled(record.manifest.id, false);
             registry_.SaveState();
             continue;
+        }
+        if (!record.enabled) {
+            // 上次失败、本次成功 → 清除禁用标记
+            Logger::Instance().Write(LogLevel::Info,
+                                     "插件恢复加载 " + record.manifest.id);
+            registry_.SetEnabled(record.manifest.id, true);
+            registry_.SaveState();
         }
         instances_.push_back(std::move(inst));
     }
