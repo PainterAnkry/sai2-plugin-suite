@@ -5,8 +5,8 @@
 //   * 左侧竖排 7 个工具：向前变形 / 膨胀 / 收缩 / 顺时针旋转 / 逆时针旋转 /
 //     平滑 / 重建
 //   * 右侧参数面板：笔刷大小、强度/角度（随工具而变）、重建模式
-//   * 中间画布：按住拖动即可涂抹（逐笔累积），右键拖动平移，滚轮缩放，
-//     +/- 调笔刷大小
+//   * 中间画布：按住拖动即可涂抹（逐笔累积），抓手工具/空格+拖/中键拖/右键拖
+//     平移，滚轮缩放，H 切换抓手，[ ] 调笔刷大小
 //   * 底部：应用 → 剪贴板（自动粘贴回 SAI2）/ 撤销 / 复位 / 关闭
 //
 // 关键实现：笔刷几何按归一化坐标下发，插件按"归一化 × 图像尺寸"求半径，
@@ -34,6 +34,9 @@ const wchar_t* kClass = L"SAI2BridgeLiquifyWnd";
 
 // 重建模式（仅"重建"工具有意义）：0 = 恢复全部，1..3 = 按笔刷逐次恢复
 int g_reconstructMode = 0;
+
+// UI 层的"抓手（平移）"工具：不属于插件效果，用特殊命中下标区分
+constexpr int kHandToolHit = -2;
 
 std::vector<int> LiquifyEffects() {
     return S().core->EffectsInGroup(BridgeCore::kGroupLiquify);
@@ -110,10 +113,31 @@ void DrawToolColumn(HDC dc, UiWindow& win, const RECT& strip,
         y += h + gap;
     }
 
+    // 抓手（平移）工具：激活后左键拖动 = 平移画布（不影响涂抹工具的选择，
+    // 点任意变形工具即退出抓手模式；H 键也能切换）
+    {
+        RECT rc = {strip.left + 4, y, strip.right - 4, y + h};
+        const bool active = win.handTool;
+        const bool hover = !active && UiHover(win, rc);
+        RoundBox(dc, rc, active ? C_ACCENT2 : (hover ? C_PANEL : C_PANEL2),
+                 active ? C_ACCENT : (hover ? C_ACCENT : C_LINE), Scale(6));
+        RECT tx = rc;
+        tx.left += 8;
+        TextC(dc, L"抓手（平移）  H", tx,
+              active ? RGB(255, 255, 255) : C_TEXT,
+              active ? s.fBold : s.fBody,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        UiHit hit;
+        hit.rc = rc;
+        hit.kind = HK_TOOL;
+        hit.index = kHandToolHit;
+        win.hits.push_back(hit);
+    }
+
     // 底部提示
     RECT hr = {strip.left + 6, strip.bottom - Scale(74), strip.right - 6,
                strip.bottom - 6};
-    TextC(dc, L"画布内按住拖动涂抹\n右键拖动平移 · 滚轮缩放\n[ ] 调笔刷 · Shift+[ ] 调强度\nCtrl+Z 撤销",
+    TextC(dc, L"画布内按住拖动涂抹\n抓手/空格+拖/中键拖 = 平移\n滚轮缩放 · [ ] 调笔刷\nCtrl+Z 撤销上一笔",
           hr, C_DIM, s.fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
 }
 
@@ -124,8 +148,11 @@ void DrawLiquifyPanel(HDC dc, UiWindow& win, const UiLayout& L,
     const int slot = CurrentToolSlot(fx);
     const int ci = WindowEffectIndex(win);
     const auto& E = s.core->Effects();
-    std::wstring toolName =
-        (ci >= 0 && ci < static_cast<int>(E.size())) ? U8(E[ci].name) : L"-";
+    std::wstring toolName = win.handTool
+                                ? L"抓手"
+                                : ((ci >= 0 && ci < static_cast<int>(E.size()))
+                                       ? U8(E[ci].name)
+                                       : L"-");
     DrawPanelFrame(dc, L, L"液化 — " + toolName,
                    slot >= 0 ? L"在画布上涂抹即实时变形；\n「应用」后自动粘贴回 SAI2。"
                              : L"");
@@ -205,7 +232,13 @@ void DrawLiquify(HDC dc, UiWindow& win, const RECT& client) {
 
 bool OnLiquifyHit(UiWindow& win, const UiHit& h) {
     AppState& s = S();
+    if (h.kind == HK_TOOL && h.index == kHandToolHit) {
+        win.handTool = !win.handTool;
+        InvalidateAll();
+        return true;
+    }
     if (h.kind == HK_TOOL && h.index >= 0) {
+        win.handTool = false; // 选变形工具时退出抓手模式
         if (!s.core->EffectAvailable(h.index)) {
             win.flash = L"该工具的插件未加载（检查 plugins 目录）";
             return true;
@@ -232,6 +265,11 @@ bool LiquifyMsg(UiWindow& win, UINT msg, WPARAM wp, LPARAM lp) {
         return true;
     case VK_OEM_6: // ]
         NudgeParam((GetKeyState(VK_SHIFT) & 0x8000) ? 1 : 0, 0.01f);
+        return true;
+    case 'H':
+        // 抓手工具切换（H = Hand）
+        win.handTool = !win.handTool;
+        InvalidateRect(win.hwnd, nullptr, FALSE);
         return true;
     case VK_ESCAPE:
         CloseToolWindow(BridgeCore::kWinLiquify);

@@ -136,6 +136,9 @@ struct UiWindow {
     bool mouseValid = false;
     bool panning = false;
     POINT panLast{};
+    // 液化窗口抓手工具（UI 层状态）：激活时左键拖动 = 平移画布而非涂抹。
+    // 临时平移：任何功能窗口按住空格 + 左键拖、或中键拖（见 UiWindow.cpp）。
+    bool handTool = false;
 
     // 液化涂抹
     bool dragStroke = false;

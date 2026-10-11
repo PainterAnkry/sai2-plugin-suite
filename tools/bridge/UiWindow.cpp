@@ -211,6 +211,15 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (h.kind == HK_PREVIEW) {
+                // 抓手模式（抓手工具 / 空格按住）：左键拖动 = 平移，不涂抹。
+                const bool spacePan = (GetKeyState(VK_SPACE) & 0x8000) != 0;
+                if ((win.handTool || spacePan) && s.core->HasImage()) {
+                    SetCapture(hwnd);
+                    win.panning = true;
+                    win.panLast = {mx, my};
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
                 const auto& fx = s.core->Effects();
                 const int ci = s.core->CurrentEffect();
                 if (ci >= 0 && ci < static_cast<int>(fx.size()) &&
@@ -316,6 +325,48 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
+
+    case WM_MBUTTONDOWN:
+        // 中键拖动 = 平移画布（PS/SAI 习惯），所有功能窗口生效
+        SetCapture(hwnd);
+        win.panning = true;
+        win.panLast = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        return 0;
+
+    case WM_MBUTTONUP:
+        if (win.panning) {
+            win.panning = false;
+            ReleaseCapture();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_SETCURSOR:
+        // 抓手/平移中 → 移动光标；液化涂抹工具 → 十字；其余箭头
+        if (LOWORD(lp) == HTCLIENT) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            const bool pan = win.panning || win.handTool ||
+                             (GetKeyState(VK_SPACE) & 0x8000) != 0;
+            if (pan) {
+                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+                return 0;
+            }
+            if (win.id == BridgeCore::kWinLiquify &&
+                InRect(win.canvas, pt.x, pt.y) && s.core->HasImage()) {
+                const auto& fxs = s.core->Effects();
+                const int ci = WindowEffectIndex(win);
+                if (ci >= 0 && ci < static_cast<int>(fxs.size()) &&
+                    fxs[static_cast<size_t>(ci)].stroke) {
+                    SetCursor(LoadCursor(nullptr, IDC_CROSS));
+                    return 0;
+                }
+            }
+            SetCursor(LoadCursor(nullptr, IDC_ARROW));
+            return 0;
+        }
+        break;
 
     case WM_MOUSEWHEEL: {
         // 自由缩放：滚轮以光标为锚点连续缩放（与 PS/SAI 一致）
