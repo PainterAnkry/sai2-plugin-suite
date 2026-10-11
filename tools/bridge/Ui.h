@@ -214,6 +214,12 @@ struct AppState {
     std::vector<std::wstring> layerAttrs;
     long long panelLeft = 0;
     int layersScroll = 0;
+    // Agent 屏幕坐标 → 物理屏幕坐标的比例（默认 1:1）。
+    // SAI2 若非 DPI 感知（或显示器缩放 ≠100%），agent 在 SAI2 内部取到的
+    // ClientToScreen/GetWindowRect 是虚拟化坐标，而桥是 DPI 感知的，
+    // SendInput 用物理坐标 —— 不换算会把点击打到标题栏等错误位置。
+    double agentScaleX = 1.0;
+    double agentScaleY = 1.0;
 
     // 字体
     HFONT fTitle = nullptr, fBody = nullptr, fSmall = nullptr, fBold = nullptr;

@@ -152,9 +152,20 @@ bool Inject(DWORD pid, const std::wstring& dllPath, std::string& error) {
         return false;
     }
     WaitForSingleObject(thread, 15000);
+    // 关键校验：LoadLibraryW 远程线程的退出码就是 HMODULE，0 = DLL 在目标
+    // 进程里加载失败（位数不匹配 / 被杀毒软件拦截 / 缺依赖）。线程本身创建
+    // 成功不代表加载成功，不校验会误报"注入完成"然后管道永远等不来。
+    DWORD exitCode = 0;
+    GetExitCodeThread(thread, &exitCode);
     CloseHandle(thread);
     VirtualFreeEx(proc, remote, 0, MEM_RELEASE);
     CloseHandle(proc);
+    if (exitCode == 0) {
+        error = "sai2_agent.dll 在目标进程内加载失败（远程 LoadLibraryW 返回 0）。"
+                "常见原因：杀毒软件拦截了 DLL（把插件目录加入白名单后重试）；"
+                "目标 SAI2 不是 64 位版本。";
+        return false;
+    }
     return true;
 }
 
@@ -440,23 +451,44 @@ int main(int argc, char** argv) {
             std::printf("SKIP Agent 已注入（管道已在）: %s\n", pingResp.c_str());
             return 0;
         }
+        // 位数预检：32 位 SAI2 里加载不了 64 位 DLL，提前报清楚，
+        // 别让用户对着"管道未就绪 lastErr=2"猜原因。
+        {
+            HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                      pid);
+            if (proc) {
+                BOOL wow64 = FALSE;
+                if (IsWow64Process(proc, &wow64) && wow64) {
+                    std::printf(
+                        "FAIL 检测到 32 位版 SAI2 —— 本插件包只支持 64 位版"
+                        "（请下载 64bit 版 sai2.exe 后重试）\n");
+                    CloseHandle(proc);
+                    return 1;
+                }
+                CloseHandle(proc);
+            }
+        }
         std::string err;
         if (!Inject(pid, dllPath, err)) {
             std::printf("FAIL 注入失败: %s\n", err.c_str());
             return 1;
         }
-        // 等管道就绪
+        // 等管道就绪（放宽到 10s：首次加载可能被杀软实时扫描拖慢）
         bool ready = false;
         DWORD lastCliErr = 0;
-        for (int i = 0; i < 40 && !ready; ++i) {
+        for (int i = 0; i < 66 && !ready; ++i) {
             AgentClient probe;
             ready = probe.Connect() && probe.Send("{\"cmd\":\"ping\"}", pingResp);
             lastCliErr = probe.lastErr;
             if (!ready) Sleep(150);
         }
         if (!ready) {
-            std::printf("FAIL 注入完成但管道未就绪 (client lastErr=%lu)\n",
-                        static_cast<unsigned long>(lastCliErr));
+            std::printf(
+                "FAIL 注入完成但管道未就绪 (client lastErr=%lu)。常见原因：\n"
+                "  1) 杀毒软件拦截了 sai2_agent.dll —— 把插件目录加入白名单后重试；\n"
+                "  2) SAI2 不是 64 位版本；\n"
+                "  3) 详细日志见插件目录 sai2_agent_*.log / sai2_agent_pipe_*.log\n",
+                static_cast<unsigned long>(lastCliErr));
             return 1;
         }
         std::printf("OK 注入成功 pid=%lu\n%s\n",

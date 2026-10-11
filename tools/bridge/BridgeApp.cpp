@@ -61,17 +61,58 @@ namespace {
 // ---------------------------------------------------------------------------
 // 主面板布局
 // ---------------------------------------------------------------------------
+// 设计稿 760x950。窗口可自由缩放，布局跟随客户区变化：
+//   * 横向：加宽量分给 图层列表(左列) 与 选项/按钮(右列)，预览/状态占满宽；
+//   * 纵向：加高量的 30% 给预览、50% 给状态日志区、剩余给图层列表；
+//   * 缩小时由 WM_GETMINMAXINFO 限制最小尺寸（Scale(580)xScale(720)），
+//     布局内部再用 std::max 兜底，避免极端尺寸下出现负高度矩形。
 int MainW() { return Scale(760); }
 int MainH() { return Scale(950); }
 
-RECT RcPreview() { return {Scale(12), Scale(46), Scale(748), Scale(410)}; }
-RECT RcCategory() { return {Scale(12), Scale(442), Scale(748), Scale(476)}; }
-RECT RcLayerHead() { return {Scale(12), Scale(488), Scale(470), Scale(512)}; }
-RECT RcLayerList() { return {Scale(12), Scale(514), Scale(470), Scale(706)}; }
-RECT RcLayerBtns() { return {Scale(12), Scale(714), Scale(470), Scale(742)}; }
-RECT RcChecks() { return {Scale(486), Scale(488), Scale(748), Scale(610)}; }
-RECT RcButtons() { return {Scale(486), Scale(640), Scale(748), Scale(742)}; }
-RECT RcStatus() { return {Scale(12), Scale(754), Scale(748), Scale(936)}; }
+struct MainLayout {
+    RECT preview, category, layerHead, layerList, layerBtns, checks, buttons,
+        status;
+};
+
+MainLayout MainLayoutOf(const RECT& client) {
+    const int cw = std::max(Scale(560),
+                            static_cast<int>(client.right) - Scale(24));
+    const int ch = std::max(Scale(720), static_cast<int>(client.bottom));
+    const int vExtra = ch - Scale(950); // 纵向富余（可为负）
+
+    MainLayout L{};
+    // 状态日志区（底部锚定）：吃 50% 纵向富余
+    const int statusH = std::max(Scale(110), Scale(182) + vExtra / 2);
+    const int statusTop = ch - Scale(14) - statusH;
+    L.status = {Scale(12), statusTop, client.right - Scale(12), ch - Scale(14)};
+
+    // 预览（顶部锚定链）：高度吃 30% 纵向富余，最小 140
+    const int previewBottom =
+        std::max(Scale(46) + Scale(140), Scale(410) + vExtra * 3 / 10);
+    L.preview = {Scale(12), Scale(46), client.right - Scale(12), previewBottom};
+    // 功能按钮条
+    L.category = {Scale(12), previewBottom + Scale(32), client.right - Scale(12),
+                  previewBottom + Scale(66)};
+    // 左列（图层）与右列（选项/按钮）按设计稿比例分宽（458 : 474 起）
+    const int leftColRight = Scale(12) + cw * 458 / 736;
+    const int rightColLeft = Scale(12) + cw * 474 / 736;
+    // 图层表头/列表/按钮条：列表吃剩余空间，底边贴图层按钮条
+    L.layerHead = {Scale(12), L.category.bottom + Scale(12), leftColRight,
+                   L.category.bottom + Scale(36)};
+    L.layerList = {Scale(12), L.layerHead.bottom + Scale(2), leftColRight,
+                   std::max(static_cast<int>(L.layerHead.bottom) + Scale(102),
+                            statusTop - Scale(48))};
+    L.layerBtns = {Scale(12), statusTop - Scale(40), leftColRight,
+                   statusTop - Scale(12)};
+    // 右列：复选框在表头右侧；两行命令按钮底部与图层按钮条对齐
+    const int row1Top = (statusTop - Scale(12)) - Scale(74);
+    L.checks = {rightColLeft, L.layerHead.top, client.right - Scale(12),
+                std::min(static_cast<int>(L.layerHead.top) + Scale(122),
+                         row1Top - Scale(8))};
+    L.buttons = {rightColLeft, L.checks.bottom + Scale(30),
+                 client.right - Scale(12), statusTop - Scale(12)};
+    return L;
+}
 
 enum LayerBtnId { LBTN_INJECT = 0, LBTN_REFRESH, LBTN_GRABSEL, LBTN_COUNT };
 
@@ -91,9 +132,12 @@ int g_uiTestSeconds = 0; // --uitest 模式：跳过图层看门狗，保留模�
 bool ListScrollAt(UiWindow& win, int my) {
     AppState& s = S();
     const int total = static_cast<int>(s.layerNames.size());
-    if (total == 0 || RectW(win.scrollTrack) <= 0) return false;
+    RECT client;
+    GetClientRect(win.hwnd, &client);
+    const RECT list = MainLayoutOf(client).layerList;
+    if (total == 0 || RectH(list) <= 0) return false;
     const int rowH = Scale(22);
-    const int viewH = RectH(RcLayerList()) - Scale(4);
+    const int viewH = RectH(list) - Scale(4);
     const int maxScroll = std::max(0, (total * rowH - viewH) / std::max(1, rowH));
     if (maxScroll <= 0) return false;
     const RECT& track = win.scrollTrack;
@@ -142,6 +186,7 @@ void DrawCheck(HDC dc, UiWindow& win, const RECT& rc, const std::wstring& text,
 void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
     AppState& s = S();
     BridgeCore& core = *s.core;
+    const MainLayout lay = MainLayoutOf(client);
 
     FillRect(dc, &client, s.bgBrush);
 
@@ -186,20 +231,21 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
     FrameRectC(dc, RECT{0, Scale(37), client.right, Scale(38)}, C_LINE);
 
     // ---- 预览（带缩放控制：滚轮 + 放大镜滑杆 + 100%/适配） ----
-    win.canvas = RcPreview();
+    win.canvas = lay.preview;
     DrawCanvas(dc, win, false, true);
 
     // ---- 功能按钮（4 个分组，各开各的窗口） ----
     {
-        RECT title = {Scale(12), Scale(418), Scale(748), Scale(438)};
+        RECT title = {Scale(12), lay.category.top - Scale(24),
+                      lay.category.right, lay.category.top - Scale(4)};
         TextC(dc, L"功能（点一下 = 抓取当前图层并打开独立功能窗口）", title,
               C_DIM, s.fSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        DrawCategoryStrip(dc, win, RcCategory(), std::wstring());
+        DrawCategoryStrip(dc, win, lay.category, std::wstring());
     }
 
     // ---- 图层区 ----
     {
-        RECT head = RcLayerHead();
+        RECT head = lay.layerHead;
         TextC(dc, L"SAI2 图层（注入代理）", head, C_DIM, s.fSmall,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         RECT hint = {head.left + Scale(190), head.top, head.right, head.bottom};
@@ -207,7 +253,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
               s.agentOnline ? C_OK : C_WARN, s.fSmall,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        RECT box = RcLayerList();
+        RECT box = lay.layerList;
         FillRectC(dc, box, C_PANEL);
         FrameRectC(dc, box, C_LINE);
 
@@ -301,7 +347,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
         static const wchar_t* labels[LBTN_COUNT] = {L"连接注入", L"刷新图层",
                                                     L"抓取选中图层"};
         static const bool primary[LBTN_COUNT] = {false, false, true};
-        const RECT strip = RcLayerBtns();
+        const RECT strip = lay.layerBtns;
         const int gap = Scale(6);
         const int bw = (RectW(strip) - gap * (LBTN_COUNT - 1)) / LBTN_COUNT;
         for (int i = 0; i < LBTN_COUNT; ++i) {
@@ -321,7 +367,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
 
     // ---- 选项 ----
     {
-        RECT box = RcChecks();
+        RECT box = lay.checks;
         const int rowH = Scale(24);
         int y = box.top;
         DrawCheck(dc, win, RECT{box.left, y, box.right, y + rowH},
@@ -342,7 +388,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
 
     // ---- 命令按钮（两行两列：文字放得下，不再省略号截断） ----
     {
-        const RECT b = RcButtons();
+        const RECT b = lay.buttons;
         const int bh = Scale(34);
         RECT row2 = {b.left, b.bottom - bh, b.right, b.bottom};
         RECT row1 = {b.left, row2.top - Scale(6) - bh, b.right,
@@ -353,7 +399,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
 
     // ---- 状态与日志 ----
     {
-        RECT box = RcStatus();
+        RECT box = lay.status;
         FillRectC(dc, box, C_PANEL2);
         FrameRectC(dc, box, C_LINE);
         RECT sr = {box.left + Scale(8), box.top + Scale(3),
@@ -364,7 +410,8 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         const auto& logs = core.LogLines();
-        const size_t maxLines = 12;
+        const size_t maxLines = std::max<size_t>(
+            4, static_cast<size_t>(std::max(1, (RectH(box) - Scale(24)) / Scale(14))));
         const size_t start = logs.size() > maxLines ? logs.size() - maxLines : 0;
         int y = box.top + Scale(22);
         const int lh = Scale(14);
@@ -408,11 +455,14 @@ bool OnMainHit(UiWindow& win, const UiHit& h) {
 }
 
 bool MainMsg(UiWindow& win, UINT msg, WPARAM wp, LPARAM lp) {
+    RECT client;
+    GetClientRect(win.hwnd, &client);
+    const MainLayout lay = MainLayoutOf(client);
     if (msg == WM_MOUSEWHEEL) {
         const int delta = GET_WHEEL_DELTA_WPARAM(wp);
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(win.hwnd, &pt);
-        if (InRect(RcLayerList(), pt.x, pt.y)) {
+        if (InRect(lay.layerList, pt.x, pt.y)) {
             g_listScroll -= delta / WHEEL_DELTA * 2;
             if (g_listScroll < 0) g_listScroll = 0;
             InvalidateRect(win.hwnd, nullptr, FALSE);
@@ -635,6 +685,60 @@ void ClickAtScreenImpl(int x, int y) {
     SendInput(3, in, sizeof(INPUT));
 }
 
+// ---------------------------------------------------------------------------
+// DPI 坐标换算：agent 在 SAI2 内部拿到的屏幕坐标可能是虚拟化坐标（SAI2 非
+// DPI 感知、显示器缩放 ≠100% 时），而桥是 DPI 感知的，SendInput 用物理
+// 坐标 —— 不换算会把点击打到标题栏等错误位置（已实测踩坑）。
+// ---------------------------------------------------------------------------
+
+// agent 坐标 → 物理坐标（比例由 RefreshLayers 用「桥看到的窗口物理矩形 /
+// agent 报告的同窗口矩形」实时校准，SAI2 感知 DPI 时为 1:1）
+POINT AgentToScreen(double x, double y) {
+    AppState& st = S();
+    const double sx = std::min(4.0, std::max(0.5, st.agentScaleX));
+    const double sy = std::min(4.0, std::max(0.5, st.agentScaleY));
+    POINT p{static_cast<LONG>(x * sx + 0.5), static_cast<LONG>(y * sy + 0.5)};
+    return p;
+}
+
+// SAI2 逻辑像素 → 物理像素的缩放（用于菜单栏偏移这类"从窗口边框量出来"
+// 的固定逻辑偏移）。SAI2 自己感知 DPI 时取它的 DPI；不感知时取所在显示器
+// 的 DPI（DWM 会把不感知的窗口整体拉伸）。
+double SaiDpiScale(HWND sai) {
+    UINT dpi = 96;
+    using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+    static GetDpiForWindowFn f1 = []() -> GetDpiForWindowFn {
+        HMODULE m = GetModuleHandleW(L"user32.dll");
+        return m ? reinterpret_cast<GetDpiForWindowFn>(
+                       GetProcAddress(m, "GetDpiForWindow"))
+                 : nullptr;
+    }();
+    if (f1 && sai) dpi = f1(sai);
+    if (dpi <= 96) {
+        using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+        static GetDpiForMonitorFn f2 = []() -> GetDpiForMonitorFn {
+            HMODULE m = LoadLibraryW(L"Shcore.dll");
+            return m ? reinterpret_cast<GetDpiForMonitorFn>(
+                           GetProcAddress(m, "GetDpiForMonitor"))
+                     : nullptr;
+        }();
+        UINT mx = 96, my = 96;
+        if (f2 && sai) {
+            const HMONITOR mon =
+                MonitorFromWindow(sai, MONITOR_DEFAULTTONEAREST);
+            if (mon && SUCCEEDED(f2(mon, 0 /*MDT_EFFECTIVE_DPI*/, &mx, &my)))
+                dpi = my;
+        }
+        if (dpi <= 96) {
+            if (HDC dc = GetDC(nullptr)) {
+                dpi = static_cast<UINT>(GetDeviceCaps(dc, LOGPIXELSY));
+                ReleaseDC(nullptr, dc);
+            }
+        }
+    }
+    return dpi > 96 ? dpi / 96.0 : 1.0;
+}
+
 bool MenuItemClickImpl(HWND sai, int menuBarOffsetX, const wchar_t* itemPrefix) {
     RECT r;
     GetWindowRect(sai, &r);
@@ -644,12 +748,18 @@ bool MenuItemClickImpl(HWND sai, int menuBarOffsetX, const wchar_t* itemPrefix) 
     SendEscape();
     Sleep(150);
     const ULONGLONG menuTick = GetTickCount64();
-    ClickAtScreenImpl(r.left + menuBarOffsetX, r.top + 33);
+    // 菜单栏偏移是 SAI2 逻辑像素：显示器缩放 >100% 时必须先放大，
+    // 否则点在标题栏上（菜单根本弹不出来）
+    const double ms = SaiDpiScale(sai);
+    ClickAtScreenImpl(r.left + static_cast<int>(menuBarOffsetX * ms + 0.5),
+                      r.top + static_cast<int>(33 * ms + 0.5));
     Sleep(480);
     int ix = -1, iy = 0;
     for (int i = 0; i < 8; ++i) {
         if (FindCapturedText(itemPrefix, ix, iy, menuTick - 200)) {
-            ClickAtScreenImpl(ix + 40, iy + 6);
+            // agent 报的坐标可能是虚拟化坐标，换算成物理坐标再点
+            const POINT p = AgentToScreen(ix + 40, iy + 6);
+            ClickAtScreenImpl(p.x, p.y);
             Sleep(350);
             return true;
         }
@@ -684,7 +794,8 @@ void RunCaptureJob() {
     if (j.row >= 0 && j.panelLeft > 0 && j.rowScreenY > 0) {
         ForceForeground(sai);
         Sleep(140);
-        ClickAtScreenImpl(j.panelLeft + 34, j.rowScreenY + 6);
+        const POINT p = AgentToScreen(j.panelLeft + 34, j.rowScreenY + 6);
+        ClickAtScreenImpl(p.x, p.y);
         Sleep(260);
     } else {
         ForceForeground(sai);
@@ -826,16 +937,23 @@ void AutoPasteToSai2() {
         s.flash = L"剪贴板已就绪，但未找到 SAI2 窗口";
         return;
     }
-    if (!MenuItemClickImpl(target, 120, L"全选")) {
-        s.flash = L"未定位到 SAI2 的「全选」菜单项";
+    // 用快捷键而不是菜单点击：不依赖 agent 管道（菜单文字钩子），
+    // 也不依赖菜单栏坐标换算 —— 只要 SAI2 在前台就一定生效。
+    // Ctrl+A 全选让粘贴对齐画布（与菜单「全选 → 粘贴」等效）。
+    WaitMouseReleased(1000);
+    ForceForeground(target);
+    Sleep(160);
+    if (GetForegroundWindow() != target) {
+        s.flash = L"无法把 SAI2 切到前台 —— 请手动 Ctrl+V";
         return;
     }
-    Sleep(200);
-    if (MenuItemClickImpl(target, 120, L"粘贴")) {
-        s.flash = L"已粘贴回 SAI2（全选对齐，无需手动调整位置）";
-    } else {
-        s.flash = L"未定位到 SAI2 的「粘贴」菜单项 —— 请手动 Ctrl+V";
-    }
+    SendEscape();
+    Sleep(150);
+    SendCtrlScan(0x1E); // Ctrl+A 全选
+    Sleep(260);
+    SendCtrlScan(0x2F); // Ctrl+V 粘贴
+    ReleaseSyntheticKeys();
+    s.flash = L"已发送 Ctrl+A / Ctrl+V 粘贴回 SAI2（若画面无变化请手动 Ctrl+V）";
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1097,25 @@ void DoReset(UiWindow& win) {
 // ---------------------------------------------------------------------------
 // 图层
 // ---------------------------------------------------------------------------
+// 用「桥看到的图层窗口物理矩形 / agent 在 SAI2 内报告的同窗口矩形」校准
+// agent 坐标 → 物理屏幕坐标的比例（显示器缩放 ≠100% 且 SAI2 非 DPI 感知
+// 时，agent 坐标是虚拟化坐标，不换算会把自动点击打偏 —— 实测踩坑）。
+void UpdateAgentScale(const sai2bridge::AgentLayerGroup& grp) {
+    AppState& s = S();
+    s.agentScaleX = 1.0;
+    s.agentScaleY = 1.0;
+    const RECT ar = grp.screenRect;
+    if (grp.hwnd == 0 || ar.right - ar.left < 50 || ar.bottom - ar.top < 50)
+        return;
+    HWND h = reinterpret_cast<HWND>(static_cast<uintptr_t>(grp.hwnd));
+    RECT phys{};
+    if (!GetWindowRect(h, &phys)) return;
+    const int pw = phys.right - phys.left, ph = phys.bottom - phys.top;
+    if (pw < 50 || ph < 50) return;
+    s.agentScaleX = std::min(4.0, std::max(0.5, pw / double(ar.right - ar.left)));
+    s.agentScaleY = std::min(4.0, std::max(0.5, ph / double(ar.bottom - ar.top)));
+}
+
 void RefreshLayers() {
     AppState& s = S();
     // uitest 模式：不查代理，保留注入的模拟图层（供界面探针截图覆盖滚动条路径）
@@ -998,6 +1135,7 @@ void RefreshLayers() {
             s.layerAttrs = agg.attrs;
             s.layerScreenY = agg.screenY;
             s.panelLeft = grp->screenRect.left;
+            UpdateAgentScale(*grp);
         }    } else {
         if (s.agentOnline) s.core->Log("注入代理失联（SAI2 可能已退出）");
         s.agentOnline = false;
@@ -1026,8 +1164,9 @@ void DoSelectLayer(int rowIdx) {
     }
     ForceForeground(sai);
     Sleep(140);
-    ClickAtScreen(static_cast<int>(s.panelLeft) + 34,
-                  s.layerScreenY[static_cast<size_t>(rowIdx)] + 6);
+    const POINT p = AgentToScreen(s.panelLeft + 34,
+                                  s.layerScreenY[static_cast<size_t>(rowIdx)] + 6);
+    ClickAtScreen(p.x, p.y);
     Sleep(220);
     s.flash = L"已在 SAI2 选中图层「" + s.layerNames[static_cast<size_t>(rowIdx)] +
               L"」";
@@ -1302,6 +1441,14 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     UiWindow& win = s.main;
 
     switch (msg) {
+    case WM_GETMINMAXINFO: {
+        // 允许自由缩放，但限制最小尺寸，避免布局挤爆
+        MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+        mmi->ptMinTrackSize.x = Scale(580);
+        mmi->ptMinTrackSize.y = Scale(720);
+        return 0;
+    }
+
     case WM_CREATE:
         InitFonts();
         CreateParamEdits(win);
@@ -1560,12 +1707,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
-    // 正常双击/bat 启动（无 CLI 参数）时隐藏宿主控制台窗口：
+    // 正常双击/bat 启动（无 CLI 参数）时脱离宿主控制台窗口：
     // 面板后面挂一个黑色 cmd 既难看，它的 QuickEdit 选择模式还会捕获
     // 鼠标（点住一拖变成选中文字），干扰正常拖拽操作。
+    // 用 FreeConsole 而不是 ShowWindow(SW_HIDE)：Win11 默认终端是
+    // Windows Terminal 时控制台窗口归 WT 所有，SW_HIDE 藏不住（非管理员
+    // 启动必现黑窗口）；FreeConsole 对 conhost / WT 都有效。
     // 带 CLI 参数（--selftest/--uitest/--demo…）时保留控制台，供测试捕获输出。
     if (argc <= 1) {
-        if (HWND con = GetConsoleWindow()) ShowWindow(con, SW_HIDE);
+        FreeConsole();
     }
 
     std::string pluginsDir = ExeDir() + "\\plugins";
