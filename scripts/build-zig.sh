@@ -16,6 +16,21 @@ ZIGC=("$ZIG" c++)
 # 这样在受限环境（不能写用户目录）里也能编译
 export ZIG_GLOBAL_CACHE_DIR="$BUILD/zig-cache"
 
+# 版本资源：每个随包二进制都带 VERSIONINFO（无版本信息的裸二进制
+# 最容易被杀软启发式引擎误报）。模板见 resources/version.rc.in。
+VER="1.13.0"
+RES="$BUILD/res"
+mkdir -p "$RES"
+# make_res <描述> <内部名> <原始文件名> <VFT_APP|VFT_DLL> <输出.res>
+make_res() {
+    sed -e "s|@DESC@|$1|g" -e "s|@NAME@|$2|g" -e "s|@FILE@|$3|g" \
+        -e "s|@TYPE@|$4|g" -e "s|@VER@|$VER|g" \
+        "$ROOT/resources/version.rc.in" > "$RES/$2.rc"
+    # /c 65001：模板是 UTF-8，不带此参数中文会被按 cp1252 解析成乱码；
+    # 写成 //c 是防止 Git Bash 把 /c 当 POSIX 路径转换（MSYS 折叠 // → /）
+    "$ZIG" rc //c 65001 "$RES/$2.rc" "$5"
+}
+
 # 注意：路径含空格，编译选项必须用 bash 数组
 CXXFLAGS=(-std=c++20 -O2 -Wno-everything
           "-I$ROOT/sdk/include" "-I$ROOT/host/include")
@@ -34,26 +49,31 @@ HOST_SRC=("$ROOT/host/src/Json.cpp" "$ROOT/host/src/Logging.cpp"
 mkdir -p "$BUILD/plugins" "$BUILD/tests" "$BUILD/tools"
 
 echo "==> [1/7] helloworld.dll"
+make_res "SAI2 插件：示例（Hello World）" helloworld helloworld.dll VFT_DLL "$RES/helloworld.res"
 "${ZIGC[@]}" "${CXXFLAGS[@]}" -shared -o "$BUILD/plugins/helloworld.dll" \
-    "$ROOT/plugins/helloworld/src/HelloWorldPlugin.cpp" "${SDK_SRC[@]}"
+    "$ROOT/plugins/helloworld/src/HelloWorldPlugin.cpp" "${SDK_SRC[@]}" "$RES/helloworld.res"
 
 echo "==> [1b/7] adjust.dll（PS 风格调整）"
+make_res "SAI2 插件：图像调整" adjust adjust.dll VFT_DLL "$RES/adjust.res"
 "${ZIGC[@]}" "${CXXFLAGS[@]}" -shared -o "$BUILD/plugins/adjust.dll" \
-    "$ROOT/plugins/adjust/src/AdjustPlugin.cpp" "${SDK_SRC[@]}"
+    "$ROOT/plugins/adjust/src/AdjustPlugin.cpp" "${SDK_SRC[@]}" "$RES/adjust.res"
 
 echo "==> [2/7] blur.dll"
+make_res "SAI2 插件：高斯模糊" blur blur.dll VFT_DLL "$RES/blur.res"
 "${ZIGC[@]}" "${CXXFLAGS[@]}" -shared -o "$BUILD/plugins/blur.dll" \
-    "$ROOT/plugins/blur/src/BlurPlugin.cpp" "${SDK_SRC[@]}"
+    "$ROOT/plugins/blur/src/BlurPlugin.cpp" "${SDK_SRC[@]}" "$RES/blur.res"
 
 echo "==> [3/7] liquify.dll"
+make_res "SAI2 插件：液化" liquify liquify.dll VFT_DLL "$RES/liquify.res"
 "${ZIGC[@]}" "${CXXFLAGS[@]}" -shared -o "$BUILD/plugins/liquify.dll" \
-    "$ROOT/plugins/liquify/src/LiquifyPlugin.cpp" "${SDK_SRC[@]}"
+    "$ROOT/plugins/liquify/src/LiquifyPlugin.cpp" "${SDK_SRC[@]}" "$RES/liquify.res"
 
 echo "==> [4/7] filtergallery.dll"
+make_res "SAI2 插件：滤镜库" filtergallery filtergallery.dll VFT_DLL "$RES/filtergallery.res"
 "${ZIGC[@]}" "${CXXFLAGS[@]}" \
     "-I$ROOT/plugins/filter-gallery/src" \
     -shared -o "$BUILD/plugins/filtergallery.dll" \
-    "$ROOT/plugins/filter-gallery/src/FilterPlugin.cpp" "${SDK_SRC[@]}"
+    "$ROOT/plugins/filter-gallery/src/FilterPlugin.cpp" "${SDK_SRC[@]}" "$RES/filtergallery.res"
 
 echo "==> [5/7] sai2_tests.exe + sai2_hostdemo.exe + sai2_computebench.exe"
 "${ZIGC[@]}" "${CXXFLAGS[@]}" \
@@ -73,6 +93,7 @@ echo "==> [5/7] sai2_tests.exe + sai2_hostdemo.exe + sai2_computebench.exe"
 echo "==> [6/7] sai2_bridge.exe（伴随宿主：剪贴板桥 + 主面板 + 4 个功能窗口）"
 # 保持控制台子系统（--selftest/--uitest/--demo 的输出要能被测试管道捕获）。
 # 双击/.bat 启动时由 wWinMain 主动隐藏控制台窗口（见 BridgeApp.cpp）。
+make_res "SAI2 伴随宿主面板（图层抓取 + 液化/滤镜/模糊/调整）" sai2_bridge sai2_bridge.exe VFT_APP "$RES/sai2_bridge.res"
 "${ZIGC[@]}" "${CXXFLAGS[@]}" -municode \
     "-I$ROOT/tools/bridge" \
     -o "$BUILD/tools/sai2_bridge.exe" \
@@ -91,39 +112,43 @@ echo "==> [6/7] sai2_bridge.exe（伴随宿主：剪贴板桥 + 主面板 + 4 �
     "$ROOT/tools/bridge/Diag.cpp" \
     "$ROOT/tools/bridge/Demo.cpp" \
     "${SDK_SRC[@]}" "${HOST_SRC[@]}" \
-    -lgdi32 -luser32 -lshell32
+    -lgdi32 -luser32 -lshell32 "$RES/sai2_bridge.res"
 
 echo "==> [6b/7] sai2_ui_probe.exe（界面探针：无人值守验证面板真的画出来了）"
+make_res "SAI2 界面探针" sai2_ui_probe sai2_ui_probe.exe VFT_APP "$RES/sai2_ui_probe.res"
 "${ZIGC[@]}" -std=c++20 -O2 -Wno-everything -municode \
     -o "$BUILD/tools/sai2_ui_probe.exe" \
     "$ROOT/tools/bridge/UiProbe.cpp" \
-    -luser32 -lgdi32
+    -luser32 -lgdi32 "$RES/sai2_ui_probe.res"
 
 echo "==> [7/7] 注入链路（sai2_agent.dll + sai2_injector.exe + sai2_fakehost.exe）"
 # Agent：注入进 SAI2 的观察 DLL（IAT 钩子 ExtTextOutW/DrawTextW/
 # SetDIBitsToDevice/BitBlt + 同步命名管道）。
 # -fms-extensions 暂留；SEH 在 windows-gnu 目标无运行时语义，
 # 代码已按无 SEH 防御式编写。
+make_res "SAI2 画布代理（注入观察库）" sai2_agent sai2_agent.dll VFT_DLL "$RES/sai2_agent.res"
 "${ZIGC[@]}" -std=c++20 -O2 -fms-extensions -Wno-everything -shared \
     -o "$BUILD/tools/sai2_agent.dll" \
     "$ROOT/tools/agent/AgentMain.cpp" \
     "$ROOT/tools/agent/AgentCore.cpp" \
     "$ROOT/tools/agent/IATHook.cpp" \
     "$ROOT/tools/agent/AgentToolbar.cpp" \
-    -lgdi32 -luser32
+    -lgdi32 -luser32 "$RES/sai2_agent.res"
 
 # Injector：注入/卸载/查询 CLI + FakeHost 端到端自检（selftest）
+make_res "SAI2 插件注入器" sai2_injector sai2_injector.exe VFT_APP "$RES/sai2_injector.res"
 "${ZIGC[@]}" -std=c++20 -O2 -Wno-everything \
     -o "$BUILD/tools/sai2_injector.exe" \
     "$ROOT/tools/injector/InjectorMain.cpp" \
-    -lgdi32 -luser32 -ladvapi32
+    -lgdi32 -luser32 -ladvapi32 "$RES/sai2_injector.res"
 
 # FakeHost：假 SAI2（ExtTextOutW 画图层行 + SetDIBitsToDevice 画缩略图），
 # 供 `sai2_injector selftest` 在不碰真 SAI2 的前提下验证整条注入链路
+make_res "SAI2 注入链路自检宿主" sai2_fakehost sai2_fakehost.exe VFT_APP "$RES/sai2_fakehost.res"
 "${ZIGC[@]}" -std=c++20 -O2 -Wno-everything -municode -Wl,--subsystem,windows \
     -o "$BUILD/tools/sai2_fakehost.exe" \
     "$ROOT/tools/agent-fakehost/FakeHost.cpp" \
-    -lgdi32 -luser32
+    -lgdi32 -luser32 "$RES/sai2_fakehost.res"
 
 # 把 4 个插件摆到 sai2_bridge.exe 旁边，PluginRegistry::Scan() 才能自动发现
 BRIDGE_PLUGINS="$BUILD/tools/plugins"

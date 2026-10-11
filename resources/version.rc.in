@@ -1,0 +1,41 @@
+// VERSIONINFO 资源模板 —— 由 scripts/build-zig.sh 用 sed 替换占位符后
+// 经 `zig rc` 编译为 .res 并链入各二进制。杀软启发式引擎对"无版本信息的
+// 裸二进制"评分更狠，带齐元数据可明显降低误报率。
+//
+// 占位符：@DESC@ 文件描述  @NAME@ 内部名  @FILE@ 原始文件名
+//         @TYPE@ VFT_APP / VFT_DLL  @VER@ 版本号
+#define VS_VERSION_INFO       1
+#define VOS_NT_WINDOWS32      0x00040004L
+#define VFT_APP               0x00000001L
+#define VFT_DLL               0x00000002L
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,13,0,0
+ PRODUCTVERSION 1,13,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       @TYPE@
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "PainterAnkry"
+            VALUE "FileDescription",  "@DESC@"
+            VALUE "FileVersion",      "@VER@"
+            VALUE "InternalName",     "@NAME@"
+            VALUE "LegalCopyright",   "MIT License, Copyright (c) PainterAnkry"
+            VALUE "OriginalFilename", "@FILE@"
+            VALUE "PrivateBuild",     ""
+            VALUE "ProductName",      "SAI2 Plugin Suite"
+            VALUE "ProductVersion",   "@VER@"
+            VALUE "SpecialBuild",     ""
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
