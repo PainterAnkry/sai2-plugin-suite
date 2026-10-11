@@ -2,7 +2,7 @@
 
 ## 快速开始（免构建）
 
-到 [Releases](../../releases) 下载 `sai2-plugin-suite-win64-*.zip`，解压后：
+到 [Releases](../../releases) 下载 `SAI2插件套件_x.xx.zip`（版本号随 Release 更新），解压后：
 
 1. 先启动 SAI2 并打开一幅画；
 2. 双击 `启动插件面板.bat`（或直接运行 `sai2_bridge.exe`）；
