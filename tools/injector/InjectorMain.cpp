@@ -25,6 +25,7 @@
     #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shellapi.h>   // CommandLineToArgvW（取原始 Unicode 命令行参数）
 #include <tlhelp32.h>
 
 #include <cstdio>
@@ -348,7 +349,30 @@ int RunSelfTest(const std::string& exeDirUtf8) {
 // 入口
 // ---------------------------------------------------------------------------
 
+// main() 的 argv 在 Windows 上来自 ANSI 命令行 —— 中文目录名会被转坏
+// （例如 "SAI2插件测试包" 变成乱码，导致注入器找不到 agent）。
+// 这里改用 CommandLineToArgvW 重新取一遍原始 Unicode 参数。
+namespace {
+
+std::vector<std::string> Utf8Args() {
+    std::vector<std::string> out;
+    int n = 0;
+    LPWSTR* w = CommandLineToArgvW(GetCommandLineW(), &n);
+    if (!w) return out;
+    for (int i = 0; i < n; ++i) out.push_back(WideToUtf8(w[i]));
+    LocalFree(w);
+    return out;
+}
+
+std::wstring WideArg(const std::vector<std::string>& a, size_t i) {
+    return Utf8ToWide(a[i]);
+}
+
+} // namespace
+
 int main(int argc, char** argv) {
+    std::vector<std::string> wargs = Utf8Args();
+    if (!wargs.empty()) argc = static_cast<int>(wargs.size());
     std::string action = "status";
     std::string pidStr, exeName = "sai2.exe", dllPathUtf8, launchPath;
     std::string cmdJson;
@@ -357,9 +381,12 @@ int main(int argc, char** argv) {
     std::string defaultDll = exeDir + "\\sai2_agent.dll";
 
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+        const std::string a = wargs[static_cast<size_t>(i)];
         auto next = [&](std::string& dst) {
-            if (i + 1 < argc) dst = argv[++i];
+            if (i + 1 < argc) {
+                // 路径类参数直接用宽字符版本转 UTF-8，避免丢字符
+                dst = WideToUtf8(WideArg(wargs, static_cast<size_t>(++i)));
+            }
         };
         if (a == "inject" || a == "eject" || a == "status" || a == "layers" ||
             a == "thumbs" || a == "text" || a == "cmd" || a == "selftest")

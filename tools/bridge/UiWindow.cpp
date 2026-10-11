@@ -29,6 +29,18 @@ namespace ui {
 
 namespace {
 
+// 输入驱动的"重渲染"触发消息：鼠标拖动（涂抹/滑杆）时输入远密于渲染速度，
+// 所以消息处理里只更新最新状态，整图渲染由这一条**投递消息**驱动。
+// 不能用 WM_TIMER/WM_PAINT：它们都是"队列空闲时才生成"的低优先级消息，输入一
+// 密集就被饿死 —— 用户报的"涂抹时画面不动、切换工具才看到变化"正是这个
+// （渲染堵住输入队列 → 画面不刷新 → 松手/切换后才补画出来）。
+const UINT kRenderMsg = WM_APP + 40;
+
+// 渲染完立刻把这一帧贴到屏幕上（只 Invalidate 会排队等系统施舍 WM_PAINT）
+void RepaintNow(HWND hwnd) {
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+}
+
 // 主面板的类名与窗口过程由 BridgeApp.cpp 提供（唯一来源，见 Ui.h）
 const ToolWindowSpec* Specs() {
     static ToolWindowSpec specs[BridgeCore::kWinCount];
@@ -138,6 +150,25 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
+    // 拖动过程中的显示帧：渲染一次整图并立刻贴屏（见 kRenderMsg 注释）
+    case kRenderMsg: {
+        win.renderPosted = false;
+        bool rendered = false;
+        if (win.dragStroke && win.strokeDirty) {
+            win.strokeDirty = false;
+            s.core->StrokeRender(win.id);
+            win.bgraDirty = true;
+            rendered = true;
+        } else if (win.dragSlider >= 0 && win.sliderPending) {
+            win.sliderPending = false;
+            OnSliderDrag(win, win.sliderPendX);
+            win.bgraDirty = true;
+            rendered = true;
+        }
+        if (rendered) RepaintNow(hwnd);
+        return 0;
+    }
+
     case WM_ERASEBKGND:
         return 1;
 
@@ -190,6 +221,12 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         s.core->StrokeBegin(nx, ny, win.id);
                         win.dragStroke = true;
                         win.strokeLast = {mx, my};
+                        win.strokeDirty = false;
+                        // 拖动期间的整图渲染由 kRenderMsg 驱动（见上）
+                        if (!win.renderPosted) {
+                            win.renderPosted = true;
+                            PostMessageW(hwnd, kRenderMsg, 0, 0);
+                        }
                         win.bgraDirty = true;
                     }
                 }
@@ -222,16 +259,25 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (win.dragSlider >= 0) {
-            OnSliderDrag(win, mx);
-            win.bgraDirty = true;
-            InvalidateRect(hwnd, nullptr, FALSE);
+            // 只记最新位置；渲染交给 kRenderMsg（大图一次渲染几十毫秒，
+            // 在消息处理里同步渲染会把输入队列堵死、画面反而不刷新）
+            win.sliderPendX = mx;
+            win.sliderPending = true;
+            if (!win.renderPosted) {
+                win.renderPosted = true;
+                PostMessageW(hwnd, kRenderMsg, 0, 0);
+            }
         } else if (win.dragStroke) {
             float nx = 0, ny = 0;
             if (CanvasPointToNorm(win, mx, my, nx, ny)) {
+                // 每个采样点都累积进置换场（这条很便宜）；整图渲染由 kRenderMsg 驱动
                 s.core->StrokeMove(nx, ny, win.id);
-                win.bgraDirty = true;
                 win.strokeLast = {mx, my};
-                InvalidateRect(hwnd, nullptr, FALSE);
+                win.strokeDirty = true;
+                if (!win.renderPosted) {
+                    win.renderPosted = true;
+                    PostMessageW(hwnd, kRenderMsg, 0, 0);
+                }
             }
         }
         return 0;
@@ -241,15 +287,20 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (win.dragZoom) win.dragZoom = false;
         if (win.dragSlider >= 0) {
             win.dragSlider = -1;
+            win.sliderPending = false;
             s.core->ParamChanged(win.id);
             win.bgraDirty = true;
         }
         if (win.dragStroke) {
             win.dragStroke = false;
+            win.strokeDirty = false;
+            win.bgraDirty = true;
             s.core->StrokeEnd(win.id);
+            // 收笔：按最终置换场渲染一帧（最后一个采样点已经累积过了）
+            s.core->StrokeRender(win.id);
         }
         ReleaseCapture();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        RepaintNow(hwnd);
         return 0;
 
     case WM_RBUTTONDOWN:

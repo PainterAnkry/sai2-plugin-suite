@@ -131,12 +131,28 @@ public:
         const float angleDeg = GetParamFloat(*host_, "liquify.angle", 45.0f);
         const float angleRad = angleDeg * 3.14159265358979f / 180.0f;
 
-        ApplyTool(tool, cx, cy, radius, strength, dirX, dirY, angleRad);
+        // 宿主协议扩展（内部参数；不传就是原来的"应用 + 渲染"，向后兼容）：
+        //   liquify.mode = "accumulate" → 只把这一笔累加进置换场，不做逆映射渲染。
+        //       大图上实时涂抹时，鼠标每个采样点都会调到这里，而逆映射是全图
+        //       O(N)（8MP 要几十上百毫秒）——逐点渲染会把宿主的输入队列堵死，
+        //       画面根本不刷新。所以宿主用这个模式廉价地"记一笔"。
+        //   liquify.mode = "render"     → 只渲染当前置换场，不再应用新的一笔。
+        //       宿主按显示帧率单独调一次，拿到这一帧要显示的画面。
+        const std::string mode = GetParamString(*host_, "liquify.mode", "apply");
+
+        if (mode != "render") {
+            ApplyTool(tool, cx, cy, radius, strength, dirX, dirY, angleRad);
+        }
+        if (mode == "accumulate") {
+            // 画布保持原样：宿主只关心插件内部累积的置换场，不取这个结果
+            host_->Log(LogLevel::Info, ("Liquify " + tool + " accumulate").c_str());
+            host_->EndUndoGroup();
+            return true;
+        }
 
         // 一次性逆映射渲染：源恒为 original_，笔笔干净
         liquify::RenderLiquify(original_, field_, *canvas,
                                host_->GetSelection());
-
         // 注意：这里不能为了日志去调 field_.MaxMagnitude() —— 它是全图 O(N)
         // 求模，每笔鼠标移动都执行一次，大图上就是几十毫秒的纯浪费。
         host_->Log(LogLevel::Info,

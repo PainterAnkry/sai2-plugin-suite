@@ -115,13 +115,16 @@ public:
     bool GrabFromClipboard(std::string& error);
 
     // 重算预览（滑块变化 / 换效果 / 笔画后调用）；winIdx 缺省 = 主面板
-    void UpdatePreview(int winIdx = kWinMain);
+    // liqMode 非空时透传给液化插件（"render" = 只重渲染置换场，不再应用新一笔，
+    // 供涂抹过程中的显示帧使用）。
+    void UpdatePreview(int winIdx = kWinMain, const char* liqMode = nullptr);
 
     // 按给定倍率跑一遍当前效果（scale >= 1 = 全分辨率）。
     // explicitBase 非空时用它当基准（提交路径必须显式传基准，避免用到
     // 某个还没建立会话的窗口基准）。
     ImageBuffer RenderEffect(int winIdx, float scale, bool recordUndo = false,
-                             const ImageBuffer* explicitBase = nullptr);
+                             const ImageBuffer* explicitBase = nullptr,
+                             const char* liqMode = nullptr);
 
     // 全分辨率应用当前效果并写回剪贴板
     struct ApplyResult {
@@ -142,9 +145,13 @@ public:
 
     // ---- 液化笔画 -------------------------------------------------------
     // 按"上一采样点 → 本次点"提交一笔（笔刷中心 + 拖动方向）。
+    // 注意：StrokeMove 只做"廉价累积"（把这一笔加进置换场，不做全图逆映射渲染），
+    // 所以可以每个鼠标采样点都调；要看到画面得另外调 StrokeRender（按显示帧率）。
     // 默认窗口 = 液化窗口；自检/无界面调用可直接省略 winIdx。
     void StrokeBegin(float nx, float ny, int winIdx = kWinLiquify);
     void StrokeMove(float nx, float ny, int winIdx = kWinLiquify);
+    // 只渲染当前置换场（不再应用新的一笔）→ 生成这一显示帧的画面
+    void StrokeRender(int winIdx = kWinLiquify);
     void StrokeEnd(int winIdx = kWinLiquify);
     // 撤销液化窗口里的上一笔（插件侧置换场快照回退）。
     // 仅对液化窗口生效（返回 false = 非液化窗口，调用方可回退到 Undo）。
@@ -200,6 +207,8 @@ private:
     void LoadParams(int effectIndex);
     // 保证 paramValues_ 就是该窗口选中效果的参数（需要时从 effectParams_ 取）
     void EnsureParamsForWindow(int winIdx) const;
+    // 液化：只把当前这一笔累加进插件置换场（不渲染，开销极小）
+    void StrokeAccumulate(int winIdx);
     // 预览基准（全分辨率，叠加模式下 = 当前已应用结果）
     ImageBuffer PreviewBase(int winIdx);
     void RebuildPreviewSource(int winIdx);
@@ -239,8 +248,7 @@ private:
     bool started_ = false;
 
     // 液化会话：每个窗口一个标识（变化即代表"换了一张图/复位"）
-    std::vector<std::string> sessionIds_;
-    int sessionCounter_ = 0;
+    std::vector<std::string> sessionIds_;    int sessionCounter_ = 0;
     bool strokeActive_ = false;
     int strokeWin_ = kWinLiquify;
     float strokeX_ = 0.5f, strokeY_ = 0.5f;
@@ -252,8 +260,11 @@ private:
     bool liquifyUndoPending_ = false;
     int liquifyStrokeCount_ = 0;          // 当前会话内已开始的笔画数
     std::string liquifyStrokeSession_;    // 笔画计数所属的会话
-    // 拖笔节流：上次预览渲染的时刻（鼠标移动频率远高于屏幕刷新率时跳帧）
-    std::chrono::steady_clock::time_point lastStrokeRenderAt_{};
+    // 累积调用用的"替身画布"：液化插件要求画布尺寸与会话原图一致（否则判定换图
+    // 会重置置换场），而累积又不需要真实像素 —— 复用这一张，避免每个采样点
+    // 克隆 8MP 大图（35MB 拷贝）。
+    ImageBuffer strokeScratch_;
+
 
     std::string status_;
     std::vector<std::string> logLines_;

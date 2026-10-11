@@ -31,6 +31,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <io.h>
 #include <memory>
 #include <string>
 #include <thread>
@@ -531,6 +533,48 @@ void SendEscape() {
     SendInput(2, in, sizeof(INPUT));
 }
 
+// 用户正按着鼠标（拖拽中/选区中）时绝不能注入合成输入：
+// 此时插入 LEFTDOWN/UP 或按键会污染系统输入状态机，最坏把 Explorer
+// 的拖拽状态留在"按钮未释放"，表现为文件/图标拖拽全部失效，直到重启。
+bool UserHoldingMouse() {
+    return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
+           (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+}
+
+// 最多等 timeoutMs 毫秒，让用户先松开鼠标（正在拖拽时返回 false）
+void WaitMouseReleased(int timeoutMs) {
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>(timeoutMs);
+    while (UserHoldingMouse() && GetTickCount64() < deadline) Sleep(60);
+}
+
+// 保险丝：把自动化用到的所有键/鼠标强制补一次 KEYUP。
+// 正常流程它们都是成对发送的；一旦某条失败路径把 down 留在系统里
+// （逻辑上卡住的 Ctrl/Alt/Esc/左键会让拖拽/点选全面异常），这里兜底。
+// 对本来已松开的键补 KEYUP 无副作用。
+void ReleaseSyntheticKeys() {
+    INPUT in[6] = {};
+    for (int i = 0; i < 6; ++i) in[i].type = INPUT_KEYBOARD;
+    in[0].ki.wScan = 0x1D; // Ctrl
+    in[0].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+    in[1].ki.wVk = VK_MENU; // Alt
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[2].ki.wVk = VK_ESCAPE;
+    in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].ki.wVk = VK_SHIFT;
+    in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[4].ki.wScan = 0x1D;
+    in[4].ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+    in[5].ki.wVk = VK_CONTROL;
+    in[5].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(6, in, sizeof(INPUT));
+    INPUT m[2] = {};
+    m[0].type = INPUT_MOUSE;
+    m[0].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    m[1].type = INPUT_MOUSE;
+    m[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+    SendInput(2, m, sizeof(INPUT));
+}
+
 // ---------------------------------------------------------------------------
 // 抓取流程（后台线程里按阶段推进）
 // ---------------------------------------------------------------------------
@@ -566,8 +610,9 @@ struct CaptureJob {
 CaptureJob g_cap;
 std::thread g_capThread;
 
-// 单击屏幕某点
+// 单击屏幕某点（用户正拖拽时先等松开，最多 1 秒）
 void ClickAtScreenImpl(int x, int y) {
+    WaitMouseReleased(1000);
     const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -617,10 +662,15 @@ void RunCaptureJob() {
     j.message.clear();
     j.clipSeq = GetClipboardSequenceNumber();
 
+    // 用户正在拖拽/按住鼠标时推迟注入：拖拽中途插入合成输入会污染
+    // 系统输入状态机（拖拽失效的根源之一），等他松手再动。
+    WaitMouseReleased(3000);
+
     HWND sai = FindSai2Window();
     if (!sai) {
         j.message = L"未找到 SAI2 窗口（sai2.exe 未运行？）";
         j.phase = CAP_FAIL;
+        ReleaseSyntheticKeys();
         PostMessageW(S().mainHwnd, WM_CAPTURE_DONE, 0, 0);
         return;
     }
@@ -657,6 +707,7 @@ void RunCaptureJob() {
         if (!MenuItemClickImpl(sai, 120, L"全选")) {
             j.message = L"抓取失败：Ctrl+A/Ctrl+C 未生效，也未定位到「全选」菜单项";
             j.phase = CAP_FAIL;
+            ReleaseSyntheticKeys();
             PostMessageW(S().mainHwnd, WM_CAPTURE_DONE, 0, 0);
             return;
         }
@@ -665,6 +716,7 @@ void RunCaptureJob() {
         if (!MenuItemClickImpl(sai, 120, L"拷贝")) {
             j.message = L"抓取失败：未定位到 SAI2 的「拷贝」菜单项";
             j.phase = CAP_FAIL;
+            ReleaseSyntheticKeys();
             PostMessageW(S().mainHwnd, WM_CAPTURE_DONE, 0, 0);
             return;
         }
@@ -680,6 +732,8 @@ void RunCaptureJob() {
         if (!j.grabbed) j.message = L"SAI2 没有把图像放进剪贴板（拷贝失败？）";
     }
     j.phase = j.grabbed ? CAP_DONE : CAP_FAIL;
+    // 保险丝：确保 Ctrl/Alt/Esc/鼠标键没有逻辑上残留在按下状态
+    ReleaseSyntheticKeys();
     PostMessageW(S().mainHwnd, WM_CAPTURE_DONE, 0, 0);
 }
 
@@ -1000,19 +1054,141 @@ void GrabSelectedLayer(HWND hwnd, int rowIdx, int wantWindow) {
     (void)hwnd;
 }
 
+// 在若干候选位置里找 sai2_injector.exe / sai2_agent.dll。
+// 场景：解压时多套了一层目录（外层只有 sai2_bridge.exe），或者用户把
+// injector/agent 放在了子目录里 —— 这时按"只看自己所在目录"就会误报
+// "找不到 sai2_injector.exe"，所以这里把常见位置都找一遍，
+// 找到了就把两个路径显式传给注入器（--dll / --out）。
+bool FileExistsW(const std::wstring& p) {
+    const DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+std::wstring DirOf(const std::wstring& path) {
+    const size_t p = path.find_last_of(L"\\/");
+    return p == std::wstring::npos ? std::wstring() : path.substr(0, p);
+}
+
+// 宽字符路径 → UTF-8（写日志用）
+std::string Wide2Utf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
+                                      static_cast<int>(w.size()), nullptr, 0,
+                                      nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                        out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+struct InjectorPaths {
+    std::wstring injector;
+    std::wstring agent;
+    std::vector<std::wstring> tried;
+};
+
+InjectorPaths FindInjectorTools(const std::wstring& exeDir) {
+    InjectorPaths r;
+    std::vector<std::wstring> dirs;
+    auto push = [&dirs](const std::wstring& d) {
+        if (!d.empty() &&
+            std::find(dirs.begin(), dirs.end(), d) == dirs.end())
+            dirs.push_back(d);
+    };
+    push(exeDir);
+    push(DirOf(exeDir)); // 上一层（解压多套一层时的常见情况）
+
+    // 当前目录 + 一/二级子目录（子目录名不限，覆盖 sai2-plugin-suite /
+    // 中文包名 / bin 等各种解压结果）
+    wchar_t cwd[MAX_PATH] = {0};
+    if (GetCurrentDirectoryW(MAX_PATH, cwd) > 0) push(cwd);
+    std::vector<std::wstring> bases = dirs;
+    for (const std::wstring& base : bases) {
+        WIN32_FIND_DATAW fd{};
+        const std::wstring pat = base + L"\\*";
+        HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 ||
+                wcscmp(fd.cFileName, L"..") == 0)
+                continue;
+            const std::wstring sub = base + L"\\" + fd.cFileName;
+            push(sub);
+            // 再下一级
+            WIN32_FIND_DATAW fd2{};
+            HANDLE h2 = FindFirstFileW((sub + L"\\*").c_str(), &fd2);
+            if (h2 == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (!(fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                    continue;
+                if (wcscmp(fd2.cFileName, L".") == 0 ||
+                    wcscmp(fd2.cFileName, L"..") == 0)
+                    continue;
+                push(sub + L"\\" + fd2.cFileName);
+            } while (FindNextFileW(h2, &fd2));
+            FindClose(h2);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    for (const std::wstring& d : dirs) {
+        const std::wstring inj = d + L"\\sai2_injector.exe";
+        r.tried.push_back(inj);
+        if (!FileExistsW(inj)) continue;
+        r.injector = inj;
+        const std::wstring ag = d + L"\\sai2_agent.dll";
+        if (FileExistsW(ag)) r.agent = ag;
+        break;
+    }
+    // agent 没跟 injector 同目录时，再单独找一遍
+    if (r.injector.empty() || r.agent.empty()) {
+        for (const std::wstring& d : dirs) {
+            const std::wstring ag = d + L"\\sai2_agent.dll";
+            if (FileExistsW(ag)) {
+                r.agent = ag;
+                break;
+            }
+        }
+    }
+    return r;
+}
+
 void DoInjectAsync(HWND hwnd) {
     AppState& s = S();
     wchar_t buf[MAX_PATH] = {0};
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring dir(buf);
-    const size_t p = dir.find_last_of(L"\\/");
-    if (p != std::wstring::npos) dir = dir.substr(0, p);
-    const std::wstring exe = dir + L"\\sai2_injector.exe";
+    const std::wstring exeDir = DirOf(std::wstring(buf));
+    const InjectorPaths paths = FindInjectorTools(exeDir);
+
+    if (paths.injector.empty()) {
+        std::string msg = "找不到 sai2_injector.exe，已找过这些位置：";
+        for (const std::wstring& t : paths.tried) {
+            const int n = WideCharToMultiByte(CP_UTF8, 0, t.c_str(), -1, nullptr,
+                                              0, nullptr, nullptr);
+            if (n > 1) {
+                std::string u8(static_cast<size_t>(n - 1), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, t.c_str(), -1, u8.data(), n,
+                                    nullptr, nullptr);
+                msg += "\n  " + u8;
+            }
+        }
+        S().core->Log("injector: " + msg);
+        s.flash = L"找不到 sai2_injector.exe —— 它要和 sai2_bridge.exe 放在一起"
+                  L"（详见日志）";
+        InvalidateAll();
+        return;
+    }
+    S().core->Log("injector: 使用 " + Wide2Utf8(paths.injector));
+
+    const std::wstring injector = paths.injector;
+    const std::wstring agent = paths.agent;
 
     s.flash = L"正在注入 SAI2 代理…";
     InvalidateAll();
 
-    std::thread([hwnd, exe]() {
+    std::thread([hwnd, injector, agent, exeDir]() {
         SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
         HANDLE readEnd = nullptr, writeEnd = nullptr;
         std::string out;
@@ -1025,16 +1201,23 @@ void DoInjectAsync(HWND hwnd) {
             si.hStdOutput = writeEnd;
             si.hStdError = writeEnd;
             PROCESS_INFORMATION pi = {};
-            std::wstring cmdline = L"\"" + exe + L"\" inject";
+            // 显式把 agent 路径喂给注入器；同时用注入器所在目录当工作目录
+            // （它默认会找同目录的 sai2_agent.dll）
+            std::wstring cmdline = L"\"" + injector + L"\" inject";
+            if (!agent.empty())
+                cmdline += L" --dll \"" + agent + L"\"";
             std::vector<wchar_t> cmdbuf(cmdline.begin(), cmdline.end());
             cmdbuf.push_back(L'\0');
-            if (CreateProcessW(exe.c_str(), cmdbuf.data(), nullptr, nullptr, TRUE,
-                               CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            const std::wstring workDir = DirOf(injector);
+            if (CreateProcessW(injector.c_str(), cmdbuf.data(), nullptr, nullptr,
+                               TRUE, CREATE_NO_WINDOW, nullptr,
+                               workDir.empty() ? nullptr : workDir.c_str(), &si,
+                               &pi)) {
                 CloseHandle(writeEnd);
                 WaitForSingleObject(pi.hProcess, 25000);
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
-                char tmp[1024] = {0};
+                char tmp[2048] = {0};
                 DWORD n = 0;
                 ReadFile(readEnd, tmp, sizeof(tmp) - 1, &n, nullptr);
                 if (n > 0) {
@@ -1042,7 +1225,11 @@ void DoInjectAsync(HWND hwnd) {
                     out = tmp;
                 }
             } else {
-                out = "找不到 sai2_injector.exe";
+                char e[128];
+                std::snprintf(e, sizeof(e),
+                              "启动注入器失败 err=%lu（路径见日志）",
+                              static_cast<unsigned long>(GetLastError()));
+                out = e;
             }
             CloseHandle(readEnd);
         }
@@ -1298,10 +1485,33 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // ---------------------------------------------------------------------------
 // 入口辅助
 // ---------------------------------------------------------------------------
+// GUI 子系统下把 CLI 输出接回去：
+//   1) 从真控制台启动（交互式）→ AttachConsole 父控制台；
+//   2) 被重定向/管道（> file、Git Bash 捕获）→ AttachConsole 会失败，
+//      但进程仍继承了 stdout/stderr 句柄，用 _open_osfhandle 接回 CRT。
+// 没有这两条，--selftest 在 GUI 子系统下输出会静默丢失。
+void ReopenStdHandle(DWORD stdId, const char* mode, FILE* stream) {
+    HANDLE h = GetStdHandle(stdId);
+    if (!h || h == INVALID_HANDLE_VALUE) return;
+    int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h),
+                             _O_WRONLY | _O_TEXT);
+    if (fd < 0) return;
+    FILE* f = _fdopen(fd, mode);
+    if (!f) {
+        _close(fd);
+        return;
+    }
+    *stream = *f;
+}
+
 void AttachParentConsole() {
-    if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;
-    freopen("CONOUT$", "w", stdout);
-    freopen("CONOUT$", "w", stderr);
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+        return;
+    }
+    ReopenStdHandle(STD_OUTPUT_HANDLE, "w", stdout);
+    ReopenStdHandle(STD_ERROR_HANDLE, "w", stderr);
 }
 
 std::string ExeDir() {
@@ -1345,13 +1555,25 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
+    // 正常双击/bat 启动（无 CLI 参数）时隐藏宿主控制台窗口：
+    // 面板后面挂一个黑色 cmd 既难看，它的 QuickEdit 选择模式还会捕获
+    // 鼠标（点住一拖变成选中文字），干扰正常拖拽操作。
+    // 带 CLI 参数（--selftest/--uitest/--demo…）时保留控制台，供测试捕获输出。
+    if (argc <= 1) {
+        if (HWND con = GetConsoleWindow()) ShowWindow(con, SW_HIDE);
+    }
+
     std::string pluginsDir = ExeDir() + "\\plugins";
     std::string logDir = ExeDir() + "\\logs";
     std::string outDir = ExeDir() + "\\selftest-out";
     std::string dumpPath;
     bool selfTest = false;
+    bool findTools = false; // 只报告"注入器/agent 找到在哪"，不真的注入
     int uiTestSeconds = 0; // >0: 打开全部功能窗口，跑几秒后自动退出（UI 冒烟测试）
     int demoSeconds = 0;   // >0: 功能演示模式（自动编排 + 逐帧导出 BMP 到 outDir）
+    bool brushBench = false; // 笔刷流畅度自检（真实消息队列灌拖动 + 屏抓统计刷新）
+    int brushW = 2480, brushH = 3508; // 自检用测试图尺寸（默认 A4@300dpi）
+    int sai2DemoSeconds = 0; // >0: 真机 SAI2 演示（抓注入图层 → 液化涂抹 → 应用）
 
     for (int i = 1; i < argc; ++i) {
         const std::wstring a = argv[i];
@@ -1368,6 +1590,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         };
         if (a == L"--selftest") selfTest = true;
         else if (a == L"--uitest") uiTestSeconds = 6;
+        else if (a == L"--find-tools") findTools = true;
         else if (a == L"--demo") {
             demoSeconds = 30;
             // 可选跟一个秒数：--demo 20
@@ -1382,10 +1605,56 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         else if (a == L"--plugins") next(pluginsDir);
         else if (a == L"--logs") next(logDir);
         else if (a == L"--out") next(outDir);
+        else if (a == L"--brushbench") {
+            brushBench = true;
+            // 可选跟一个尺寸：--brushbench 2000x2500
+            if (i + 1 < argc) {
+                const std::wstring v = argv[i + 1];
+                const size_t xp = v.find(L'x');
+                if (xp != std::wstring::npos) {
+                    const int w = _wtoi(v.substr(0, xp).c_str());
+                    const int h = _wtoi(v.substr(xp + 1).c_str());
+                    if (w >= 64 && h >= 64 && w <= 8000 && h <= 8000) {
+                        brushW = w;
+                        brushH = h;
+                        ++i;
+                    }
+                }
+            }
+        }
+        else if (a == L"--sai2demo") {
+            sai2DemoSeconds = 6;
+            if (i + 1 < argc) {
+                const int v = _wtoi(argv[i + 1]);
+                if (v > 0 && v <= 120) {
+                    sai2DemoSeconds = v;
+                    ++i;
+                }
+            }
+        }
         else if (a == L"--dump-clipboard") next(dumpPath);
     }
     if (argv) LocalFree(argv);
     g_uiTestSeconds = uiTestSeconds;
+
+    // 只报告注入器/agent 找在哪（不入界面、不注入），用于排查"找不到
+    // sai2_injector.exe"这类问题：卡片会被解压成几层目录时特别有用。
+    if (findTools) {
+        AttachParentConsole();
+        wchar_t buf[MAX_PATH] = {0};
+        GetModuleFileNameW(nullptr, buf, MAX_PATH);
+        const std::wstring exeDir = DirOf(std::wstring(buf));
+        const InjectorPaths p = FindInjectorTools(exeDir);
+        std::printf("本程序目录: %s\n", Wide2Utf8(exeDir).c_str());
+        std::printf("injector  : %s\n",
+                    p.injector.empty() ? "(未找到)" : Wide2Utf8(p.injector).c_str());
+        std::printf("agent dll : %s\n",
+                    p.agent.empty() ? "(未找到)" : Wide2Utf8(p.agent).c_str());
+        std::printf("已查找 %d 个位置:\n", static_cast<int>(p.tried.size()));
+        for (const std::wstring& t : p.tried)
+            std::printf("  %s\n", Wide2Utf8(t).c_str());
+        return p.injector.empty() ? 1 : 0;
+    }
 
     if (!dumpPath.empty()) {
         AttachParentConsole();
@@ -1459,6 +1728,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             outDir = ExeDir() + "\\demo-frames"; // 默认输出目录
         CreateDirectoryW(U8(outDir).c_str(), nullptr);
         RunDemo(demoSeconds, outDir);
+    }
+    // 笔刷流畅度自检：真实消息队列灌拖动 + 屏抓统计（量化"涂抹时画面不动"）
+    else if (brushBench) {
+        g_uiTestSeconds = 60;
+        if (outDir == ExeDir() + "\\selftest-out")
+            outDir = ExeDir() + "\\brushbench-out";
+        CreateDirectoryW(U8(outDir).c_str(), nullptr);
+        RunBrushBench(brushW, brushH, outDir);
+    }
+    // 真机 SAI2 演示：抓注入图层 → 液化真涂抹 → 应用回写（录素材用）
+    else if (sai2DemoSeconds > 0) {
+        g_uiTestSeconds = sai2DemoSeconds + 60; // 跳过图层看门狗
+        RunSai2Demo(sai2DemoSeconds, outDir);
     }
     // UI 冒烟测试：把 4 个功能窗口全部打开（每个都完整绘制一遍布局），
     // 停留 uiTestSeconds 秒后自动退出。用于无人值守地验证窗口创建/绘制。

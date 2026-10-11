@@ -340,7 +340,10 @@ bool EnsureBgra(UiWindow& win, const ImageBuffer& img) {
         !win.bgra.empty())
         return true;
 
-    win.bgra.assign(static_cast<size_t>(img.Width()) * img.Height() * 4, 0);
+    if (win.bgra.size() !=
+        static_cast<size_t>(img.Width()) * img.Height() * 4) {
+        win.bgra.assign(static_cast<size_t>(img.Width()) * img.Height() * 4, 0);
+    }
     win.bgraW = img.Width();
     win.bgraH = img.Height();
     const uint32_t bpc = img.BytesPerChannel();

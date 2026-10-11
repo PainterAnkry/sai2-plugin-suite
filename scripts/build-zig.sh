@@ -71,8 +71,9 @@ echo "==> [5/7] sai2_tests.exe + sai2_hostdemo.exe + sai2_computebench.exe"
     "$ROOT/tools/ComputeBench.cpp" "${SDK_SRC[@]}" "${HOST_SRC[@]}"
 
 echo "==> [6/7] sai2_bridge.exe（伴随宿主：剪贴板桥 + 主面板 + 4 个功能窗口）"
-# -mwindows/-municode：GUI 子系统 + wWinMain 入口；--selftest 走 AttachConsole
-"${ZIGC[@]}" "${CXXFLAGS[@]}" -municode -mwindows \
+# 保持控制台子系统（--selftest/--uitest/--demo 的输出要能被测试管道捕获）。
+# 双击/.bat 启动时由 wWinMain 主动隐藏控制台窗口（见 BridgeApp.cpp）。
+"${ZIGC[@]}" "${CXXFLAGS[@]}" -municode \
     "-I$ROOT/tools/bridge" \
     -o "$BUILD/tools/sai2_bridge.exe" \
     "$ROOT/tools/bridge/BridgeApp.cpp" \
@@ -119,7 +120,7 @@ echo "==> [7/7] 注入链路（sai2_agent.dll + sai2_injector.exe + sai2_fakehos
 
 # FakeHost：假 SAI2（ExtTextOutW 画图层行 + SetDIBitsToDevice 画缩略图），
 # 供 `sai2_injector selftest` 在不碰真 SAI2 的前提下验证整条注入链路
-"${ZIGC[@]}" -std=c++20 -O2 -Wno-everything -municode -mwindows \
+"${ZIGC[@]}" -std=c++20 -O2 -Wno-everything -municode -Wl,--subsystem,windows \
     -o "$BUILD/tools/sai2_fakehost.exe" \
     "$ROOT/tools/agent-fakehost/FakeHost.cpp" \
     -lgdi32 -luser32

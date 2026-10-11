@@ -439,7 +439,8 @@ ImageBuffer BridgeCore::PreviewBase(int winIdx) {
 }
 
 ImageBuffer BridgeCore::RenderEffect(int winIdx, float scale, bool recordUndo,
-                                     const ImageBuffer* explicitBase) {
+                                     const ImageBuffer* explicitBase,
+                                     const char* liqMode) {
     const int wi = Norm(winIdx);
     UiPreview* w = Win(wi);
     const bool isTool = (wi != kWinMain);
@@ -497,6 +498,8 @@ ImageBuffer BridgeCore::RenderEffect(int winIdx, float scale, bool recordUndo,
         host_->SetParam("liquify.cy", strokeY_);
         host_->SetParam("liquify.dirX", pendingZeroDir_ ? 0.0f : pendingDirX_);
         host_->SetParam("liquify.dirY", pendingZeroDir_ ? 0.0f : pendingDirY_);
+        // 涂抹过程中的"显示帧"：只重渲染置换场，不再重复应用最后一笔
+        if (liqMode) host_->SetParam("liquify.mode", std::string(liqMode));
         // 笔级撤销协议：本笔开始前先让插件快照置换场；撤销时回退一笔
         if (strokeBeginPending_) {
             host_->SetParam("liquify.begin", 1);
@@ -525,7 +528,7 @@ ImageBuffer BridgeCore::RenderEffect(int winIdx, float scale, bool recordUndo,
     return std::move(host_->Canvas());
 }
 
-void BridgeCore::UpdatePreview(int winIdx) {
+void BridgeCore::UpdatePreview(int winIdx, const char* liqMode) {
     const int wi = Norm(winIdx);
     if (!started_ || !HasImage() || effects_.empty()) return;
     UiPreview* w = Win(wi);
@@ -544,7 +547,7 @@ void BridgeCore::UpdatePreview(int winIdx) {
 
     const auto t0 = Clock::now();
     // 预览不记录 Undo（拖动滑块会产生大量中间状态）
-    w->display = RenderEffect(wi, w->scale, false);
+    w->display = RenderEffect(wi, w->scale, false, nullptr, liqMode);
     w->ms = MsSince(t0);
     w->commitScale = w->scale;
     w->showApplied = false;
@@ -719,8 +722,7 @@ void BridgeCore::StrokeBegin(float nx, float ny, int winIdx) {
     pendingZeroDir_ = true;
     // 通知插件在应用本笔前快照置换场（供 Ctrl+Z 撤销上一笔）
     strokeBeginPending_ = true;
-    // 单击也算一笔（膨胀/收缩/旋转不需要拖动方向）
-    lastStrokeRenderAt_ = Clock::now();
+    // 单击也算一笔（膨胀/收缩/旋转不需要拖动方向）：渲染首帧
     UpdatePreview(w);
 }
 
@@ -759,20 +761,86 @@ void BridgeCore::StrokeMove(float nx, float ny, int winIdx) {
         pendingZeroDir_ = true;
     }
 
-    // 节流：鼠标移动事件（125~1000Hz）远密于屏幕能呈现的帧率，
-    // 渲染又耗时几十毫秒 —— 事件排着队逐个渲染就是"卡"。
-    // 距上次渲染不足 12ms 时跳过本帧（下一次移动事件会补上最新位置）。
-    const auto now = Clock::now();
-    const double sinceLast =
-        lastStrokeRenderAt_.time_since_epoch().count() == 0
-            ? 1e9
-            : std::chrono::duration<double, std::milli>(now - lastStrokeRenderAt_)
-                  .count();
-    if (sinceLast < 12.0) return;
-
-    lastStrokeRenderAt_ = now;
-    UpdatePreview(w);
+    // 只累积、不渲染：把这一笔加进插件内部的置换场（很便宜），
+    // 逆映射渲染交给 StrokeRender 按显示帧率做。
+    // 之前这里是"同步全图渲染 + 12ms 节流"——渲染一次几十上百毫秒，鼠标事件
+    // 125Hz 灌进来，输入队列越积越多；WM_PAINT 又是低优先级消息被饿死，
+    // 于是拖动期间画布根本不刷新（用户报的"画的时候没变化"）。
+    StrokeAccumulate(w);
     Win(w)->showApplied = false;
+}
+
+void BridgeCore::StrokeAccumulate(int winIdx) {
+    const int w = Norm(winIdx);
+    if (!started_ || !manager_ || !host_) return;
+    UiPreview* wp = Win(w);
+    const int eidx = (w != kWinMain && wp->effectIndex >= 0) ? wp->effectIndex
+                                                             : current_;
+    if (!EffectAvailable(eidx)) return;
+    if (eidx != current_) EnsureParamsForWindow(w);
+    const EffectDef& e = effects_[static_cast<size_t>(eidx)];
+    if (e.group != kGroupLiquify) return;
+
+    host_->ClearParams();
+    for (const auto& kv : e.fixed) host_->SetParam(kv.first, kv.second);
+    for (size_t i = 0; i < e.params.size() && i < paramValues_.size(); ++i) {
+        const UiParam& p = e.params[i];
+        const float v = paramValues_[i];
+        if (p.isInt)
+            host_->SetParam(p.key, static_cast<int>(std::lround(v)));
+        else
+            host_->SetParam(p.key, v);
+    }
+    host_->SetParam("liquify.session", sessionIds_[static_cast<size_t>(w)]);
+    host_->SetParam("liquify.cx", strokeX_);
+    host_->SetParam("liquify.cy", strokeY_);
+    host_->SetParam("liquify.dirX", pendingZeroDir_ ? 0.0f : pendingDirX_);
+    host_->SetParam("liquify.dirY", pendingZeroDir_ ? 0.0f : pendingDirY_);
+    host_->SetParam("liquify.mode", std::string("accumulate"));
+    if (strokeBeginPending_) {
+        host_->SetParam("liquify.begin", 1);
+        strokeBeginPending_ = false;
+        const std::string& sid = sessionIds_[static_cast<size_t>(w)];
+        if (liquifyStrokeSession_ != sid) {
+            liquifyStrokeSession_ = sid;
+            liquifyStrokeCount_ = 0;
+        }
+        ++liquifyStrokeCount_;
+    }
+    if (liquifyUndoPending_) {
+        host_->SetParam("liquify.undo", 1);
+        liquifyUndoPending_ = false;
+    }
+
+    // 累积调用不记录 Undo（一笔一个快照，由 strokeBeginPending_ 负责）
+    host_->SetRecordingUndo(false);
+    // 画布尺寸必须与会话原图一致，否则插件判定"换图"会重置置换场；
+    // 内容无关紧要，所以复用一张替身画布而不是克隆整幅图。
+    ImageBuffer& base = wp->base;
+    if (!strokeScratch_.IsValid() || !base.IsValid() ||
+        strokeScratch_.Width() != base.Width() ||
+        strokeScratch_.Height() != base.Height() ||
+        strokeScratch_.Format() != base.Format()) {
+        strokeScratch_ = base.IsValid() ? base.Clone() : ImageBuffer();
+    }
+    if (!strokeScratch_.IsValid()) return;
+    host_->SetCanvas(std::move(strokeScratch_), false);
+    std::string err;
+    if (!manager_->ExecutePlugin(e.pluginId, err)) {
+        status_ = "执行失败: " + err;
+        Log("liquify accumulate failed: " + err);
+    }
+    strokeScratch_ = std::move(host_->Canvas()); // 收回替身，供下一个采样点复用
+    host_->SetRecordingUndo(true);
+}
+
+void BridgeCore::StrokeRender(int winIdx) {
+    const int w = Norm(winIdx);
+    if (!started_ || !HasImage()) return;
+    UiPreview* wp = Win(w);
+    if (w != kWinMain && !wp->open) return;
+    // "render"：只重渲染当前置换场（不再应用新的一笔）
+    UpdatePreview(w, "render");
 }
 
 void BridgeCore::StrokeEnd(int winIdx) {

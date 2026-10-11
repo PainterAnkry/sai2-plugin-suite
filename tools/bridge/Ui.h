@@ -140,9 +140,15 @@ struct UiWindow {
     // 液化涂抹
     bool dragStroke = false;
     POINT strokeLast{};
+    // 累积已进置换场、等一个显示帧渲染（kRenderMsg 驱动）
+    bool strokeDirty = false;
+    // 已经投递了一条渲染请求（避免拖动时把消息队列灌满渲染请求）
+    bool renderPosted = false;
 
     // 滑杆拖动
     int dragSlider = -1;
+    int sliderPendX = 0;
+    bool sliderPending = false;
 
     // 画布缩放滑杆（放大镜）拖动
     bool dragZoom = false;
