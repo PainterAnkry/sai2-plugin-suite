@@ -82,7 +82,9 @@ public:
         // 撤销时不产生新的形变，直接渲染回退后的场。
         if (GetParamBool(*host_, "liquify.undo", false)) {
             if (!undoStack_.empty()) {
-                field_ = undoStack_.back();
+                // swap 而非深拷贝：undo 恢复后栈顶快照即被丢弃，
+                // 直接交换可省一次全画布置换场的内存分配
+                std::swap(field_, undoStack_.back());
                 undoStack_.pop_back();
             }
             liquify::RenderLiquify(original_, field_, *canvas,
@@ -95,8 +97,20 @@ public:
             return true;
         }
         if (GetParamBool(*host_, "liquify.begin", false)) {
+            // 撤销快照按内存预算限深：置换场是全画布分辨率、每像素 8 字节，
+            // 4000x3000 画布一步就要 96MB——固定 30 步要 2.9GB，足以把机器
+            // 推进内存交换、拖垮整个系统（用户反馈"用完液化一直卡，必须
+            // 关插件重启 SAI2"）。按 384MB 预算折算最大步数，
+            // 小画布（1920x1080 ≈ 16MB/步）仍保留 30 步的完整撤销体验。
+            const size_t bytesPerStep =
+                static_cast<size_t>(field_.Width()) *
+                static_cast<size_t>(field_.Height()) * 8;
+            const size_t kUndoBudget = 384ull << 20;
+            const size_t maxSteps =
+                std::max<size_t>(3, kUndoBudget / std::max<size_t>(bytesPerStep, 1));
             undoStack_.push_back(field_);
-            if (undoStack_.size() > 30) undoStack_.erase(undoStack_.begin());
+            while (undoStack_.size() > maxSteps)
+                undoStack_.erase(undoStack_.begin());
         }
 
         host_->BeginUndoGroup("Liquify");
@@ -229,7 +243,7 @@ private:
     IHostContext* host_ = nullptr;
     ImageBuffer original_;            // 会话原始图像（画质无损的基准）
     liquify::DisplacementField field_; // 跨笔累积的置换场
-    std::vector<liquify::DisplacementField> undoStack_; // 笔级撤销快照（最多 30）
+    std::vector<liquify::DisplacementField> undoStack_; // 笔级撤销快照（按内存预算限深，≤384MB）
     std::string session_;
 };
 

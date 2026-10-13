@@ -10,6 +10,10 @@
 
 namespace sai2agent {
 
+// 桥推送按钮清单后让 SAI2 内的浮动按钮条立即重绘
+// （AgentToolbar.cpp 实现；未 StartToolbar 时是空操作）
+void NotifyBarUpdated();
+
 class AgentCore {
 public:
     // 初始化：安装 IAT 钩子并开始记录。outDir 为日志/缩略图目录（空 = DLL 目录）

@@ -99,48 +99,66 @@ int HitButton(int x, int y) {
     return (i >= 0 && i < n) ? i : -1;
 }
 
-void SyncBarPosition() {
-    if (!g_barWnd) return;
+// 返回本窗口几何是否发生了变化（变了才需要重绘）
+bool SyncBarPosition() {
+    if (!g_barWnd) return false;
     if (!g_saiMain || !IsWindow(g_saiMain)) {
         MainWndCtx ctx;
         EnumWindows(FindMainProc, reinterpret_cast<LPARAM>(&ctx));
         g_saiMain = ctx.found;
         if (!g_saiMain) {
             ShowWindow(g_barWnd, SW_HIDE);
-            return;
+            return false;
         }
     }
     if (IsIconic(g_saiMain)) {
         ShowWindow(g_barWnd, SW_HIDE);
-        return;
+        return false;
     }
 
     RECT r;
-    if (!GetWindowRect(g_saiMain, &r)) return;
+    if (!GetWindowRect(g_saiMain, &r)) return false;
     const int n = std::max(1, ButtonCount());
     const int bw = std::max(kBtnMinW * n, 4 * kBtnMinW);
     const int bh = kBtnH;
     const int x = r.right - bw - 24;
     const int y = r.top + 62;
+    RECT cr;
+    if (IsWindowVisible(g_barWnd) && GetWindowRect(g_barWnd, &cr) &&
+        cr.left == x && cr.top == y &&
+        cr.right - cr.left == bw && cr.bottom - cr.top == bh)
+        return false; // 位置尺寸都没变：什么都不做
     ShowWindow(g_barWnd, SW_SHOWNOACTIVATE);
     SetWindowPos(g_barWnd, HWND_TOPMOST, x, y, bw, bh, SWP_NOACTIVATE);
+    return true;
 }
 
 // ------------------------------------------------------------ 主题（与桥一致）
 // 读桥写入的设置（HKCU\Software\SAI2Bridge\Theme）：0=跟随系统 1=浅色 2=深色
+// 结果缓存 5 秒：WM_PAINT/WM_TIMER 高频调用，每次都读注册表是浪费
 bool BarDark() {
+    static ULONGLONG lastTick = 0;
+    static bool cachedDark = false;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastTick < 5000) return cachedDark;
+    lastTick = now;
     DWORD v = 0, size = sizeof(v);
     RegGetValueW(HKEY_CURRENT_USER, L"Software\\SAI2Bridge", L"Theme",
                  RRF_RT_REG_DWORD, nullptr, &v, &size);
-    if (v == 1) return false;
-    if (v == 2) return true;
-    DWORD light = 1;
-    size = sizeof(light);
-    RegGetValueW(
-        HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
-    return light == 0;
+    bool dark;
+    if (v == 1) dark = false;
+    else if (v == 2) dark = true;
+    else {
+        DWORD light = 1;
+        size = sizeof(light);
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+        dark = light == 0;
+    }
+    cachedDark = dark;
+    return cachedDark;
 }
 
 // Win11 圆角窗口（失败静默）
@@ -259,9 +277,13 @@ LRESULT CALLBACK BarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 1;
     case WM_TIMER:
         if (wp == g_barTimerId) {
-            SyncBarPosition();
-            InvalidateRect(hwnd, nullptr, FALSE);
+            // 只有位置/尺寸真的变了才重绘（此前每 250ms 无条件重绘 +
+            // SetWindowPos，白耗 SAI2 进程的 GDI/CPU）
+            if (SyncBarPosition()) InvalidateRect(hwnd, nullptr, FALSE);
         }
+        return 0;
+    case WM_APP + 7: // 桥推送了新的按钮清单（NotifyBarUpdated）
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, g_barTimerId);
@@ -318,6 +340,12 @@ DWORD WINAPI ToolbarThreadProc(LPVOID) {
 }
 
 } // namespace
+
+// 桥推送按钮清单后调用：让浮窗立即重绘（原来靠 250ms 定时器兜底，
+// 现在 WM_TIMER 不再无条件重绘，需要显式通知）
+void NotifyBarUpdated() {
+    if (g_barWnd) PostMessageW(g_barWnd, WM_APP + 7, 0, 0);
+}
 
 void AgentCore::StartToolbar() {
     g_barCore = this;

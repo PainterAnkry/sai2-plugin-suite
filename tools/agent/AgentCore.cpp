@@ -137,6 +137,77 @@ struct AgentCore::Impl {
     CRITICAL_SECTION logLock;
     long thumbSeq = 0;
 
+    // ------------------------------------------------------------ 异步缩略图
+    // 用户反馈：装插件后画画有延迟。原因：绘画时 SAI2 实时更新图层缩略图，
+    // 命中捕获条件的 blit 会在**绘画线程上同步 CreateFileW+WriteFile**，
+    // 杀软实时扫描还会再叠一层。现在钩子内只做内存拷贝（且有 per-hwnd
+    // 350ms 节流），磁盘 I/O 全部移交 ThumbThreadProc 后台线程。
+    struct ThumbJob {
+        BlitCapture meta;
+        std::vector<uint8_t> pixels;
+        int w = 0, h = 0;
+        LONG declaredHeight = 0;
+    };
+    CRITICAL_SECTION thumbLock;
+    std::deque<ThumbJob> thumbJobs;
+    HANDLE thumbEvent = nullptr;
+    HANDLE thumbThread = nullptr;
+    volatile bool thumbStop = false;
+    std::unordered_map<HWND, ULONGLONG> lastThumbTick;
+    static constexpr ULONGLONG kThumbIntervalMs = 350;
+    static constexpr size_t kMaxThumbJobs = 3;
+
+    void InitThumbs() {
+        InitializeCriticalSection(&thumbLock);
+        thumbEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+
+    // 节流 + 入队。返回是否入队成功（false = 被节流跳过）。
+    bool TryEnqueueThumb(BlitCapture& c, int w, int h, LONG declared,
+                         const void* bits, size_t bytes) {
+        EnterCriticalSection(&thumbLock);
+        if (thumbStop) {
+            LeaveCriticalSection(&thumbLock);
+            return false;
+        }
+        const ULONGLONG now = c.tick;
+        auto it = lastThumbTick.find(c.hwnd);
+        if (it != lastThumbTick.end() &&
+            now - it->second < kThumbIntervalMs) {
+            LeaveCriticalSection(&thumbLock);
+            return false;
+        }
+        lastThumbTick[c.hwnd] = now;
+        ThumbJob job;
+        job.meta = c;
+        job.w = w;
+        job.h = h;
+        job.declaredHeight = declared;
+        job.pixels.assign(static_cast<const uint8_t*>(bits),
+                          static_cast<const uint8_t*>(bits) + bytes);
+        while (thumbJobs.size() >= kMaxThumbJobs) thumbJobs.pop_front();
+        thumbJobs.push_back(std::move(job));
+        LeaveCriticalSection(&thumbLock);
+        SetEvent(thumbEvent);
+        return true;
+    }
+
+    void ShutdownThumbs() {
+        thumbStop = true;
+        if (thumbEvent) SetEvent(thumbEvent);
+        if (thumbThread) {
+            // 最多等 1.5s：Shutdown 可能从 DllMain 调用，不能死等
+            WaitForSingleObject(thumbThread, 1500);
+            CloseHandle(thumbThread);
+            thumbThread = nullptr;
+        }
+        if (thumbEvent) {
+            CloseHandle(thumbEvent);
+            thumbEvent = nullptr;
+        }
+        DeleteCriticalSection(&thumbLock);
+    }
+
     // ------------------------------------------------------------ 日志
     void Log(const char* line) {
         EnterCriticalSection(&logLock);
@@ -377,28 +448,19 @@ struct AgentCore::Impl {
         }
         // 先做文字配对（行模型由此生长），再记录 blit
         PairPendingTexts(c);
-        // 只收"落在有行数据的窗口里"的小位块（缩略图候选），避免收画布瓦片
-        if (!c.hasScreen || w < 8 || h < 8 || w > 512 || h > 512 ||
-            !PointInAnyGroup(c.screenX, c.screenY)) {
-            RecordBlit(c);
-            return;
-        }
+        RecordBlit(c);
+
+        // ---- 缩略图捕获：廉价过滤在前，昂贵检查（窗口命中/入队）在后。
+        // 命中后不再同步写盘，只把像素拷进内存队列交给后台线程落盘。
+        if (!c.hasScreen || w < 8 || h < 8 || w > 512 || h > 512) return;
         if (!bmi || bmi->bmiHeader.biBitCount != 32 ||
-            bmi->bmiHeader.biCompression != BI_RGB || !bits || cLines == 0) {
-            RecordBlit(c);
+            bmi->bmiHeader.biCompression != BI_RGB || !bits || cLines == 0)
             return;
-        }
-        wchar_t path[MAX_PATH];
-        swprintf(path, MAX_PATH, L"%s\\thumb_%06ld.bmp", thumbDir.c_str(),
-                 ++thumbSeq);
+        if (!PointInAnyGroup(c.screenX, c.screenY)) return;
         const LONG declared = bmi->bmiHeader.biHeight;
         const size_t stride = ((static_cast<size_t>(w) * 4) + 3) & ~size_t(3);
-        if (WriteBmpFromDib32(path, w, static_cast<int>(cLines), declared, bits,
-                              stride * static_cast<size_t>(cLines))) {
-            c.captured = true;
-            CopyPathToChar(path, c.file);
-        }
-        RecordBlit(c);
+        TryEnqueueThumb(c, w, static_cast<int>(cLines), declared, bits,
+                        stride * static_cast<size_t>(cLines));
     }
 
     void CaptureBitBlt(HDC dstDc, int x, int y, int w, int h, HDC srcDc,
@@ -418,34 +480,26 @@ struct AgentCore::Impl {
             c.screenY = org.y + y;
             c.hasScreen = true;
         }
-        if (!c.hasScreen || !srcDc || w < 8 || h < 8 || w > 512 || h > 512 ||
-            !PointInAnyGroup(c.screenX, c.screenY)) {
-            RecordBlit(c);
+        RecordBlit(c);
+
+        // ---- 缩略图候选：同 CaptureSetDibits，昂贵检查后置 + 异步落盘
+        if (!c.hasScreen || !srcDc || w < 8 || h < 8 || w > 512 || h > 512)
             return;
-        }
         // 源是 32bpp DIBSection 才拿得到像素
         HBITMAP srcBmp =
             static_cast<HBITMAP>(GetCurrentObject(srcDc, OBJ_BITMAP));
         DIBSECTION ds = {};
         if (!srcBmp || GetObjectW(srcBmp, sizeof(ds), &ds) != sizeof(ds) ||
             !ds.dsBm.bmBits || ds.dsBm.bmBitsPixel != 32 ||
-            ds.dsBmih.biCompression != BI_RGB) {
-            RecordBlit(c);
+            ds.dsBmih.biCompression != BI_RGB)
             return;
-        }
-        wchar_t path[MAX_PATH];
-        swprintf(path, MAX_PATH, L"%s\\thumb_%06ld.bmp", thumbDir.c_str(),
-                 ++thumbSeq);
+        if (!PointInAnyGroup(c.screenX, c.screenY)) return;
         const size_t stride =
             ((static_cast<size_t>(ds.dsBm.bmWidth) * 4) + 3) & ~size_t(3);
-        if (WriteBmpFromDib32(path, ds.dsBm.bmWidth, ds.dsBm.bmHeight,
-                              ds.dsBmih.biHeight, ds.dsBm.bmBits,
-                              stride * static_cast<size_t>(
-                                           std::abs(ds.dsBm.bmHeight)))) {
-            c.captured = true;
-            CopyPathToChar(path, c.file);
-        }
-        RecordBlit(c);
+        TryEnqueueThumb(c, ds.dsBm.bmWidth, ds.dsBm.bmHeight,
+                        ds.dsBmih.biHeight, ds.dsBm.bmBits,
+                        stride * static_cast<size_t>(
+                                     std::abs(ds.dsBm.bmHeight)));
     }
 
     // ------------------------------------------------------------ 序列化
@@ -736,6 +790,38 @@ struct AgentCore::Impl {
 
 namespace {
 
+// 缩略图写盘后台线程：绘画热路径上绝不碰磁盘。
+// 成功落盘后补记一条 captured=true 的 blit 记录（thumbs 命令消费）。
+DWORD WINAPI ThumbThreadProc(LPVOID param) {
+    AgentCore::Impl* impl = static_cast<AgentCore::Impl*>(param);
+    while (!impl->thumbStop) {
+        WaitForSingleObject(impl->thumbEvent, 400);
+        for (;;) {
+            AgentCore::Impl::ThumbJob job;
+            EnterCriticalSection(&impl->thumbLock);
+            if (impl->thumbJobs.empty()) {
+                LeaveCriticalSection(&impl->thumbLock);
+                break;
+            }
+            job = std::move(impl->thumbJobs.front());
+            impl->thumbJobs.pop_front();
+            LeaveCriticalSection(&impl->thumbLock);
+
+            wchar_t path[MAX_PATH];
+            swprintf(path, MAX_PATH, L"%s\\thumb_%06ld.bmp",
+                     impl->thumbDir.c_str(), ++impl->thumbSeq);
+            if (WriteBmpFromDib32(path, job.w, job.h, job.declaredHeight,
+                                  job.pixels.data(), job.pixels.size())) {
+                BlitCapture c = job.meta;
+                c.captured = true;
+                CopyPathToChar(path, c.file);
+                impl->RecordBlit(c);
+            }
+        }
+    }
+    return 0;
+}
+
 BOOL WINAPI HookedExtTextOutW(HDC hdc, int x, int y, UINT options,
                               const RECT* lprc, LPCWSTR str, int cch,
                               const INT* dx) {
@@ -865,6 +951,9 @@ bool AgentCore::Startup(const std::wstring& outDir, std::wstring& error) {
     }
     impl_->thumbDir = impl_->outDir + L"\\thumbs";
     CreateDirectoryW(impl_->thumbDir.c_str(), nullptr);
+    impl_->InitThumbs();
+    impl_->thumbThread =
+        CreateThread(nullptr, 0, ThumbThreadProc, impl_, 0, nullptr);
 
     // 日志文件（按 PID 区分多个宿主进程）
     wchar_t logp[MAX_PATH];
@@ -907,6 +996,7 @@ bool AgentCore::Startup(const std::wstring& outDir, std::wstring& error) {
 void AgentCore::Shutdown() {
     if (!impl_) return;
     impl_->Log("=== sai2_agent shutdown ===");
+    impl_->ShutdownThumbs();
     if (g_hooks) {
         g_hooks->RestoreAll();
         g_hooks = nullptr;
@@ -928,6 +1018,7 @@ void AgentCore::SetPluginItems(const std::vector<PluginItem>& items) {
     AcquireSRWLockExclusive(&impl_->lock);
     impl_->pluginItems = items;
     ReleaseSRWLockExclusive(&impl_->lock);
+    NotifyBarUpdated(); // 浮窗立即重绘新按钮
 }
 
 std::vector<AgentCore::PluginItem> AgentCore::CopyPluginItems() {
