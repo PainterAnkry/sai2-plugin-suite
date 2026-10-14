@@ -107,7 +107,7 @@ MainLayout MainLayoutOf(const RECT& client) {
     // 右列：复选框在表头右侧；两行命令按钮底部与图层按钮条对齐
     const int row1Top = (statusTop - Scale(12)) - Scale(74);
     L.checks = {rightColLeft, L.layerHead.top, client.right - Scale(12),
-                std::min(static_cast<int>(L.layerHead.top) + Scale(122),
+                std::min(static_cast<int>(L.layerHead.top) + Scale(150),
                          row1Top - Scale(8))};
     L.buttons = {rightColLeft, L.checks.bottom + Scale(30),
                  client.right - Scale(12), statusTop - Scale(12)};
@@ -122,7 +122,8 @@ enum {
     CMD_LAYER_BTN = 2000,   // +i  图层操作按钮
     CMD_WATCH = 910,        // 监听剪贴板
     CMD_AUTOLAYER = 911,    // 点图层行时在 SAI2 选中
-    CMD_MERGE = 912         // 合并回原层
+    CMD_MERGE = 912,        // 合并回原层
+    CMD_INPLACE = 913       // 原位粘贴（Ctrl+Shift+V）
 };
 
 int g_listScroll = 0;
@@ -384,6 +385,9 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
         y += rowH;
         DrawCheck(dc, win, RECT{box.left, y, box.right, y + rowH},
                   L"应用后合并回原图层（向下转写）", s.mergeBack, CMD_MERGE);
+        y += rowH;
+        DrawCheck(dc, win, RECT{box.left, y, box.right, y + rowH},
+                  L"原位粘贴（精确回贴，推荐）", s.pasteInPlace, CMD_INPLACE);
     }
 
     // ---- 命令按钮（两行两列：文字放得下，不再省略号截断） ----
@@ -448,6 +452,7 @@ bool OnMainHit(UiWindow& win, const UiHit& h) {
         case CMD_WATCH: s.watchClipboard = !s.watchClipboard; return true;
         case CMD_AUTOLAYER: s.autoGrabLayer = !s.autoGrabLayer; return true;
         case CMD_MERGE: s.mergeBack = !s.mergeBack; return true;
+        case CMD_INPLACE: s.pasteInPlace = !s.pasteInPlace; return true;
         default: break;
         }
     }
@@ -579,6 +584,18 @@ void SendCtrlScan(WORD scan) {
     SendKeyScan(0x1D, true);
 }
 
+// Ctrl+Shift+V：SAI2 的原位粘贴 —— 贴进当前图层、保持复制时的位置，
+// 不新建图层也不按画布中心摆放（新建式 Ctrl+V 才会居中对齐）。
+void SendCtrlShiftScan(WORD scan) {
+    SendKeyScan(0x2A, false); // Shift down
+    SendKeyScan(0x1D, false); // Ctrl down
+    SendKeyScan(scan, false);
+    Sleep(30);
+    SendKeyScan(scan, true);
+    SendKeyScan(0x1D, true);
+    SendKeyScan(0x2A, true);
+}
+
 void SendEscape() {
     INPUT in[2] = {};
     in[0].type = INPUT_KEYBOARD;
@@ -664,6 +681,24 @@ struct CaptureJob {
 
 CaptureJob g_cap;
 std::thread g_capThread;
+
+// 浮窗心跳：独立于 UI 线程的管道 ping（每 1 秒）。此前心跳只靠 UI
+// 定时器的 400ms 轮询（take.request），液化窗口最小化/连片重绘等
+// UI 线程繁忙场景会把心跳拖过阈值，SAI2 内浮动按钮条被误判
+// "桥已挂死"而自动隐藏（用户反馈：最小化液化窗口浮窗会掉）。
+std::atomic<bool> g_hbStop{false};
+void HeartbeatLoop() {
+    while (!g_hbStop.load(std::memory_order_relaxed)) {
+        if (S().agentOnline) {
+            long long pid = 0;
+            sai2bridge::AgentPing(pid); // 结果不重要，让 agent 知道桥还活着
+        }
+        for (int i = 0; i < 10 && !g_hbStop.load(std::memory_order_relaxed);
+             ++i)
+            Sleep(100);
+    }
+}
+std::thread g_hbThread;
 
 // 单击屏幕某点（用户正拖拽时先等松开，最多 1 秒）
 void ClickAtScreenImpl(int x, int y) {
@@ -947,10 +982,10 @@ void AutoPasteToSai2() {
     }
     // 用快捷键而不是菜单点击：不依赖 agent 管道（菜单文字钩子），
     // 也不依赖菜单栏坐标换算 —— 只要 SAI2 在前台就一定生效。
-    // Ctrl+A 全选让粘贴对齐画布（与菜单「全选 → 粘贴」等效）。
-    // 注意对齐原理：SAI2 粘贴按画布中心对齐 —— 抓的是整层（图=画布
-    // 尺寸）时正好完全重合；若抓的是局部框选内容，SAI2 会把它放到
-    // 画布中心，需要用移动工具摆位（SAI2 剪贴板不携带位置信息）。
+    // 对齐原理：SAI2 的复制会把图层内容裁到"上色部分包围盒"（透明区域
+    // 不计入），剪贴板里的图永远≠画布尺寸；而新建式粘贴（Ctrl+V）按
+    // 画布中心对齐 —— 二者叠加必然错位。因此默认用 Ctrl+Shift+V
+    // 原位粘贴：贴进当前图层、保持复制时的位置，天然精确对齐。
     WaitMouseReleased(1000);
     ForceForeground(target);
     Sleep(160);
@@ -960,12 +995,17 @@ void AutoPasteToSai2() {
     }
     SendEscape();
     Sleep(200);
-    SendCtrlScan(0x1E); // Ctrl+A 全选
-    Sleep(400);
-    SendCtrlScan(0x2F); // Ctrl+V 粘贴
-    ReleaseSyntheticKeys();
-    s.flash = L"已粘贴回 SAI2（整层抓取会精确对齐；局部框选抓取的，"
-              L"SAI2 会把粘贴内容放到画布中心，请用移动工具摆位）";
+    if (s.pasteInPlace) {
+        SendCtrlShiftScan(0x2F); // Ctrl+Shift+V 原位粘贴进当前图层
+        ReleaseSyntheticKeys();
+        s.flash = L"已原位粘贴回当前图层（位置精确对齐，无需合并）";
+    } else {
+        SendCtrlScan(0x1E); // Ctrl+A 全选
+        Sleep(400);
+        SendCtrlScan(0x2F); // Ctrl+V 粘贴（新建图层，画布中心对齐）
+        ReleaseSyntheticKeys();
+        s.flash = L"已粘贴回 SAI2（新建图层，按画布中心对齐）";
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,7 +1142,10 @@ void DoApplyFlow(UiWindow& win) {
         (void)win;
         if (s.autoPaste) {
             AutoPasteToSai2();
-            if (s.mergeBack) ScheduleMergeAfterPaste(s.mainHwnd);
+            // 原位粘贴已直接贴进当前图层，不需要（也不能）再向下转写；
+            // 只有居中粘贴（新建图层）才需要 F 键转写回原层。
+            if (s.mergeBack && !s.pasteInPlace)
+                ScheduleMergeAfterPaste(s.mainHwnd);
         }
         s.flash.clear();
     } else if (!r.error.empty()) {
@@ -1986,11 +2029,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
 
     MSG msg;
+    g_hbThread = std::thread(HeartbeatLoop);
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
+    g_hbStop = true;
+    if (g_hbThread.joinable()) g_hbThread.join();
     CloseAllToolWindows();
     s.core->Shutdown();
     s.core.reset();

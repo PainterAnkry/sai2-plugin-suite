@@ -345,7 +345,11 @@ int RunSelfTest(const std::string& exeDirUtf8) {
     ok = Eject(fakePid, L"sai2_agent.dll", err);
     if (!ok) Check(false, ("卸载 Agent: " + err).c_str());
     Sleep(500);
-    bool pipeGone = !AgentClient::Query("{\"cmd\":\"ping\"}", resp, nullptr);
+    // 注意必须探测"本测试的专用管道"而不是默认名：开发机上若正开着
+    // SAI2（真实 agent 注入中），默认管道是活的 —— 那是环境噪声，
+    // 不是卸载失败（曾把自检误导出 FAIL）。
+    bool pipeGone = !AgentClient::Query("{\"cmd\":\"ping\"}", resp,
+                                        testPipe.c_str());
     Check(pipeGone, "卸载后管道不再响应");
 
     KillFake();

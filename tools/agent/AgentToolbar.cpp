@@ -102,12 +102,12 @@ int HitButton(int x, int y) {
 // 返回本窗口几何是否发生了变化（变了才需要重绘）
 bool SyncBarPosition() {
     if (!g_barWnd) return false;
-    // 桥心跳检测：桥退出/挂死后（>4 秒没有管道命令）自动隐藏浮窗，
-    // 避免留一个"点了没反应"的死按钮条（1.15 之前用户只能重启面板）。
-    // 桥重新连上（push set.plugins / 400ms 轮询）后自动恢复显示。
+    // 桥心跳检测：桥退出/挂死后自动隐藏浮窗，避免留一个"点了没反应"
+    // 的死按钮条。阈值 6 秒（桥侧已有独立 1 秒心跳线程，正常间隔 1 秒；
+    // 放宽到 6 秒是为了容忍偶发的管道连接抖动，避免浮窗闪隐）。
     if (g_barCore) {
         const long long since = g_barCore->MsSinceBridgeSeen();
-        if (since < 0 || since > 4000) {
+        if (since < 0 || since > 6000) {
             if (IsWindowVisible(g_barWnd)) ShowWindow(g_barWnd, SW_HIDE);
             return false;
         }
@@ -136,8 +136,14 @@ bool SyncBarPosition() {
     RECT cr;
     if (IsWindowVisible(g_barWnd) && GetWindowRect(g_barWnd, &cr) &&
         cr.left == x && cr.top == y &&
-        cr.right - cr.left == bw && cr.bottom - cr.top == bh)
-        return false; // 位置尺寸都没变：什么都不做
+        cr.right - cr.left == bw && cr.bottom - cr.top == bh) {
+        // 位置尺寸没变：仍然每隔一拍重申 TOPMOST —— 其它置顶窗口出现/
+        // 消失时 z 序可能把按钮条压到 SAI2 界面后面（用户反馈：最小化
+        // 液化窗口后浮窗"掉"了）。仅重申 z 序，不动位置不重绘。
+        SetWindowPos(g_barWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        return false;
+    }
     ShowWindow(g_barWnd, SW_SHOWNOACTIVATE);
     SetWindowPos(g_barWnd, HWND_TOPMOST, x, y, bw, bh, SWP_NOACTIVATE);
     return true;
