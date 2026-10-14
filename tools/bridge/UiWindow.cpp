@@ -453,6 +453,39 @@ bool RegisterWindowClasses(HINSTANCE hInst) {
     return true;
 }
 
+// 把窗口可靠地切到前台。桥此时通常是后台进程（用户在 SAI2 里点的浮窗），
+// 直接 SetForegroundWindow 会被 Windows 前台锁拒绝——窗口只闪任务栏，
+// 用户必须手动点任务栏才能把它"点出来"（1.15 用户反馈的现象）。
+// 三级策略：AttachThreadInput 借前台线程权限 → Alt 键解锁 → 闪任务栏兜底。
+static void RaiseToForeground(HWND h) {
+    if (!h || !IsWindow(h)) return;
+    HWND fore = GetForegroundWindow();
+    if (fore == h) return;
+    const DWORD foreThread =
+        fore ? GetWindowThreadProcessId(fore, nullptr) : 0;
+    const DWORD ourThread = GetWindowThreadProcessId(h, nullptr);
+    if (foreThread && foreThread != ourThread)
+        AttachThreadInput(foreThread, ourThread, TRUE);
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    SetFocus(h);
+    if (foreThread && foreThread != ourThread)
+        AttachThreadInput(foreThread, ourThread, FALSE);
+    if (GetForegroundWindow() != h) {
+        // 按一次 Alt 可解除调用进程的前台限制（系统级规则）
+        keybd_event(VK_MENU, 0, 0, 0);
+        SetForegroundWindow(h);
+        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    }
+    if (GetForegroundWindow() != h) {
+        FlashWindow(h, TRUE); // 仍被拒：至少让任务栏图标亮起来提示用户
+        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
 void OpenToolWindow(int winIdx) {
     const int idx = (winIdx >= 1 && winIdx < BridgeCore::kWinCount) ? winIdx
                                                                    : 0;
@@ -460,8 +493,11 @@ void OpenToolWindow(int winIdx) {
     AppState& s = S();
     UiWindow& win = s.toolWindows[idx];
     if (win.hwnd && IsWindow(win.hwnd)) {
-        ShowWindow(win.hwnd, SW_SHOW);
-        SetForegroundWindow(win.hwnd);
+        // 窗口已存在（第二次及以后的浮窗点击）：
+        // 最小化过要先还原，再抢前台——SW_SHOW + 裸 SetForegroundWindow
+        // 在桥为后台进程时大概率被前台锁拒绝，只闪任务栏不弹出。
+        ShowWindow(win.hwnd, IsIconic(win.hwnd) ? SW_RESTORE : SW_SHOW);
+        RaiseToForeground(win.hwnd);
         InvalidateRect(win.hwnd, nullptr, FALSE);
         return;
     }
@@ -487,7 +523,7 @@ void OpenToolWindow(int winIdx) {
     UpdateWindow(h);
     // 抓图流程会把前台切到 SAI2 / 主面板；新窗口必须抢回前台，
     // 否则用户点"液化"后看到的还是主面板（窗口其实已经开在后面了）
-    SetForegroundWindow(h);
+    RaiseToForeground(h);
     s.core->Log(std::string("tool window created: ") +
                 std::string(1, static_cast<char>('0' + idx)));
 }
