@@ -143,6 +143,16 @@ public:
     // 把当前 applied_ 再写一次剪贴板（不重新计算）
     bool WriteClipboard(std::string& error);
 
+    // ---- 画布上下文（精确回贴） -----------------------------------------
+    // 整层抓取时由抓取流程设置：SAI2 画布尺寸与抓取内容在画布内的偏移。
+    // 设置后，写剪贴板的都是"补边到画布尺寸"的图 —— SAI2 的 Ctrl+V 按
+    // 画布 (0,0) 对齐，补边后内容正好落回原位置，不再依赖 Ctrl+Shift+V。
+    void SetCanvasContext(bool has, int canvasW, int canvasH, int offX,
+                          int offY);
+    bool HasCanvasContext() const { return hasCanvasCtx_; }
+    int CanvasW() const { return canvasW_; }
+    int CanvasH() const { return canvasH_; }
+
     // ---- 液化笔画 -------------------------------------------------------
     // 按"上一采样点 → 本次点"提交一笔（笔刷中心 + 拖动方向）。
     // 注意：StrokeMove 只做"廉价累积"（把这一笔加进置换场，不做全图逆映射渲染），
@@ -268,6 +278,15 @@ private:
     // 克隆 8MP 大图（35MB 拷贝）。
     ImageBuffer strokeScratch_;
 
+
+    // 把当前 applied_ 写剪贴板（有画布上下文时先补边成画布尺寸）
+    bool WriteAppliedToClipboard(std::string& error);
+    // 把 img 摆到画布坐标 (canvasX0_, canvasY0_) 处、补边成画布尺寸
+    ImageBuffer PadToCanvas(const ImageBuffer& img) const;
+
+    // 画布上下文（0 = 无；抓取自外部剪贴板/匹配失败时无效）
+    bool hasCanvasCtx_ = false;
+    int canvasW_ = 0, canvasH_ = 0, canvasX0_ = 0, canvasY0_ = 0;
 
     std::string status_;
     std::vector<std::string> logLines_;

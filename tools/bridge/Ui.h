@@ -200,10 +200,10 @@ struct AppState {
     bool watchClipboard = true;
     bool autoGrabLayer = true; // 点图层行时自动到 SAI2 选中
     bool mergeBack = false;    // 应用后自动"向下转写"合并回原图层
-    // 原位粘贴（Ctrl+Shift+V）：贴进当前图层、保持原位置。
-    // SAI2 的复制会把图层内容裁到"上色部分包围盒"（透明区域不计入），
-    // 剪贴板里的图永远≠画布尺寸，居中粘贴必然错位 —— 原位粘贴是唯一
-    // 能精确回贴的方式。关闭时退回 Ctrl+A+Ctrl+V 居中粘贴 + 向下转写。
+    // 精确回贴（1.19）：整层抓取时记录画布尺寸与内容偏移，应用后把结果
+    // 补边成画布尺寸再 Ctrl+V —— SAI2 按画布 (0,0) 对齐，内容正好落回
+    // 原位置。不依赖 Ctrl+Shift+V（很多 SAI2 版本没有该快捷键）。
+    // 关闭时退回 Ctrl+A+Ctrl+V 居中粘贴 + 向下转写。
     bool pasteInPlace = true;
     bool agentPushed = false;  // 效果清单已推给注入代理
     bool mergePending = false;

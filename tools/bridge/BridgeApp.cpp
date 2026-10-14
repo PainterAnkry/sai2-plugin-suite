@@ -123,7 +123,7 @@ enum {
     CMD_WATCH = 910,        // 监听剪贴板
     CMD_AUTOLAYER = 911,    // 点图层行时在 SAI2 选中
     CMD_MERGE = 912,        // 合并回原层
-    CMD_INPLACE = 913       // 原位粘贴（Ctrl+Shift+V）
+    CMD_INPLACE = 913       // 精确回贴（补边对齐）
 };
 
 int g_listScroll = 0;
@@ -387,7 +387,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
                   L"应用后合并回原图层（向下转写）", s.mergeBack, CMD_MERGE);
         y += rowH;
         DrawCheck(dc, win, RECT{box.left, y, box.right, y + rowH},
-                  L"原位粘贴（精确回贴，推荐）", s.pasteInPlace, CMD_INPLACE);
+                  L"精确回贴（补边对齐，推荐）", s.pasteInPlace, CMD_INPLACE);
     }
 
     // ---- 命令按钮（两行两列：文字放得下，不再省略号截断） ----
@@ -584,17 +584,9 @@ void SendCtrlScan(WORD scan) {
     SendKeyScan(0x1D, true);
 }
 
-// Ctrl+Shift+V：SAI2 的原位粘贴 —— 贴进当前图层、保持复制时的位置，
-// 不新建图层也不按画布中心摆放（新建式 Ctrl+V 才会居中对齐）。
-void SendCtrlShiftScan(WORD scan) {
-    SendKeyScan(0x2A, false); // Shift down
-    SendKeyScan(0x1D, false); // Ctrl down
-    SendKeyScan(scan, false);
-    Sleep(30);
-    SendKeyScan(scan, true);
-    SendKeyScan(0x1D, true);
-    SendKeyScan(0x2A, true);
-}
+// Ctrl+V：SAI2 新建式粘贴，图像按画布 (0,0) 对齐 —— 1.19 起精确回贴
+// 不再用 Ctrl+Shift+V（很多 SAI2 版本没有该快捷键），而是靠补边成画布
+// 尺寸让 (0,0) 对齐恰好等于原位置。
 
 void SendEscape() {
     INPUT in[2] = {};
@@ -681,6 +673,10 @@ struct CaptureJob {
 
 CaptureJob g_cap;
 std::thread g_capThread;
+
+// 抓取线程刚设置好的画布上下文要跨过 OnCaptureFinished →
+// DoGrabFromClipboard（剪贴板读图）保留下来；手动"从剪贴板抓取"则清除
+bool g_grabKeepCtx = false;
 
 // 浮窗心跳：独立于 UI 线程的管道 ping（每 1 秒）。此前心跳只靠 UI
 // 定时器的 400ms 轮询（take.request），液化窗口最小化/连片重绘等
@@ -804,6 +800,178 @@ bool MenuItemClickImpl(HWND sai, int menuBarOffsetX, const wchar_t* itemPrefix) 
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// 画布上下文（精确回贴）
+// SAI2 的 Ctrl+C 只拷贝图层不透明部分包围盒（透明区域被裁掉），Ctrl+V 又按
+// 画布 (0,0) 对齐 —— 这是错位的根源。整层抓取时：agent 把画布 DIBSection
+// （画布尺寸）快照落盘，桥读回后用剪贴板位图（alpha 作掩码）做模板匹配求
+// 内容在画布内的偏移；处理结果补边成画布尺寸再 Ctrl+V 就能精确落回原位，
+// 不再依赖 Ctrl+Shift+V（很多 SAI2 版本没有该快捷键）。
+// ---------------------------------------------------------------------------
+
+struct CanvasCtxResult {
+    bool ok = false;
+    int cw = 0, ch = 0, x0 = 0, y0 = 0;
+    double score = 1e9;
+};
+
+// 盒式降采样：RGB 取平均、alpha 取最大（保留内容掩码）
+ImageBuffer DownscaleRGBA(const ImageBuffer& src, int step) {
+    const int w = std::max(1, src.Width() / step);
+    const int h = std::max(1, src.Height() / step);
+    ImageBuffer out(w, h, PixelFormat::RGBA8);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            long r = 0, g = 0, b = 0;
+            int a = 0, n = 0;
+            for (int dy = 0; dy < step; ++dy) {
+                for (int dx = 0; dx < step; ++dx) {
+                    RGBA p;
+                    if (!src.GetPixel(x * step + dx, y * step + dy, p))
+                        continue;
+                    r += p.r; g += p.g; b += p.b; ++n;
+                    if (p.a > a) a = p.a;
+                }
+            }
+            if (n == 0) continue;
+            RGBA o;
+            o.r = static_cast<uint16_t>(r / n);
+            o.g = static_cast<uint16_t>(g / n);
+            o.b = static_cast<uint16_t>(b / n);
+            o.a = static_cast<uint16_t>(a);
+            out.SetPixel(x, y, o);
+        }
+    }
+    return out;
+}
+
+// 模板样本（只在 alpha >= 250 的像素上比对；数量封顶 cap）
+struct TplSample { int tx, ty; uint8_t r, g, b; };
+
+std::vector<TplSample> BuildSamples(const ImageBuffer& img, int cap) {
+    const int w = img.Width(), h = img.Height();
+    std::vector<TplSample> all;
+    const int stride = std::max(
+        1, static_cast<int>(std::sqrt(
+               static_cast<double>(w) * h / static_cast<double>(cap))));
+    for (int y = 0; y < h; y += stride) {
+        for (int x = 0; x < w; x += stride) {
+            RGBA p;
+            if (!img.GetPixel(x, y, p) || p.a < (250 << 8)) continue;
+            TplSample s;
+            s.tx = x; s.ty = y;
+            s.r = static_cast<uint8_t>(p.r >> 8);
+            s.g = static_cast<uint8_t>(p.g >> 8);
+            s.b = static_cast<uint8_t>(p.b >> 8);
+            all.push_back(s);
+        }
+    }
+    return all;
+}
+
+// 在 [x0..x1]×[y0..y1] 内找模板最佳位置（掩码 SAD，RGBA8 直查）
+void MaskedSearch(const ImageBuffer& canvas, const std::vector<TplSample>& smp,
+                  int tw, int th, int x0, int y0, int x1, int y1, int posStep,
+                  int& bx, int& by, double& bs) {
+    if (smp.empty()) return;
+    const int cw = canvas.Width(), ch = canvas.Height();
+    const uint8_t* cd = canvas.Data();
+    for (int py = y0; py <= y1; py += posStep) {
+        if (py < 0 || py + th > ch) continue;
+        for (int px = x0; px <= x1; px += posStep) {
+            if (px < 0 || px + tw > cw) continue;
+            long long acc = 0;
+            for (const TplSample& s : smp) {
+                const uint8_t* cp = cd +
+                    (static_cast<size_t>(py + s.ty) * cw +
+                     static_cast<size_t>(px + s.tx)) * 4;
+                acc += std::abs(s.r - cp[0]) + std::abs(s.g - cp[1]) +
+                       std::abs(s.b - cp[2]);
+            }
+            const double score =
+                static_cast<double>(acc) / static_cast<double>(smp.size());
+            if (score < bs) { bs = score; bx = px; by = py; }
+        }
+    }
+}
+
+bool AcquireCanvasContext(CanvasCtxResult& out) {
+    // 等 agent 完成画布快照（canvas.arm 在抓取开始前已设置；抓取期间的
+    // 前台切换与 Ctrl+A 通常已触发画布重绘）。第 5 轮还没抓到就让宿主
+    // 补一次强制重绘，避免"没有重绘 → 永远抓不到"的死等。
+    std::string resp;
+    bool captured = false;
+    for (int i = 0; i < 22; ++i) {
+        Sleep(100);
+        resp.clear();
+        if (!sai2agent::AgentClient::Query("{\"cmd\":\"canvas.state\"}",
+                                           resp))
+            continue;
+        if (resp.find("unknown cmd") != std::string::npos)
+            return false; // 宿主里的 agent 还是旧版
+        if (resp.find("\"captured\":true") != std::string::npos) {
+            captured = true;
+            break;
+        }
+        if (i == 5) {
+            std::string r2;
+            sai2agent::AgentClient::Query("{\"cmd\":\"canvas.redraw\"}", r2);
+        }
+    }
+    if (!captured) return false;
+
+    resp.clear();
+    if (!sai2agent::AgentClient::Query("{\"cmd\":\"canvas.save\"}", resp) ||
+        resp.find("\"ok\":true") == std::string::npos)
+        return false;
+    std::string file8;
+    long long w = 0, h = 0;
+    sai2agent::JsonFindString(resp, "file", file8);
+    sai2agent::JsonFindInt(resp, "w", w);
+    sai2agent::JsonFindInt(resp, "h", h);
+    if (file8.empty() || w < 256 || h < 256) return false;
+
+    ImageBuffer canvas;
+    std::string err;
+    if (!ReadBmp32(file8, canvas, err) || !canvas.IsValid()) return false;
+    out.cw = canvas.Width();
+    out.ch = canvas.Height();
+
+    // 模板 = 刚抓到剪贴板里的图层内容（alpha 作掩码）
+    ImageBuffer tmpl;
+    if (!ReadClipboardImage(tmpl, err) || !tmpl.IsValid()) return false;
+    const int tw = tmpl.Width(), th = tmpl.Height();
+    if (tw < 8 || th < 8 || tw > out.cw || th > out.ch) return false;
+
+    // 粗匹配：降采样后全画布搜索
+    const int coarse = std::max(2, std::min(tw, th) / 48);
+    const ImageBuffer cs = DownscaleRGBA(canvas, coarse);
+    const ImageBuffer ts = DownscaleRGBA(tmpl, coarse);
+    const std::vector<TplSample> csSmp = BuildSamples(ts, 1200);
+    int bx = -1, by = -1;
+    double bs = 1e9;
+    MaskedSearch(cs, csSmp, ts.Width(), ts.Height(), 0, 0,
+                 cs.Width() - ts.Width(), cs.Height() - ts.Height(), 1,
+                 bx, by, bs);
+    if (bx < 0 || bs > 60.0) return false;
+
+    // 精匹配：全分辨率，粗位置附近 ±coarse
+    const std::vector<TplSample> fsSmp = BuildSamples(tmpl, 2000);
+    bx *= coarse;
+    by *= coarse;
+    double fs = 1e9;
+    int fx = bx, fy = by;
+    MaskedSearch(canvas, fsSmp, tw, th, bx - coarse, by - coarse,
+                 bx + coarse, by + coarse, 1, fx, fy, fs);
+    if (fx < 0 || fs > 20.0) return false;
+
+    out.x0 = fx;
+    out.y0 = fy;
+    out.score = fs;
+    out.ok = true;
+    return true;
+}
+
 // 后台线程的阶段推进
 void RunCaptureJob() {
     CaptureJob& j = g_cap;
@@ -811,6 +979,19 @@ void RunCaptureJob() {
     j.grabbed = false;
     j.message.clear();
     j.clipSeq = GetClipboardSequenceNumber();
+    AppState& st = S();
+
+    // 0) 画布上下文预备：先 arm 再抓 —— 抓取期间的前台切换/Ctrl+A 会触发
+    //    画布重绘，钩子才能拿到画布 DIB（= 画布尺寸）。
+    const bool ctxArmed =
+        st.agentOnline && st.pasteInPlace && [&]() {
+            std::string resp;
+            return sai2agent::AgentClient::Query(
+                       "{\"cmd\":\"canvas.arm\",\"ms\":9000}",
+                       resp) &&
+                   resp.find("\"ok\":true") != std::string::npos;
+        }();
+    if (!ctxArmed) st.core->SetCanvasContext(false, 0, 0, 0, 0);
 
     // 用户正在拖拽/按住鼠标时推迟注入：拖拽中途插入合成输入会污染
     // 系统输入状态机（拖拽失效的根源之一），等他松手再动。
@@ -890,6 +1071,17 @@ void RunCaptureJob() {
         if (!j.grabbed && ClipboardHasImage()) j.grabbed = true;
         if (!j.grabbed) j.message = L"SAI2 没有把图像放进剪贴板（拷贝失败？）";
     }
+    // 4) 画布上下文（精确回贴）：读画布快照 + 模板匹配求内容偏移
+    if (j.grabbed && ctxArmed) {
+        CanvasCtxResult ctx;
+        if (AcquireCanvasContext(ctx)) {
+            st.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0);
+        } else {
+            st.core->SetCanvasContext(false, 0, 0, 0, 0);
+            st.core->Log("canvas ctx: locate failed, fallback to plain paste");
+        }
+    }
+
     j.phase = j.grabbed ? CAP_DONE : CAP_FAIL;
     // 保险丝：确保 Ctrl/Alt/Esc/鼠标键没有逻辑上残留在按下状态
     ReleaseSyntheticKeys();
@@ -982,10 +1174,10 @@ void AutoPasteToSai2() {
     }
     // 用快捷键而不是菜单点击：不依赖 agent 管道（菜单文字钩子），
     // 也不依赖菜单栏坐标换算 —— 只要 SAI2 在前台就一定生效。
-    // 对齐原理：SAI2 的复制会把图层内容裁到"上色部分包围盒"（透明区域
-    // 不计入），剪贴板里的图永远≠画布尺寸；而新建式粘贴（Ctrl+V）按
-    // 画布中心对齐 —— 二者叠加必然错位。因此默认用 Ctrl+Shift+V
-    // 原位粘贴：贴进当前图层、保持复制时的位置，天然精确对齐。
+    // 对齐原理（1.19）：SAI2 的 Ctrl+C 只拷贝图层不透明部分包围盒（透明
+    // 区域被裁掉），Ctrl+V 又按画布 (0,0) 对齐。整层抓取时桥已记录画布
+    // 尺寸与内容偏移，写剪贴板前把结果补边成画布尺寸 —— 图=画布尺寸，
+    // (0,0) 对齐就是精确回贴，不依赖 Ctrl+Shift+V。
     WaitMouseReleased(1000);
     ForceForeground(target);
     Sleep(160);
@@ -995,17 +1187,20 @@ void AutoPasteToSai2() {
     }
     SendEscape();
     Sleep(200);
-    if (s.pasteInPlace) {
-        SendCtrlShiftScan(0x2F); // Ctrl+Shift+V 原位粘贴进当前图层
+    if (s.pasteInPlace && s.core->HasCanvasContext()) {
+        SendCtrlScan(0x2F); // Ctrl+V（新建图层，左上角对齐 = 原位）
         ReleaseSyntheticKeys();
-        s.flash = L"已原位粘贴回当前图层（位置精确对齐，无需合并）";
-    } else {
-        SendCtrlScan(0x1E); // Ctrl+A 全选
-        Sleep(400);
-        SendCtrlScan(0x2F); // Ctrl+V 粘贴（新建图层，画布中心对齐）
-        ReleaseSyntheticKeys();
-        s.flash = L"已粘贴回 SAI2（新建图层，按画布中心对齐）";
+        s.flash = L"已精确回贴到画布原位置（新建图层，可按 F 向下转写）";
+        return;
     }
+    // 无画布上下文（外部剪贴板抓取/定位失败/未勾选）：退回全选+粘贴
+    SendCtrlScan(0x1E); // Ctrl+A 全选
+    Sleep(400);
+    SendCtrlScan(0x2F); // Ctrl+V 粘贴（新建图层）
+    ReleaseSyntheticKeys();
+    s.flash = s.pasteInPlace
+                  ? L"已粘贴回 SAI2（未能定位图层原位置，请核对结果）"
+                  : L"已粘贴回 SAI2（新建图层）";
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,12 +1219,16 @@ void OnCaptureFinished() {
     g_cap.wantWindow = -1;
 
     if (grabbed) {
+        g_grabKeepCtx = true;
         DoGrabFromClipboard(s.main);
+        g_grabKeepCtx = false;
         s.flash.clear();
         if (want >= 1 && want < BridgeCore::kWinCount) {
             OpenToolWindow(want);
         }
     } else {
+        // 抓取失败：之前留下的画布上下文对应的是新一次抓取，作废
+        s.core->SetCanvasContext(false, 0, 0, 0, 0);
         if (!msg.empty()) s.flash = msg;
         // 兜底：自动抓取失败，但桥里已经有图像 → 照样打开目标窗口，
         // 绝不能让「点液化没反应」。失败原因保留在状态栏提示里。
@@ -1097,10 +1296,14 @@ void DoGrabFromClipboard(UiWindow& win) {
     (void)win;
     AppState& s = S();
     std::string err;
+    const bool keepCtx = g_grabKeepCtx;
+    g_grabKeepCtx = false;
+    if (!keepCtx) s.core->SetCanvasContext(false, 0, 0, 0, 0);
     if (s.core->GrabFromClipboard(err)) {
         s.flash.clear();
         OnImageAcquired();
     } else {
+        s.core->SetCanvasContext(false, 0, 0, 0, 0);
         s.flash = U8("抓取失败: " + err);
         InvalidateAll();
     }
@@ -1142,10 +1345,9 @@ void DoApplyFlow(UiWindow& win) {
         (void)win;
         if (s.autoPaste) {
             AutoPasteToSai2();
-            // 原位粘贴已直接贴进当前图层，不需要（也不能）再向下转写；
-            // 只有居中粘贴（新建图层）才需要 F 键转写回原层。
-            if (s.mergeBack && !s.pasteInPlace)
-                ScheduleMergeAfterPaste(s.mainHwnd);
+            // 1.19 起所有粘贴路径都是新建图层（Ctrl+V）：勾了「合并回原
+            // 图层」就发 F（向下转写）把效果并入原图层。
+            if (s.mergeBack) ScheduleMergeAfterPaste(s.mainHwnd);
         }
         s.flash.clear();
     } else if (!r.error.empty()) {

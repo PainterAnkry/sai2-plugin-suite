@@ -559,6 +559,61 @@ void BridgeCore::PushAppliedHistory() {
     if (history_.size() > 20) history_.erase(history_.begin());
 }
 
+void BridgeCore::SetCanvasContext(bool has, int canvasW, int canvasH,
+                                  int offX, int offY) {
+    hasCanvasCtx_ = has && canvasW > 0 && canvasH > 0;
+    canvasW_ = canvasW;
+    canvasH_ = canvasH;
+    canvasX0_ = offX;
+    canvasY0_ = offY;
+    if (hasCanvasCtx_) {
+        Log("canvas ctx: " + std::to_string(canvasW_) + "x" +
+            std::to_string(canvasH_) + " offset(" +
+            std::to_string(canvasX0_) + "," + std::to_string(canvasY0_) + ")");
+    } else {
+        Log("canvas ctx: none");
+    }
+}
+
+ImageBuffer BridgeCore::PadToCanvas(const ImageBuffer& img) const {
+    if (!img.IsValid() ||
+        (img.Width() == canvasW_ && img.Height() == canvasH_))
+        return img.Clone();
+    ImageBuffer out(canvasW_, canvasH_, PixelFormat::RGBA8);
+    out.Clear(RGBA{0, 0, 0, 0});
+    // 结果尺寸与抓取时不同（异常情况）：仍按记录的偏移摆放，越界裁掉
+    const int px = canvasX0_, py = canvasY0_;
+    const int iw = img.Width(), ih = img.Height();
+    for (int y = 0; y < ih; ++y) {
+        const int dy = py + y;
+        if (dy < 0 || dy >= canvasH_) continue;
+        int sx = 0;                       // 源列起点（偏移为负时裁掉左侧）
+        if (px < 0) {
+            sx = -px;
+            if (sx >= iw) continue;
+        }
+        const int dx = std::max(px, 0);   // 目标列起点
+        const int copy = std::min(iw - sx, canvasW_ - dx);
+        if (copy <= 0) continue;
+        std::memcpy(out.Data() + out.Stride() * static_cast<size_t>(dy) +
+                        static_cast<size_t>(dx) * 4,
+                    img.Data() + img.Stride() * static_cast<size_t>(y) +
+                        static_cast<size_t>(sx) * 4,
+                    static_cast<size_t>(copy) * 4);
+    }
+    return out;
+}
+
+bool BridgeCore::WriteAppliedToClipboard(std::string& error) {
+    if (!applied_.IsValid()) {
+        error = "没有可写入的图像";
+        return false;
+    }
+    if (!hasCanvasCtx_) return WriteClipboardImage(applied_, error);
+    const ImageBuffer padded = PadToCanvas(applied_);
+    return WriteClipboardImage(padded, error);
+}
+
 BridgeCore::ApplyResult BridgeCore::ApplyToClipboard() {
     ApplyResult r;
     if (!started_ || !HasImage()) {
@@ -617,7 +672,7 @@ BridgeCore::ApplyResult BridgeCore::ApplyToClipboard() {
     RebuildPreviewSource(kWinMain);
 
     std::string err;
-    const bool wrote = WriteClipboardImage(applied_, err);
+    const bool wrote = WriteAppliedToClipboard(err);
     r.ok = true;
     r.clipboardWritten = wrote;
     r.error = wrote ? "" : err;
@@ -633,11 +688,7 @@ BridgeCore::ApplyResult BridgeCore::ApplyToClipboard() {
 }
 
 bool BridgeCore::WriteClipboard(std::string& error) {
-    if (!applied_.IsValid()) {
-        error = "没有可写入的图像";
-        return false;
-    }
-    return WriteClipboardImage(applied_, error);
+    return WriteAppliedToClipboard(error);
 }
 
 bool BridgeCore::Undo(std::string& error) {

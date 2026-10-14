@@ -25,11 +25,14 @@ typedef int(WINAPI* FnSetDIBitsToDevice)(HDC, int, int, DWORD, DWORD, int, int,
                                          UINT, UINT, const void*,
                                          const BITMAPINFO*, UINT);
 typedef BOOL(WINAPI* FnBitBlt)(HDC, int, int, int, int, HDC, int, int, DWORD);
+typedef BOOL(WINAPI* FnStretchBlt)(HDC, int, int, int, int, HDC, int, int,
+                                   int, int, DWORD);
 
 void* g_origExtTextOutW = nullptr;
 void* g_origDrawTextW = nullptr;
 void* g_origSetDIBitsToDevice = nullptr;
 void* g_origBitBlt = nullptr;
+void* g_origStretchBlt = nullptr;
 IATHook* g_hooks = nullptr;
 AgentCore* g_core = nullptr; // Startup 后有效
 
@@ -206,6 +209,96 @@ struct AgentCore::Impl {
             thumbEvent = nullptr;
         }
         DeleteCriticalSection(&thumbLock);
+    }
+
+    // ------------------------------------------------------------ 画布快照
+    // 回贴错位的终局修复：SAI2 的 Ctrl+C 只拷贝图层不透明部分的包围盒
+    // （透明区域被裁掉），Ctrl+V 又按画布 (0,0) 对齐 —— 想精确回贴必须
+    // 知道画布尺寸与内容偏移。桥先 canvas.arm 打开捕获窗口，钩子在窗口
+    // 期内把见到的最大 32bpp DIB 源（≈ 画布 DIBSection，画布尺寸）拷进
+    // 内存；canvas.save 把它落盘成 BMP，桥在文件里对剪贴板位图做模板
+    // 匹配求出内容在画布内的偏移。管道只传尺寸与路径，像素走文件。
+    struct CanvasSnap {
+        int w = 0, h = 0;
+        bool topDown = false;
+        std::vector<uint8_t> bits;
+        ULONGLONG tick = 0;
+        bool dirty = false; // 自上次 canvas.save 后有新快照
+    };
+    CRITICAL_SECTION canvasLock;
+    CanvasSnap canvasSnap;
+    volatile LONG canvasArmed = 0;
+    ULONGLONG canvasDeadline = 0; // canvasLock 保护
+    // 保险丝：超过 24MP 的 DIB 不拷贝（防异常大表面把绘制线程卡死）
+    static constexpr unsigned long long kCanvasMaxPixels =
+        24ull * 1024 * 1024;
+
+    void InitCanvas() { InitializeCriticalSection(&canvasLock); }
+    void ShutdownCanvas() { DeleteCriticalSection(&canvasLock); }
+
+    // arm 窗口期内记录候选画布 DIB（只留面积最大者；画布是绘制源里最大的）
+    void MaybeCaptureCanvas(int w, int h, bool topDown, const void* bits,
+                            ULONGLONG now) {
+        if (!canvasArmed || w < 256 || h < 256 || !bits) return;
+        const unsigned long long area =
+            static_cast<unsigned long long>(w) *
+            static_cast<unsigned long long>(h);
+        if (area == 0 || area > kCanvasMaxPixels) return;
+        const size_t stride =
+            ((static_cast<size_t>(w) * 4) + 3) & ~size_t(3);
+        const size_t bytes = stride * static_cast<size_t>(h);
+        EnterCriticalSection(&canvasLock);
+        if (now > canvasDeadline) {
+            canvasArmed = 0; // 窗口已关闭
+        } else {
+            const unsigned long long oldArea =
+                static_cast<unsigned long long>(canvasSnap.w) *
+                static_cast<unsigned long long>(canvasSnap.h);
+            if (area > oldArea) {
+                canvasSnap.w = w;
+                canvasSnap.h = h;
+                canvasSnap.topDown = topDown;
+                canvasSnap.tick = now;
+                canvasSnap.bits.assign(
+                    static_cast<const uint8_t*>(bits),
+                    static_cast<const uint8_t*>(bits) + bytes);
+                canvasSnap.dirty = true;
+            }
+        }
+        LeaveCriticalSection(&canvasLock);
+    }
+
+    // BitBlt/StretchBlt 的源 DC 里找画布 DIBSection（缩略图路径已有同款检查）
+    void MaybeCaptureCanvasDc(HDC srcDc, ULONGLONG now) {
+        if (!canvasArmed || !srcDc) return;
+        HBITMAP srcBmp =
+            static_cast<HBITMAP>(GetCurrentObject(srcDc, OBJ_BITMAP));
+        DIBSECTION ds = {};
+        if (!srcBmp || GetObjectW(srcBmp, sizeof(ds), &ds) != sizeof(ds) ||
+            !ds.dsBm.bmBits || ds.dsBm.bmBitsPixel != 32 ||
+            ds.dsBmih.biCompression != BI_RGB)
+            return;
+        MaybeCaptureCanvas(ds.dsBm.bmWidth, std::abs(ds.dsBm.bmHeight),
+                           ds.dsBmih.biHeight < 0, ds.dsBm.bmBits, now);
+    }
+
+    // canvas.redraw：让宿主立即重绘一次（arm 窗口期内 blit 才会被捕获）。
+    // 用已知面板行的根窗口 —— agent 就在宿主进程内，直接 RedrawWindow。
+    void TriggerRepaint() {
+        HWND top = nullptr;
+        AcquireSRWLockShared(&lock);
+        for (const auto& kv : rowsByHwnd) {
+            if (kv.first) {
+                top = GetAncestor(kv.first, GA_ROOT);
+                if (top) break;
+            }
+        }
+        ReleaseSRWLockShared(&lock);
+        if (top) {
+            RedrawWindow(top, nullptr, nullptr,
+                         RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW |
+                             RDW_NOERASE | RDW_NOFRAME);
+        }
     }
 
     // ------------------------------------------------------------ 日志
@@ -450,6 +543,22 @@ struct AgentCore::Impl {
         PairPendingTexts(c);
         RecordBlit(c);
 
+        // ---- 画布快照候选：SetDIBitsToDevice 的 bits 指向 startScan 行，
+        //      按步长回退还原出整个 DIB 的首行地址再参与评比
+        if (canvasArmed && bmi && bits && cLines > 0 &&
+            bmi->bmiHeader.biBitCount == 32 &&
+            bmi->bmiHeader.biCompression == BI_RGB) {
+            const int cw = bmi->bmiHeader.biWidth;
+            const LONG declaredH = bmi->bmiHeader.biHeight;
+            const size_t cstride =
+                ((static_cast<size_t>(cw) * 4) + 3) & ~size_t(3);
+            const uint8_t* bitsFull =
+                static_cast<const uint8_t*>(bits) -
+                cstride * static_cast<size_t>(startScan);
+            MaybeCaptureCanvas(cw, std::abs(static_cast<int>(declaredH)),
+                               declaredH < 0, bitsFull, c.tick);
+        }
+
         // ---- 缩略图捕获：廉价过滤在前，昂贵检查（窗口命中/入队）在后。
         // 命中后不再同步写盘，只把像素拷进内存队列交给后台线程落盘。
         if (!c.hasScreen || w < 8 || h < 8 || w > 512 || h > 512) return;
@@ -481,6 +590,9 @@ struct AgentCore::Impl {
             c.hasScreen = true;
         }
         RecordBlit(c);
+
+        // ---- 画布快照候选：arm 期间任何 32bpp DIBSection 源都参与评比
+        MaybeCaptureCanvasDc(srcDc, c.tick);
 
         // ---- 缩略图候选：同 CaptureSetDibits，昂贵检查后置 + 异步落盘
         if (!c.hasScreen || !srcDc || w < 8 || h < 8 || w > 512 || h > 512)
@@ -927,6 +1039,21 @@ BOOL WINAPI HookedBitBlt(HDC dst, int x, int y, int cx, int cy, HDC src,
     return r;
 }
 
+// 画布视图在缩放 ≠100% 时走 StretchBlt：只为画布快照补这个钩子，
+// 不参与缩略图/文字配对（那些只看 1:1 的 BitBlt/SetDIBitsToDevice）。
+BOOL WINAPI HookedStretchBlt(HDC dst, int x, int y, int cx, int cy, HDC src,
+                             int x1, int y1, int cx1, int cy1, DWORD rop) {
+    const BOOL r = reinterpret_cast<FnStretchBlt>(g_origStretchBlt)(
+        dst, x, y, cx, cy, src, x1, y1, cx1, cy1, rop);
+    if (g_core && !g_core->ExitRequested() && g_inCapture == 0 &&
+        rop == SRCCOPY) {
+        ++g_inCapture;
+        g_core->ImplPtr()->MaybeCaptureCanvasDc(src, GetTickCount64());
+        --g_inCapture;
+    }
+    return r;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -952,6 +1079,7 @@ bool AgentCore::Startup(const std::wstring& outDir, std::wstring& error) {
     impl_->thumbDir = impl_->outDir + L"\\thumbs";
     CreateDirectoryW(impl_->thumbDir.c_str(), nullptr);
     impl_->InitThumbs();
+    impl_->InitCanvas();
     impl_->thumbThread =
         CreateThread(nullptr, 0, ThumbThreadProc, impl_, 0, nullptr);
 
@@ -978,6 +1106,8 @@ bool AgentCore::Startup(const std::wstring& outDir, std::wstring& error) {
                       reinterpret_cast<void*>(&HookedSetDIBitsToDevice));
     g_origBitBlt = hooks.Install("GDI32.dll", "BitBlt",
                                  reinterpret_cast<void*>(&HookedBitBlt));
+    g_origStretchBlt = hooks.Install("GDI32.dll", "StretchBlt",
+                                     reinterpret_cast<void*>(&HookedStretchBlt));
     g_hooks = &hooks;
     g_core = this;
 
@@ -997,6 +1127,7 @@ void AgentCore::Shutdown() {
     if (!impl_) return;
     impl_->Log("=== sai2_agent shutdown ===");
     impl_->ShutdownThumbs();
+    impl_->ShutdownCanvas();
     if (g_hooks) {
         g_hooks->RestoreAll();
         g_hooks = nullptr;
@@ -1196,6 +1327,91 @@ void AgentCore::HandleCommand(const std::string& line, std::string& out) {
             if (p.first == L"dump" && p.second.isBool) dump = p.second.boolean;
         }
         impl_->ScanStrings(substr, dump, out);
+        return;
+    }
+
+    // ---- 画布快照（精确回贴）：用法 = arm → (redraw) → state → save ----
+    if (cmd == L"canvas.arm") {
+        long long ms = 6000;
+        for (auto& p : kv)
+            if (p.first == L"ms" && p.second.isNum) ms = p.second.num;
+        if (ms < 500) ms = 500;
+        if (ms > 20000) ms = 20000;
+        EnterCriticalSection(&impl_->canvasLock);
+        impl_->canvasSnap = decltype(impl_->canvasSnap){};
+        impl_->canvasDeadline =
+            GetTickCount64() + static_cast<ULONGLONG>(ms);
+        LeaveCriticalSection(&impl_->canvasLock);
+        impl_->canvasArmed = 1;
+        impl_->Log("canvas armed");
+        out = "{\"ok\":true,\"ms\":";
+        JsonNum(ms, out);
+        out += "}";
+        return;
+    }
+
+    if (cmd == L"canvas.redraw") {
+        impl_->TriggerRepaint();
+        out = "{\"ok\":true}";
+        return;
+    }
+
+    if (cmd == L"canvas.state") {
+        bool captured = false, dirty = false;
+        int w = 0, h = 0;
+        long long tick = 0;
+        EnterCriticalSection(&impl_->canvasLock);
+        captured = !impl_->canvasSnap.bits.empty();
+        dirty = impl_->canvasSnap.dirty;
+        w = impl_->canvasSnap.w;
+        h = impl_->canvasSnap.h;
+        tick = static_cast<long long>(impl_->canvasSnap.tick);
+        LeaveCriticalSection(&impl_->canvasLock);
+        out = "{\"ok\":true,\"captured\":";
+        out += captured ? "true" : "false";
+        out += ",\"dirty\":";
+        out += dirty ? "true" : "false";
+        out += ",\"w\":";
+        JsonNum(w, out);
+        out += ",\"h\":";
+        JsonNum(h, out);
+        out += ",\"tick\":";
+        JsonNum(tick, out);
+        out += "}";
+        return;
+    }
+
+    if (cmd == L"canvas.save") {
+        decltype(impl_->canvasSnap) snap;
+        EnterCriticalSection(&impl_->canvasLock);
+        snap = impl_->canvasSnap;
+        impl_->canvasSnap.dirty = false;
+        LeaveCriticalSection(&impl_->canvasLock);
+        if (snap.bits.empty()) {
+            out =
+                "{\"ok\":false,\"error\":\"no canvas snapshot (arm first)\"}";
+            return;
+        }
+        wchar_t path[MAX_PATH];
+        swprintf(path, MAX_PATH, L"%s\\canvas_snap.bmp",
+                 impl_->thumbDir.c_str());
+        const LONG declared = snap.topDown ? -snap.h : snap.h;
+        if (!WriteBmpFromDib32(path, snap.w, snap.h, declared,
+                               snap.bits.data(), snap.bits.size())) {
+            out = "{\"ok\":false,\"error\":\"write bmp failed\"}";
+            return;
+        }
+        char p8[MAX_PATH * 2] = {};
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, p8, sizeof(p8), nullptr,
+                            nullptr);
+        impl_->Log("canvas.save ok");
+        out = "{\"ok\":true,\"w\":";
+        JsonNum(snap.w, out);
+        out += ",\"h\":";
+        JsonNum(snap.h, out);
+        out += ",\"file\":";
+        JsonEscapeInto(std::string(p8), out);
+        out += "}";
         return;
     }
 
