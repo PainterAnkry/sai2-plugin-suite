@@ -5,6 +5,7 @@
 
 #include "AgentShared.h"
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,18 @@ public:
 
     // 管道命令分发（输入一行 JSON，输出一行 JSON；无对象返回值便于 SEH 包装）
     void HandleCommand(const std::string& line, std::string& out);
+
+    // 桥存活心跳：管道每服务一条桥命令就刷新；工具栏用它判断桥是否还在
+    //（桥退出/挂死后浮窗自动隐藏，避免点了没反应）
+    void TouchBridgeSeen() {
+        bridgeSeenTick_.store(static_cast<long long>(GetTickCount64()),
+                              std::memory_order_relaxed);
+    }
+    long long MsSinceBridgeSeen() const {
+        const long long t = bridgeSeenTick_.load(std::memory_order_relaxed);
+        return t == 0 ? -1
+                      : static_cast<long long>(GetTickCount64()) - t;
+    }
 
     const std::wstring& LogPath() const { return logPath_; }
 
@@ -60,6 +73,7 @@ public:
 private:
     Impl* impl_ = nullptr;
     volatile bool exitFlag_ = false;
+    std::atomic<long long> bridgeSeenTick_{0};
     std::wstring logPath_;
 };
 

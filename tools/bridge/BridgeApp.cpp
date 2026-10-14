@@ -806,17 +806,25 @@ void RunCaptureJob() {
     //    菜单点击链路（截屏找文字+模拟点击）太脆弱：菜单没弹出/前台切换失败/
     //    文字没截到，任何一步失败窗口就永远开不出来。快捷键只要 SAI2 在前台
     //    就一定生效（readme 里手动 Ctrl+C 的流程就是证明）。
-    SendCtrlScan(0x1E); // Ctrl+A 全选
-    Sleep(350);
-    SendCtrlScan(0x2E); // Ctrl+C 拷贝
-    for (int i = 0; i < 20; ++i) {
-        Sleep(100);
-        if (GetClipboardSequenceNumber() != j.clipSeq && ClipboardHasImage()) {
-            j.grabbed = true;
-            break;
+    //    整段重试一次：前台切换偶发失败/首个按键被吞是「浮窗点了没反应」
+    //    的主因，用户看到的就是点了按钮什么都没发生。
+    for (int attempt = 0; attempt < 2 && !j.grabbed; ++attempt) {
+        ForceForeground(sai);
+        Sleep(attempt > 0 ? 260 : 100);
+        if (GetForegroundWindow() != sai) continue;
+        SendCtrlScan(0x1E); // Ctrl+A 全选
+        Sleep(attempt > 0 ? 450 : 350);
+        SendCtrlScan(0x2E); // Ctrl+C 拷贝
+        for (int i = 0; i < 20; ++i) {
+            Sleep(100);
+            if (GetClipboardSequenceNumber() != j.clipSeq &&
+                ClipboardHasImage()) {
+                j.grabbed = true;
+                break;
+            }
         }
+        if (!j.grabbed && ClipboardHasImage()) j.grabbed = true;
     }
-    if (!j.grabbed && ClipboardHasImage()) j.grabbed = true;
 
     // 3) 兜底：快捷键没拿到图再退回旧菜单点击链路
     if (!j.grabbed) {
@@ -940,6 +948,9 @@ void AutoPasteToSai2() {
     // 用快捷键而不是菜单点击：不依赖 agent 管道（菜单文字钩子），
     // 也不依赖菜单栏坐标换算 —— 只要 SAI2 在前台就一定生效。
     // Ctrl+A 全选让粘贴对齐画布（与菜单「全选 → 粘贴」等效）。
+    // 注意对齐原理：SAI2 粘贴按画布中心对齐 —— 抓的是整层（图=画布
+    // 尺寸）时正好完全重合；若抓的是局部框选内容，SAI2 会把它放到
+    // 画布中心，需要用移动工具摆位（SAI2 剪贴板不携带位置信息）。
     WaitMouseReleased(1000);
     ForceForeground(target);
     Sleep(160);
@@ -948,12 +959,13 @@ void AutoPasteToSai2() {
         return;
     }
     SendEscape();
-    Sleep(150);
+    Sleep(200);
     SendCtrlScan(0x1E); // Ctrl+A 全选
-    Sleep(260);
+    Sleep(400);
     SendCtrlScan(0x2F); // Ctrl+V 粘贴
     ReleaseSyntheticKeys();
-    s.flash = L"已发送 Ctrl+A / Ctrl+V 粘贴回 SAI2（若画面无变化请手动 Ctrl+V）";
+    s.flash = L"已粘贴回 SAI2（整层抓取会精确对齐；局部框选抓取的，"
+              L"SAI2 会把粘贴内容放到画布中心，请用移动工具摆位）";
 }
 
 // ---------------------------------------------------------------------------
@@ -1384,9 +1396,11 @@ void DoInjectAsync(HWND hwnd) {
 
 void ScheduleMergeAfterPaste(HWND hwnd) {
     AppState& s = S();
-    if (!s.mergeBack || !s.mergePending) return;
-    s.mergePending = false;
-    SetTimer(hwnd, 5, 900, nullptr);
+    if (!s.mergeBack) return;
+    // 注意：这里曾经要求 s.mergePending（从未有代码把它置 true），
+    // 结果勾选了「合并回原图层」也永远不会合并——1.15 修复。
+    // 粘贴（含 SAI2 新建图层）需要一点时间，大画布更久，给足 1.4 秒。
+    SetTimer(hwnd, 5, 1400, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,12 +1437,24 @@ void DoMergeDown(HWND hwnd) {
         s.flash = L"未找到 SAI2 窗口，无法合并回图层";
         return;
     }
-    if (MenuItemClickImpl(sai, 292, L"向下转写")) {
-        s.flash = L"已合并回原图层（向下转写）";
-        s.core->Log("merge-down: merged pasted layer back");
-    } else {
-        s.flash = L"未在图层菜单里找到「向下转写」";
+    // 用 SAI2 原生快捷键 F（向下转写：当前层内容并入下层、本层清空）。
+    // 此前走「图层菜单 → 向下转写」的菜单点击链路：依赖 agent 管道的
+    // 文字钩子 + 菜单栏坐标换算 + 屏幕找字，任何一环失败就悄悄不合并
+    //（用户反馈：勾了合并回原图层，结果还在新建图层上）。
+    // 粘贴层刚被 SAI2 选中且直接位于原图层之上，F 正好把它转写下去。
+    WaitMouseReleased(1000);
+    ForceForeground(sai);
+    Sleep(160);
+    if (GetForegroundWindow() != sai) {
+        s.flash = L"无法把 SAI2 切到前台 —— 请在 SAI2 里手动按 F（向下转写）";
+        return;
     }
+    SendKeyScan(0x21, false); // F = 向下转写
+    Sleep(40);
+    SendKeyScan(0x21, true);
+    ReleaseSyntheticKeys();
+    s.flash = L"已发送「向下转写」（F）：效果已并入原图层";
+    s.core->Log("merge-down: sent F (transfer down)");
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 

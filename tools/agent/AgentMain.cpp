@@ -105,6 +105,8 @@ bool ServeClient(HANDLE pipe) {
 
     std::string resp;
     g_agent.HandleCommand(req, resp);
+    if (req.find("__exit") == std::string::npos)
+        g_agent.TouchBridgeSeen(); // 心跳：桥还活着（工具栏据此显隐）
     resp += '\n';
     DWORD w = 0;
     WriteFile(pipe, resp.data(), static_cast<DWORD>(resp.size()), &w, nullptr);

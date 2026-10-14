@@ -102,6 +102,16 @@ int HitButton(int x, int y) {
 // 返回本窗口几何是否发生了变化（变了才需要重绘）
 bool SyncBarPosition() {
     if (!g_barWnd) return false;
+    // 桥心跳检测：桥退出/挂死后（>4 秒没有管道命令）自动隐藏浮窗，
+    // 避免留一个"点了没反应"的死按钮条（1.15 之前用户只能重启面板）。
+    // 桥重新连上（push set.plugins / 400ms 轮询）后自动恢复显示。
+    if (g_barCore) {
+        const long long since = g_barCore->MsSinceBridgeSeen();
+        if (since < 0 || since > 4000) {
+            if (IsWindowVisible(g_barWnd)) ShowWindow(g_barWnd, SW_HIDE);
+            return false;
+        }
+    }
     if (!g_saiMain || !IsWindow(g_saiMain)) {
         MainWndCtx ctx;
         EnumWindows(FindMainProc, reinterpret_cast<LPARAM>(&ctx));
