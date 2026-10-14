@@ -1066,6 +1066,31 @@ void DoGrabFromClipboard(UiWindow& win) {
     }
 }
 
+// 主面板「抓取 SAI2 图层」按钮 / 全局抓取热键：走完整抓取链路。
+// 历史 bug：这个按钮此前经 RunCmd → RequestToolWindow(hwnd, kWinMain)
+// 而 winIdx=0 直接 return，是个空操作 —— 用户实际靠"监控剪贴板"抓到
+// 的都是自己在 SAI2 里 Ctrl+C 的内容（局部选区/内容包围盒），应用后
+// 按 SAI2"画布中心对齐"粘贴就会出现大幅错位。
+void DoGrabWholeLayer(HWND hwnd) {
+    (void)hwnd;
+    AppState& s = S();
+    if (s.agentOnline && !g_cap.busy.load()) {
+        g_cap.row = -1;        // 不点图层行：直接抓当前激活图层整层
+        g_cap.panelLeft = 0;
+        g_cap.rowScreenY = 0;
+        g_cap.wantWindow = -1; // 不自动打开功能窗口
+        g_cap.busy = true;
+        g_cap.hasJob = true;
+        g_cap.phase = CAP_SELECT_LAYER;
+        s.flash = L"正在抓取 SAI2 当前图层（整层）…";
+        InvalidateAll();
+        if (g_capThread.joinable()) g_capThread.join();
+        g_capThread = std::thread(RunCaptureJob);
+        return;
+    }
+    DoGrabFromClipboard(s.main);
+}
+
 // ---------------------------------------------------------------------------
 // 应用 / 撤销 / 复位
 // ---------------------------------------------------------------------------
@@ -1635,7 +1660,7 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_HOTKEY:
         if (wp == 1) {
-            DoGrabFromClipboard(win);
+            DoGrabWholeLayer(win.hwnd);
         } else if (wp == 2) {
             if (s.core->HasImage()) DoApplyFlow(win);
         } else if (wp == 3) {

@@ -400,6 +400,11 @@ void DoApply(UiWindow& win);
 void DoUndo(UiWindow& win);
 void DoReset(UiWindow& win);
 void DoGrabFromClipboard(UiWindow& win);
+// 主面板「抓取 SAI2 图层」按钮 / 全局抓取热键：走完整抓取链路
+// （切前台 → Esc → Ctrl+A 全选 → Ctrl+C），保证拿到的是整层
+// （画布尺寸）内容，回贴才能按画布中心精确对齐。
+// 代理不在线时退回 DoGrabFromClipboard（读当前剪贴板）。
+void DoGrabWholeLayer(HWND hwnd);
 // 图层：连接注入代理 / 刷新 / 选中并抓取某一层
 struct LayerAgg {
     std::vector<std::wstring> names;

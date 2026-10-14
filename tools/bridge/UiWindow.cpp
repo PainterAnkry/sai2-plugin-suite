@@ -600,7 +600,9 @@ void RunCmd(UiWindow& win, int cmd) {
         s.autoPaste = !s.autoPaste;
         break;
     case CMD_GRAB:
-        RequestToolWindow(win.hwnd, win.id, true);
+        // 主面板「抓取 SAI2 图层」：整层抓取（此前误走 RequestToolWindow，
+        // winIdx=0 直接 return，按钮等于没功能）
+        DoGrabWholeLayer(win.hwnd);
         break;
     case CMD_THEME:
         CycleTheme(win.hwnd ? win.hwnd : S().mainHwnd);
