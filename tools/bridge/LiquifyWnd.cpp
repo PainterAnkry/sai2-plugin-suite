@@ -218,12 +218,10 @@ void DrawLiquify(HDC dc, UiWindow& win, const RECT& client) {
     win.canvas = {toolCol.right + gap, body.top, body.right, body.bottom};
 
     FillRect(dc, &client, s.bgBrush);
-    wchar_t sub[160];
+    wchar_t head[200], sub[240];
     const ImageBuffer& img = s.core->DisplayImage(BridgeCore::kWinLiquify);
-    swprintf(sub, 160, L"%s   %d x %d   液化工具 %d 个",
-             (s.core->HasImage() ? L"已抓取图层" : L"等待抓取"),
-             img.IsValid() ? img.Width() : 0, img.IsValid() ? img.Height() : 0,
-             static_cast<int>(fx.size()));
+    GrabSubtitleHead(head, 200, img);
+    swprintf(sub, 240, L"%s   液化工具 %d 个", head, static_cast<int>(fx.size()));
     DrawWindowChrome(dc, win, L, L"液化（Liquify）", sub, fx);
     DrawToolColumn(dc, win, toolCol, fx);
     DrawCanvas(dc, win, true);

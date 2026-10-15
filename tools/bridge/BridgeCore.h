@@ -152,6 +152,10 @@ public:
     bool HasCanvasContext() const { return hasCanvasCtx_; }
     int CanvasW() const { return canvasW_; }
     int CanvasH() const { return canvasH_; }
+    // 把当前 applied_ 补边成画布尺寸后写剪贴板 —— 这就是产品"精确回贴"的
+    // 写入路径。公开出来是为了让 `--pad-clipboard` 诊断复跑**同一段**代码，
+    // 而不是另写一份（否则测的就不是产品路径了）。
+    bool WriteAppliedToClipboard(std::string& error);
 
     // ---- 液化笔画 -------------------------------------------------------
     // 按"上一采样点 → 本次点"提交一笔（笔刷中心 + 拖动方向）。
@@ -279,8 +283,6 @@ private:
     ImageBuffer strokeScratch_;
 
 
-    // 把当前 applied_ 写剪贴板（有画布上下文时先补边成画布尺寸）
-    bool WriteAppliedToClipboard(std::string& error);
     // 把 img 摆到画布坐标 (canvasX0_, canvasY0_) 处、补边成画布尺寸
     ImageBuffer PadToCanvas(const ImageBuffer& img) const;
 

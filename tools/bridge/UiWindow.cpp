@@ -65,6 +65,25 @@ UiWindow* WindowById(int id) {
     return nullptr;
 }
 
+// 功能窗口副标题的前半段：抓取尺寸 → 画布尺寸。
+// 为什么要并排显示这两个数：用户看到"已抓取图层 971 x 593"会以为抓错了尺寸，
+// 其实 **SAI2 的 Ctrl+C 只给图层不透明部分的包围盒**，补边到画布尺寸发生在
+// "应用"那一步。把两个尺寸摆在一起，并在没拿到画布尺寸时直接预警，
+// 就不会再出现"画布大小和截取大小不一致 → 以为是 bug"的误解。
+// （画布尺寸 = 精确回贴的补边目标；拿不到就必然错位，故用显式警告。）
+void GrabSubtitleHead(wchar_t* out, size_t n, const ImageBuffer& img) {
+    AppState& s = S();
+    const int w = img.IsValid() ? img.Width() : 0;
+    const int h = img.IsValid() ? img.Height() : 0;
+    const wchar_t* state = s.core->HasImage() ? L"已抓取图层" : L"等待抓取";
+    if (s.core->HasCanvasContext()) {
+        swprintf(out, n, L"%s   %d x %d  →  画布 %d x %d（应用时补边）", state,
+                 w, h, s.core->CanvasW(), s.core->CanvasH());
+    } else {
+        swprintf(out, n, L"%s   %d x %d  ⚠ 无画布尺寸：粘贴会错位", state, w, h);
+    }
+}
+
 // 工具窗口的命中/绘制/命令分别由各自文件实现
 void WindowPaint(UiWindow& win, HDC dc, const RECT& rc) {
     const ToolWindowSpec* sp = &Specs()[win.id];
@@ -412,6 +431,26 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 } // namespace
+
+// 功能窗口副标题的前半段：抓取尺寸 → 画布尺寸。
+// 为什么要并排显示这两个数：用户看到"已抓取图层 971 x 593"会以为抓错了尺寸，
+// 其实 **SAI2 的 Ctrl+C 只给图层不透明部分的包围盒**，补边到画布尺寸发生在
+// "应用"那一步。把两个尺寸摆在一起，并在没拿到画布尺寸时直接预警，
+// 就不会再出现"画布大小和截取大小不一致 → 以为是 bug"的误解。
+// （画布尺寸 = 精确回贴的补边目标；拿不到就必然错位，故用显式警告。）
+// 注意：必须定义在匿名 namespace **之外**，否则只有内部链接，四类窗口链接不到。
+void GrabSubtitleHead(wchar_t* out, size_t n, const ImageBuffer& img) {
+    AppState& s = S();
+    const int w = img.IsValid() ? img.Width() : 0;
+    const int h = img.IsValid() ? img.Height() : 0;
+    const wchar_t* state = s.core->HasImage() ? L"已抓取图层" : L"等待抓取";
+    if (s.core->HasCanvasContext()) {
+        swprintf(out, n, L"%s   %d x %d  →  画布 %d x %d（应用时补边）", state,
+                 w, h, s.core->CanvasW(), s.core->CanvasH());
+    } else {
+        swprintf(out, n, L"%s   %d x %d  ⚠ 无画布尺寸：粘贴会错位", state, w, h);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 窗口类注册 / 创建

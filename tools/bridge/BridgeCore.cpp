@@ -616,14 +616,20 @@ bool BridgeCore::WriteAppliedToClipboard(std::string& error) {
 
 BridgeCore::ApplyResult BridgeCore::ApplyToClipboard() {
     ApplyResult r;
+    // 这些失败路径以前只写 status_/UI flash，**不进日志** ——
+    // 界面上闪一下就没了，排查时完全看不到（踩过：--hotkey 触发应用后
+    // 日志里连一句 applied 都没有，无法判断是没执行还是提前返回）。
     if (!started_ || !HasImage()) {
         r.error = "还没有图像：请先在 SAI2 中复制选区";
         status_ = r.error;
+        Log("apply FAILED: " + r.error);
         return r;
     }
     if (!EffectAvailable(current_)) {
         r.error = "当前效果对应的插件未加载";
         status_ = r.error;
+        Log("apply FAILED: " + r.error + " (effect#" +
+            std::to_string(current_) + ")");
         return r;
     }
 
@@ -658,6 +664,7 @@ BridgeCore::ApplyResult BridgeCore::ApplyToClipboard() {
     if (!result.IsValid()) {
         r.error = "插件未产出有效图像";
         status_ = r.error;
+        Log("apply FAILED: " + r.error + " (effect=" + e.id + ")");
         return r;
     }
 

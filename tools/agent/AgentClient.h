@@ -15,6 +15,7 @@
 #endif
 #include <windows.h>
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,22 @@ namespace sai2agent {
 
 inline const wchar_t* DefaultPipeName() { return L"\\\\.\\pipe\\sai2agent"; }
 
+// ---------------------------------------------------------------------------
+// 进程内串行化（关键修复）
+//
+// agent 的命名管道是**单实例同步服务**：服务端一次只服务一个连接，读完一整行
+// 才回一整行。面板里有两条线程都会用它 —— UI 定时器（take.request / ping /
+// layers，约 400ms 一次）和抓取线程（canvas.arm / state / save）。
+// 两条线程各自 Connect 时，服务端的"请求↔响应"配对会错乱：抓取线程发出的
+// canvas.save 可能轮不到自己的回复 → Query 返回 false，表现为
+//   canvas ctx: locate failed (save failed: pipe busy ...)
+// 实测证据见 docs/SAI2Injection.md §10.6.2 的管道日志（canvas.* 与 take.request
+// 交错出现）。
+//
+// 因此进程内用一把互斥量把所有管道访问串起来：Connect 取锁、Close 放锁，
+// 一个实例在其生命周期内独占管道，请求/响应永远成对。
+// （跨进程仍可能争用，故 Connect 保留 ERROR_PIPE_BUSY 重试；诊断前先关面板。）
+// ---------------------------------------------------------------------------
 class AgentClient {
 public:
     ~AgentClient() { Close(); }
@@ -30,6 +47,8 @@ public:
 
     bool Connect(const wchar_t* pipeName = nullptr, DWORD timeoutMs = 3000) {
         Close();
+        // 取进程内独占锁（UI 定时器单次查询是毫秒级，拿不到就等）
+        lock_ = std::unique_lock<std::mutex>(PipeMutex());
         const wchar_t* name = pipeName ? pipeName : DefaultPipeName();
         const ULONGLONG t0 = GetTickCount64();
         for (;;) {
@@ -37,9 +56,25 @@ public:
                                   nullptr, OPEN_EXISTING, 0, nullptr);
             if (handle_ != INVALID_HANDLE_VALUE) return true;
             lastErr = GetLastError();
-            if (lastErr != ERROR_PIPE_BUSY) return false;
-            if (GetTickCount64() - t0 > timeoutMs) return false;
-            WaitNamedPipeW(name, 250);
+            // 关键：服务端每服务完一个客户端就 DisconnectNamedPipe → 重新
+            // CreateNamedPipe。在这两步之间**管道名短暂不存在**，此刻
+            // CreateFileW 返回 ERROR_FILE_NOT_FOUND(2)（有时 ERROR_PIPE_NOT_CONNECTED(233)）。
+            // 旧代码只把 ERROR_PIPE_BUSY(231) 当可重试，于是这种"恰好卡在重建窗口"
+            // 的连接会**立刻失败**——表现为 canvas.save 明明刚发过 state 却连不上，
+            // 日志里就是 save failed: pipe busy（其实根本不是 busy）。
+            // 三种都属于"服务端暂不可用"，一律重试到超时。
+            const bool retryable =
+                lastErr == ERROR_PIPE_BUSY ||
+                lastErr == ERROR_FILE_NOT_FOUND ||
+                lastErr == ERROR_PIPE_NOT_CONNECTED;
+            if (!retryable || GetTickCount64() - t0 > timeoutMs) {
+                if (lock_.owns_lock()) lock_.unlock();
+                return false;
+            }
+            if (lastErr == ERROR_PIPE_BUSY)
+                WaitNamedPipeW(name, 100);
+            else
+                Sleep(15);   // 重建窗口，短暂退避
         }
     }
 
@@ -87,10 +122,17 @@ public:
             CloseHandle(handle_);
             handle_ = INVALID_HANDLE_VALUE;
         }
+        if (lock_.owns_lock()) lock_.unlock();   // 释放进程内独占
     }
 
 private:
+    static std::mutex& PipeMutex() {
+        static std::mutex m;   // 函数内静态：C++11 起初始化线程安全
+        return m;
+    }
+
     HANDLE handle_ = INVALID_HANDLE_VALUE;
+    std::unique_lock<std::mutex> lock_;   // 持有到 Close()
 };
 
 // ---------------------------------------------------------------------------

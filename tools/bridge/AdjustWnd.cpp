@@ -44,13 +44,11 @@ void DrawAdjust(HDC dc, UiWindow& win, const RECT& client) {
 
     FillRect(dc, &client, s.bgBrush);
     const ImageBuffer& img = s.core->DisplayImage(BridgeCore::kWinAdjust);
-    wchar_t sub[200];
     const int ci = WindowEffectIndex(win);
     const auto& E = s.core->Effects();
-    swprintf(sub, 200, L"%s   %d x %d   预览 %.0f ms",
-             (s.core->HasImage() ? L"已抓取图层" : L"等待抓取"),
-             img.IsValid() ? img.Width() : 0, img.IsValid() ? img.Height() : 0,
-             s.core->LastPreviewMs());
+    wchar_t head[200], sub[240];
+    GrabSubtitleHead(head, 200, img);
+    swprintf(sub, 240, L"%s   预览 %.0f ms", head, s.core->LastPreviewMs());
     DrawWindowChrome(dc, win, L, L"调整（Adjust）", sub, fx);
 
     const std::wstring name =

@@ -543,20 +543,19 @@ struct AgentCore::Impl {
         PairPendingTexts(c);
         RecordBlit(c);
 
-        // ---- 画布快照候选：SetDIBitsToDevice 的 bits 指向 startScan 行，
-        //      按步长回退还原出整个 DIB 的首行地址再参与评比
+        // ---- 画布快照候选：只接受整帧 blit（startScan=0 且行数覆盖整个
+        //      DIB）。带状 blit 的 bits 只含带内行，往回推 startScan 行会
+        //      越界读宿主内存（可能的崩溃源，实测快照里出现过未初始化的
+        //      黑色区域）。整帧时 bits 就是 DIB 首行。
         if (canvasArmed && bmi && bits && cLines > 0 &&
             bmi->bmiHeader.biBitCount == 32 &&
-            bmi->bmiHeader.biCompression == BI_RGB) {
+            bmi->bmiHeader.biCompression == BI_RGB &&
+            startScan == 0 &&
+            cLines >= std::abs(static_cast<int>(bmi->bmiHeader.biHeight))) {
             const int cw = bmi->bmiHeader.biWidth;
             const LONG declaredH = bmi->bmiHeader.biHeight;
-            const size_t cstride =
-                ((static_cast<size_t>(cw) * 4) + 3) & ~size_t(3);
-            const uint8_t* bitsFull =
-                static_cast<const uint8_t*>(bits) -
-                cstride * static_cast<size_t>(startScan);
             MaybeCaptureCanvas(cw, std::abs(static_cast<int>(declaredH)),
-                               declaredH < 0, bitsFull, c.tick);
+                               declaredH < 0, bits, c.tick);
         }
 
         // ---- 缩略图捕获：廉价过滤在前，昂贵检查（窗口命中/入队）在后。

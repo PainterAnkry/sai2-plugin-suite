@@ -192,11 +192,9 @@ void DrawFilter(HDC dc, UiWindow& win, const RECT& client) {
     const ImageBuffer& img = s.core->DisplayImage(BridgeCore::kWinFilter);
     const int ci = WindowEffectIndex(win);
     const auto& E = s.core->Effects();
-    wchar_t sub[200];
-    swprintf(sub, 200, L"%s   %d x %d   预览 %.0f ms",
-             (s.core->HasImage() ? L"已抓取图层" : L"等待抓取"),
-             img.IsValid() ? img.Width() : 0, img.IsValid() ? img.Height() : 0,
-             s.core->LastPreviewMs());
+    wchar_t head[200], sub[240];
+    GrabSubtitleHead(head, 200, img);
+    swprintf(sub, 240, L"%s   预览 %.0f ms", head, s.core->LastPreviewMs());
     DrawWindowChrome(dc, win, L, L"滤镜库（Filter Gallery）", sub, fx);
     DrawGallery(dc, win, gallery, fx);
 
