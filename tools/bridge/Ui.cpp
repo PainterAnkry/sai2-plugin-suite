@@ -877,7 +877,14 @@ LayerAgg AggregateLayers(const std::vector<sai2bridge::AgentLayerRow>& rows) {
     std::sort(sorted.begin(), sorted.end(),
               [](const sai2bridge::AgentLayerRow& a,
                  const sai2bridge::AgentLayerRow& b) { return a.y < b.y; });
+    // 按屏幕 Y 去重：agent 的文字 ring 会把**同一条图层行**记录多次（面板每
+    // 重绘一次就追加一条），不去重的话 names/screenY 会出现重复项，导致
+    // "行号 → 屏幕 Y" 整体错位 —— 实测表现为多图层流程点"第 2 行"实际点的
+    // 还是第 1 行，于是同一层被处理两次（shift 恒为 0）。
+    int lastRowY = (1 << 30);
     for (const auto& r : sorted) {
+        if (r.screenY == lastRowY) continue;
+        lastRowY = r.screenY;
         std::wstring t = r.text;
         const size_t b0 = t.find_first_not_of(L" \t");
         t = (b0 == std::wstring::npos)

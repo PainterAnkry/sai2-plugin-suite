@@ -160,9 +160,85 @@ struct AgentCore::Impl {
     static constexpr ULONGLONG kThumbIntervalMs = 350;
     static constexpr size_t kMaxThumbJobs = 3;
 
+    // ---------------------------------------------------- 缩略图文件回收
+    // 以前每个捕获的 blit 都写一个**新编号**的 BMP 且从不删除。实测开发机
+    // 累积到 **79,188 个文件 / 17 GB**：面板每 2.5s 轮询一次图层，每次落一张
+    // ~2.9MB 的位图，编号一路涨到 6 万多。而这些文件**只有 `sai2_injector
+    // thumbs` 诊断会读，面板本身不读**（面板读的唯一 agent 文件是 canvas.save
+    // 的画布快照）。所以：
+    //   1) 注入时先清掉上次残留 → 跨会话不再堆积；
+    //   2) 会话内按**磁盘预算**淘汰最旧的 → 单次长会话也不会涨到几十 GB。
+    struct ThumbFile {
+        std::wstring path;
+        unsigned long long bytes;
+    };
+    std::deque<ThumbFile> thumbFiles;
+    unsigned long long thumbDiskUsed = 0;
+    // 缩略图是一次性交接物：留最近 128MB / 最多 512 个文件足够诊断用。
+    // 两个上限都要有 —— 实测文件大小随捕获源变化很大（图层行 blit 约 0.1MB，
+    // 大块 blit 能到 2.9MB），只卡字节数会让小文件堆出上千个条目。
+    static constexpr unsigned long long kThumbDiskBudget =
+        128ull * 1024 * 1024;
+    static constexpr size_t kMaxThumbFiles = 512;
+
+    // 清掉 thumbDir 里所有上次残留的 thumb_*.bmp
+    void PruneThumbDir() {
+        std::wstring pat = thumbDir + L"\\thumb_*.bmp";
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        int n = 0;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            const std::wstring p = thumbDir + L"\\" + fd.cFileName;
+            if (DeleteFileW(p.c_str())) ++n;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        if (n > 0) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "pruned %d stale thumb file(s)", n);
+            Log(buf);
+        }
+    }
+
+    // 记一张刚写成功的缩略图，并执行磁盘预算淘汰
+    void NoteThumbFile(const std::wstring& path) {
+        unsigned long long sz = 0;
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+            sz = (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) |
+                 fad.nFileSizeLow;
+        }
+        EnterCriticalSection(&thumbLock);
+        ThumbFile tf;
+        tf.path = path;
+        tf.bytes = sz;
+        thumbFiles.push_back(tf);
+        thumbDiskUsed += sz;
+        while ((thumbDiskUsed > kThumbDiskBudget ||
+                thumbFiles.size() > kMaxThumbFiles) &&
+               !thumbFiles.empty()) {
+            DeleteFileW(thumbFiles.front().path.c_str());
+            thumbDiskUsed -= thumbFiles.front().bytes;
+            thumbFiles.pop_front();
+        }
+        LeaveCriticalSection(&thumbLock);
+    }
+
+    // 卸载时清干净（下次 PruneThumbDir 兜底）
+    void ReleaseThumbFiles() {
+        EnterCriticalSection(&thumbLock);
+        for (size_t i = 0; i < thumbFiles.size(); ++i)
+            DeleteFileW(thumbFiles[i].path.c_str());
+        thumbFiles.clear();
+        thumbDiskUsed = 0;
+        LeaveCriticalSection(&thumbLock);
+    }
+
     void InitThumbs() {
         InitializeCriticalSection(&thumbLock);
         thumbEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        PruneThumbDir();   // 必须拿掉上次的残留，见上面的说明
     }
 
     // 节流 + 入队。返回是否入队成功（false = 被节流跳过）。
@@ -208,6 +284,9 @@ struct AgentCore::Impl {
             CloseHandle(thumbEvent);
             thumbEvent = nullptr;
         }
+        // 必须在**线程 join 之后**再回收：先清的话写盘线程还会继续产生
+        // 新文件（它们就永远留下了）。这里也还没到 DeleteCriticalSection。
+        ReleaseThumbFiles();
         DeleteCriticalSection(&thumbLock);
     }
 
@@ -923,6 +1002,7 @@ DWORD WINAPI ThumbThreadProc(LPVOID param) {
                      impl->thumbDir.c_str(), ++impl->thumbSeq);
             if (WriteBmpFromDib32(path, job.w, job.h, job.declaredHeight,
                                   job.pixels.data(), job.pixels.size())) {
+                impl->NoteThumbFile(path);   // 磁盘预算淘汰（防无上限堆积）
                 BlitCapture c = job.meta;
                 c.captured = true;
                 CopyPathToChar(path, c.file);

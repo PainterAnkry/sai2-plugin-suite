@@ -290,12 +290,20 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
             for (int i = 0; i < total; ++i) {
                 RECT rr = {box.left + 1, y, box.right - barW - 1, y + rowH};
                 if (rr.bottom > viewTop && rr.top < box.bottom) {
-                    const bool sel = (s.selLayer == i);
+                    const bool sel = RowIsSelected(i);
+                    const bool primary = (s.selLayer == i);
                     if (sel) {
                         RECT sr = rr;
                         sr.left += 2;
                         sr.right -= 2;
-                        FillRectC(dc, sr, C_ACCENT2);
+                        // 多选时：主层用亮底，其余选中层用稍暗的底色 + 左侧色条，
+                        // 让"编辑的是哪层、还会一起处理哪几层"一眼分清。
+                        FillRectC(dc, sr, primary ? C_ACCENT2 : C_DIM);
+                        if (!primary) {
+                            RECT bar = sr;
+                            bar.right = bar.left + Scale(3);
+                            FillRectC(dc, bar, C_ACCENT);
+                        }
                     }
                     std::wstring line = std::to_wstring(i + 1) + L". " + s.layerNames[i];
                     if (i < static_cast<int>(s.layerAttrs.size()) &&
@@ -438,15 +446,19 @@ bool OnMainHit(UiWindow& win, const UiHit& h) {
         switch (h.index - CMD_LAYER_BTN) {
         case LBTN_INJECT: DoInjectAsync(win.hwnd); break;
         case LBTN_REFRESH: RefreshLayers(); break;
-        case LBTN_GRABSEL: DoSelectLayer(s.selLayer); break;
+        case LBTN_GRABSEL: SyncSelectionToSai2(); GrabSelectedLayer(win.hwnd, s.selLayer, -1); break;
         default: break;
         }
         return true;
     }
     if (h.kind == HK_CMD) {
         if (h.index >= CMD_LAYER_ROW && h.index < CMD_LAYER_ROW + 256) {
-            s.selLayer = h.index - CMD_LAYER_ROW;
-            DoSelectLayer(s.selLayer);
+            const int row = h.index - CMD_LAYER_ROW;
+            const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            SetRowSelection(row, ctrl, shift);
+            SyncSelectionToSai2();
+            InvalidateAll();
             return true;
         }
         switch (h.index) {
@@ -665,6 +677,9 @@ struct CaptureJob {
     std::atomic<bool> grabbed{false};
     std::atomic<int> selectedRow{-1};
     int row = -1;
+    // 多选：本次抓取要**一起处理**的全部图层行（主层在前，其余按面板顺序）。
+    // 长度 > 1 时，应用阶段会对每一层施加同一形变、并各自合并回原层。
+    std::vector<int> selRows;
     int panelLeft = 0;
     int rowScreenY = 0;
     DWORD clipSeq = 0;
@@ -1012,6 +1027,14 @@ std::vector<TplSample> BuildSamples(const ImageBuffer& img, int cap) {
     const PixelFormat fmt = img.Format();
     const int aMin = ChThresh(250, fmt);
     std::vector<TplSample> all;
+    // 只对**小模板**做"剔除贴边样本"：大模板（心形等）边缘占比小、原本就能
+    // 过阈值，实测加腐蚀反而会让它选错尺度（回归）。
+    // 【已停用】本想让粗搜避开"贴边样本"（DownscaleRGBA 对 alpha 取 max、
+    // RGB 取平均，导致模板边缘单元与 view 的渲染方式不一致）。实测：即使只对
+    // 小降采样单元启用，也会改变粗搜选出的尺度（心形从 0.5 变 0.31）→
+    // 连带 paperEqFrame 误判 → 三组夹具全部 ambiguous。真机小圆的失败根源
+    // 也不在这里（模板 alpha 正常、合成同类数据完美匹配），故整体停用。
+    const bool erode = false;
     const int stride = std::max(
         1, static_cast<int>(std::sqrt(
                static_cast<double>(w) * h / static_cast<double>(cap))));
@@ -1019,6 +1042,31 @@ std::vector<TplSample> BuildSamples(const ImageBuffer& img, int cap) {
         for (int x = 0; x < w; x += stride) {
             RGBA p;
             if (!img.GetPixel(x, y, p) || p.a < aMin) continue;
+            // ★ 只取**内部**单元：把紧贴透明区的一圈样本剔掉。
+            //
+            // 原因（实测踩坑）：粗搜用的降采样是 DownscaleRGBA —— 它对 alpha 取
+            // max、对 RGB 取**平均**。模板边缘那个 cell 里混着"透明"(RGB 通常是
+            // 黑的)，平均出来是**暗绿**；而 view 里同一位置是"内容+白纸"平均成
+            // **亮绿**，两者永远对不上。
+            //   - 大模板（心形 970x593）边缘占比小 → SAD 只涨到 0.5~1.7，能过阈值；
+            //   - 小模板（281x281 的实心圆）边缘占比大 → SAD 爆掉 → 粗搜报
+            //     "coarse no scale"，整个精确回贴静默退化成普通粘贴。
+            // 剔掉边缘样本后，内部单元两边都是纯内容色，SAD 在正确位置接近 0；
+            // 而"尺度过小时 SAD 也接近 0"的平台特性不受影响（仍取最大可通过尺度）。
+            bool interior = true;   // 只有 erode 为真时才做邻域检查
+            for (int dy = -stride; erode && dy <= stride && interior; dy += stride) {
+                for (int dx = -stride; dx <= stride; dx += stride) {
+                    if (dx == 0 && dy == 0) continue;
+                    const int nx = x + dx, ny = y + dy;
+                    if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                    RGBA q;
+                    if (!img.GetPixel(nx, ny, q) || q.a < aMin) {
+                        interior = false;   // 邻居是透明的 → 本样本贴边
+                        break;
+                    }
+                }
+            }
+            if (!interior) continue;
             TplSample s;
             s.tx = x; s.ty = y;
             s.r = Ch8(p.r, fmt);
@@ -1393,8 +1441,14 @@ bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
         const std::vector<TplSample> smp = BuildSamples(t8, 220);
         int bx = -1, by = -1;
         double bs = 1e9;
+        // 位置步长要随模板大小自适应：粗搜在 8 倍降采样空间里进行，
+        // 步长 2 单元 = 16 视图像素。对大模板（心形降采样后 61x37）这没问题；
+        // 但小模板（281px 的圆在 33% 缩放下只有 94 视图像素 → 降采样后仅
+        // 12x12，几乎全是边缘单元）半个单元错位就足以让 SAD 爆掉 →
+        // 整个精确回贴会报 "coarse no scale" 静默退化成普通粘贴。
+        const int posStep = (t8.Width() < 24 || t8.Height() < 24) ? 1 : 2;
         MaskedSearch(v8, smp, t8.Width(), t8.Height(), 0, 0,
-                     v8.Width() - t8.Width(), v8.Height() - t8.Height(), 2,
+                     v8.Width() - t8.Width(), v8.Height() - t8.Height(), posStep,
                      bx, by, bs);
         if (bx >= 0 && bs <= kSadEps &&
             (bestX8 < 0 || s > bestS)) {
@@ -1575,17 +1629,147 @@ bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
     const int bw = static_cast<int>(std::lround(tw * s));
     const int bh = static_cast<int>(std::lround(th * s));
 
-    // ---- 画布纸检测：内容外围颜色环带 → 纸色（不依赖纸是白色）----
+    // ---- 画布纸检测（不依赖粗搜内容框是否准确）----------------------------
+    // 旧做法：取"内容框外围环带"的模态色当纸色。但内容框来自粗搜，小模板 /
+    // 高对比内容时它可能不可靠 —— 环带会取到**内容自己的颜色**当纸色，于是纸
+    // 矩形、画布尺寸、偏移一起崩（实测：960px 的纸被测成 425px，随后被精确画布
+    // 尺寸的自洽校验以 dS=54% 否决）。
+    // 新做法：全视图统计**大面积均匀色块**，按下面的优先级挑纸：
+    //   ① 必须包容内容框（内容框只当"内容在哪儿"的提示，不要求它准确）；
+    //   ② 填充率够高（矩形块应填满自己的 bbox，散落同色像素被挡掉）；
+    //   ③ 排除"几乎铺满整个视图"的候选 —— 那是视口灰底，不是纸；
+    //   ④ 剩下的取**面积最大**者（纸比内容里的平坦色块大）。
     RGBA paper{};
     double paperFrac = 0.0;
-    const int m = std::max(8, static_cast<int>(std::lround(12 * s)));
-    if (!canvasctx::ModalColor(view, bx - m - 12, by - m - 12,
-                               bx + bw + m + 12, by + bh + m + 12, 2, 0.5,
-                               paper, paperFrac,
-                               bx - m, by - m, bx + bw + m, by + bh + m)) {
-        diag = "paper ring modal fail s=" + std::to_string(s);
+    bool paperFound = false;
+    // 主路径：内容外围环带模态色（一直在用的做法，心形等大内容上已验证）
+    {
+        RGBA p1{};
+        double f1 = 0.0;
+        const int m1 = std::max(8, static_cast<int>(std::lround(12 * s)));
+        if (canvasctx::ModalColor(view, bx - m1 - 12, by - m1 - 12,
+                                  bx + bw + m1 + 12, by + bh + m1 + 12, 2, 0.5,
+                                  p1, f1, bx - m1, by - m1, bx + bw + m1,
+                                  by + bh + m1)) {
+            paper = p1;
+            paperFrac = f1;
+            paperFound = true;
+        }
+    }
+    if (!paperFound) {
+        struct Region {
+            RGBA c{};
+            long long count = 0;
+            int x0 = 1 << 30, y0 = 1 << 30, x1 = -1, y1 = -1;
+        };
+        const int step = std::max(1, std::min(vw, vh) / 400);
+        std::unordered_map<int, Region> regs;
+        regs.reserve(8192);
+        for (int y = 0; y < vh; y += step) {
+            for (int x = 0; x < vw; x += step) {
+                RGBA p;
+                if (!view.GetPixel(x, y, p)) continue;
+                const int key = (static_cast<int>(p.r >> 4) << 8) |
+                                (static_cast<int>(p.g >> 4) << 4) |
+                                static_cast<int>(p.b >> 4);
+                Region& r = regs[key];
+                if (r.count == 0) r.c = p;
+                ++r.count;
+                if (x < r.x0) r.x0 = x;
+                if (x > r.x1) r.x1 = x;
+                if (y < r.y0) r.y0 = y;
+                if (y > r.y1) r.y1 = y;
+            }
+        }
+        const int cx0 = bx, cy0 = by, cx1 = bx + bw - 1, cy1 = by + bh - 1;
+        const double viewArea = static_cast<double>(vw) * vh;
+        long long bestArea = -1;
+        for (std::unordered_map<int, Region>::const_iterator it = regs.begin();
+             it != regs.end(); ++it) {
+            const Region& r = it->second;
+            if (r.count < 200) continue;          // 太小的块不可能是纸
+            const long long rw = r.x1 - r.x0 + 1, rh = r.y1 - r.y0 + 1;
+            if (rw < 64 || rh < 64) continue;     // 纸不可能这么小
+            if (r.x0 > cx0 || r.y0 > cy0 || r.x1 < cx1 || r.y1 < cy1)
+                continue;                         // ① 不包容内容
+            const long long area = rw * rh;
+            const double fill = static_cast<double>(r.count) *
+                                static_cast<double>(step) * step /
+                                static_cast<double>(area);
+            if (fill < 0.45) continue;            // ② 不成矩形
+            if (static_cast<double>(area) >= viewArea * 0.95)
+                continue;                         // ③ 这是视口底/边距
+            if (area <= bestArea) continue;       // ④ 取面积最大者
+            bestArea = area;
+            paper = r.c;
+            paperFrac = fill;
+            paperFound = true;
+        }
+    }
+    if (false) {
+        // 【已停用】这一步原本想用较宽容差复核纸矩形，但实测有害：把 paper
+        // 拉向"大面积均值"（含视口灰底）→ paper 与 frame 同色 → 触发
+        // ambiguous paper color，三组夹具（心形/合成小圆/真机小圆）全部失败。
+        // 保留代码备查，但不再执行。
+        int x0 = vw, y0 = vh, x1 = -1, y1 = -1;
+        long long in = 0, tot = 0;
+        for (int y = 0; y < vh; y += 2) {
+            for (int x = 0; x < vw; x += 2) {
+                ++tot;
+                if (!canvasctx::ColorNear(view, x, y, paper, 8)) continue;
+                ++in;
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+        }
+        if (x1 > x0 && y1 > y0) {
+            paperFrac = static_cast<double>(in) /
+                        static_cast<double>(std::max<long long>(1, tot));
+            // 修正代表色为该范围内像素的均值，减少量化偏差
+            long long sr = 0, sg = 0, sb = 0, n = 0;
+            for (int y = y0; y <= y1; y += 4) {
+                for (int x = x0; x <= x1; x += 4) {
+                    RGBA p;
+                    if (!view.GetPixel(x, y, p)) continue;
+                    if (!canvasctx::ColorNear(view, x, y, paper, 8)) continue;
+                    sr += p.r;
+                    sg += p.g;
+                    sb += p.b;
+                    ++n;
+                }
+            }
+            if (n > 0) {
+                RGBA m{};
+                m.r = static_cast<uint16_t>(sr / n);
+                m.g = static_cast<uint16_t>(sg / n);
+                m.b = static_cast<uint16_t>(sb / n);
+                paper = m;
+            }
+        }
+    }
+    if (!paperFound) {
+        // 兜底：退回旧的环带法（视图被严重裁剪、纸区不完整时）
+        RGBA p2{};
+        double f2 = 0.0;
+        const int m2 = std::max(8, static_cast<int>(std::lround(12 * s)));
+        if (canvasctx::ModalColor(view, bx - m2 - 12, by - m2 - 12,
+                                  bx + bw + m2 + 12, by + bh + m2 + 12, 2, 0.5,
+                                  p2, f2, bx - m2, by - m2, bx + bw + m2,
+                                  by + bh + m2)) {
+            paper = p2;
+            paperFrac = f2;
+            paperFound = true;
+        }
+    }
+    if (!paperFound) {
+        diag = "paper region not found s=" + std::to_string(s);
         return false;
     }
+    if (g_ctxDebugCurve)
+        std::printf("[paper] rgb=(%d,%d,%d)\n", static_cast<int>(paper.r),
+                    static_cast<int>(paper.g), static_cast<int>(paper.b));
     // 视图最外框模态色（边距/未用区）
     RGBA frame{};
     double frameFrac = 0.0;
@@ -1603,6 +1787,21 @@ bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
     if (paperEqFrame) {
         // 纸色与外框同色 → 无法靠颜色区分纸和边距。若内容与视图边框之间
         // 几乎全是"纸色"，说明快照本身就是画布 DIB（1:1，无视图边距）。
+        //
+        // ★ 但已知精确画布尺寸（.sai2 文件头）时必须先做一致性检查：
+        // 实测 art.sai2 文件头 bg=#ff808080 与 SAI2 视口留白同色 → paperEqFrame
+        // 成立 → 原来直接认定"快照 = 1:1 画布"，得出画布 = 视图尺寸 2592x1472
+        // （真值 2160x3280）、偏移全错。画布底色与视口同色（或被视图裁切）时
+        // 本来就没有可用的纸矩形，此时应当**明确拒绝并给出可操作提示**。
+        if (docW > 0 && docH > 0 &&
+            (std::abs(vw - docW) > 8 || std::abs(vh - docH) > 8)) {
+            diag = "canvas not locatable: view " + std::to_string(vw) + "x" +
+                   std::to_string(vh) + " vs doc " + std::to_string(docW) + "x" +
+                   std::to_string(docH) +
+                   " (canvas bg == viewport colour / view cropped"
+                   " -> please zoom out until the whole canvas is visible)";
+            return false;
+        }
         long long in = 0, tot = 0;
         for (int y = 0; y < vh; y += 8) {
             for (int x = 0; x < vw; x += 8) {
@@ -1620,22 +1819,64 @@ bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
         }
         cw = vw; ch = vh; cx0 = bx; cy0 = by;
     } else {
-        // 纸色包围盒（步长 2）∪ 内容矩形 → 画布纸矩形
-        int px1 = bx + bw - 1, py1 = by + bh - 1;
-        px0 = bx; py0 = by;
-        for (int y = 0; y < vh; y += 2) {
-            for (int x = 0; x < vw; x += 2) {
-                if (!canvasctx::ColorNear(view, x, y, paper, 3)) continue;
-                if (x < px0) px0 = x;
-                if (x > px1) px1 = x;
-                if (y < py0) py0 = y;
-                if (y > py1) py1 = y;
+        // 纸矩形 = **与内容相连的那块近纸色连通分量**，而不是"所有近纸色
+        // 像素的包围盒"。
+        // 踩坑（实测 ml2.sai2）：SAI2 的画布视图 DIB 里还画着**两条水平滚动
+        // 条**，它们也是白的。用包围盒会把纸和上下两条滚动条并成一块
+        // 639x819 的区域（纸真值 645x367），画布高被算成 2.3 倍，进而触发
+        // "与 .sai2 尺寸矛盾"的拒绝。滚动条与纸之间隔着灰底、**并不连通**，
+        // 所以从内容旁边洪泛一次即可精确取到纸。
+        std::vector<uint8_t> mask(static_cast<size_t>(vw) * vh, 0);
+        for (int y = 0; y < vh; ++y)
+            for (int x = 0; x < vw; ++x)
+                if (canvasctx::ColorNear(view, x, y, paper, 8))
+                    mask[static_cast<size_t>(y) * vw + x] = 1;
+        // 种子：内容框外扩一圈里第一个近纸色像素（上下左右四个方向试）
+        int sx = -1, sy = -1;
+        for (int d = 1; d <= 64 && sx < 0; ++d) {
+            const int cand[4][2] = {{bx - d, by + bh / 2},
+                                    {bx + bw - 1 + d, by + bh / 2},
+                                    {bx + bw / 2, by - d},
+                                    {bx + bw / 2, by + bh - 1 + d}};
+            for (int k = 0; k < 4 && sx < 0; ++k) {
+                const int x = cand[k][0], y = cand[k][1];
+                if (x < 0 || y < 0 || x >= vw || y >= vh) continue;
+                if (mask[static_cast<size_t>(y) * vw + x] == 1) {
+                    sx = x;
+                    sy = y;
+                }
             }
         }
-        pw = px1 - px0 + 1;
-        ph = py1 - py0 + 1;
+        if (sx < 0) {
+            diag = "no paper seed near content s=" + std::to_string(s);
+            return false;
+        }
+        int rx0 = sx, ry0 = sy, rx1 = sx, ry1 = sy;
+        std::vector<int> stack;
+        stack.reserve(1 << 16);
+        mask[static_cast<size_t>(sy) * vw + sx] = 2;
+        stack.push_back(sy * vw + sx);
+        while (!stack.empty()) {
+            const int idx = stack.back();
+            stack.pop_back();
+            const int x = idx % vw, y = idx / vw;
+            if (x < rx0) rx0 = x;
+            if (x > rx1) rx1 = x;
+            if (y < ry0) ry0 = y;
+            if (y > ry1) ry1 = y;
+            const int nb[4][2] = {{x - 1, y}, {x + 1, y}, {x, y - 1}, {x, y + 1}};
+            for (int k = 0; k < 4; ++k) {
+                const int nx = nb[k][0], ny = nb[k][1];
+                if (nx < 0 || ny < 0 || nx >= vw || ny >= vh) continue;
+                const size_t ni = static_cast<size_t>(ny) * vw + nx;
+                if (mask[ni] != 1) continue;
+                mask[ni] = 2;
+                stack.push_back(ny * vw + nx);
+            }
+        }
+        px0 = rx0; py0 = ry0; pw = rx1 - rx0 + 1; ph = ry1 - ry0 + 1;
         if (pw < 16 || ph < 16) {
-            diag = "paper rect too small";
+            diag = "paper rect too small (cc) s=" + std::to_string(s);
             return false;
         }
         cw = static_cast<int>(std::lround(pw / s));
@@ -1665,10 +1906,16 @@ bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
                         std::to_string(sFile) + " dS=" +
                         std::to_string(sRel * 100.0) + "%]";
         } else {
-            exactNote = " [sai2 size " + std::to_string(docW) + "x" +
-                        std::to_string(docH) +
-                        " rejected: dS=" + std::to_string(sRel * 100.0) +
-                        "% dH=" + std::to_string((hRatio - 1.0) * 100.0) + "%]";
+            // 与已知事实矛盾 → **拒绝**，不要拿这个估计值去准备粘贴。
+            // 原因：纸矩形量错时，估计出的画布/偏移可能离谱（实测 ml2.sai2：
+            // 宽度差 0.66% 但高度差 127.9%），若继续用就会把内容贴到错误位置。
+            // 宁可明确失败并让上层提示用户，也好过"看起来成功了但贴歪了"。
+            diag = "paper rect contradicts .sai2 size: est canvas=" +
+                   std::to_string(cw) + "x" + std::to_string(ch) + " vs doc " +
+                   std::to_string(docW) + "x" + std::to_string(docH) + " (dS=" +
+                   std::to_string(sRel * 100.0) + "% dH=" +
+                   std::to_string((hRatio - 1.0) * 100.0) + "%)";
+            return false;
         }
     }
 
@@ -1878,6 +2125,33 @@ void ForceForeground(HWND target) {
 }
 
 void ClickAtScreen(int x, int y) { ClickAtScreenImpl(x, y); }
+
+// Ctrl+点击：多选图层用。坐标换算与 ClickAtScreenImpl 完全一致，只是在
+// 移动/按下/抬起的前后按住并松开 Ctrl —— SAI2 读的是点击瞬间的修饰键状态，
+// 所以必须让 Ctrl 与点击在**同一个 SendInput 批次**里按顺序下发。
+void CtrlClickAtScreenImpl(int x, int y) {
+    WaitMouseReleased(1000);
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    INPUT in[5] = {};
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_CONTROL;
+    in[1].type = INPUT_MOUSE;
+    in[1].mi.dwFlags =
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    in[1].mi.dx = static_cast<LONG>((x - vx) * 65536 / std::max(1, vw));
+    in[1].mi.dy = static_cast<LONG>((y - vy) * 65536 / std::max(1, vh));
+    in[2].type = INPUT_MOUSE;
+    in[2].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    in[3].type = INPUT_MOUSE;
+    in[3].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    in[4].type = INPUT_KEYBOARD;
+    in[4].ki.wVk = VK_CONTROL;
+    in[4].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(5, in, sizeof(INPUT));
+}
 
 bool FindCapturedText(const wchar_t* text, int& outX, int& outY,
                       ULONGLONG minTick) {
@@ -2117,6 +2391,16 @@ void DoApplyFlow(UiWindow& win) {
             if (s.mergeBack) ScheduleMergeAfterPaste(s.mainHwnd);
         }
         s.flash.clear();
+        // 多选了多层 → 主层已由上面处理完，其余层逐层补做（后台线程）。
+        // 放在这里而不是抓取阶段：只有"应用"才知道用户最终定下的形变。
+        if (s.selLayers.size() > 1) {
+            const HWND h = win.hwnd;
+            if (g_cap.busy.exchange(true)) return;
+            std::thread([h]() {
+                RunMultiLayerApply(h);
+                g_cap.busy = false;
+            }).detach();
+        }
     } else if (!r.error.empty()) {
         s.flash = U8(r.error);
     }
@@ -2181,6 +2465,21 @@ void RefreshLayers() {
         if (grp) {
             const LayerAgg agg = AggregateLayers(grp->rows);
             s.layerNames = agg.names;
+    // 图层集合变了（合并/新建/删除都会动行号）→ 把越界的选中项剔掉，
+    // 否则后面的"逐层处理"会点到不存在的行上
+    {
+        const int t2 = static_cast<int>(s.layerNames.size());
+        std::vector<int> keep;
+        for (size_t i = 0; i < s.selLayers.size(); ++i)
+            if (s.selLayers[i] >= 0 && s.selLayers[i] < t2)
+                keep.push_back(s.selLayers[i]);
+        s.selLayers.swap(keep);
+        if (s.selLayers.empty() && t2 > 0) {
+            s.selLayer = std::min(std::max(0, s.selLayer), t2 - 1);
+            s.selLayers.assign(1, s.selLayer);
+        }
+        if (s.selLayer >= t2) s.selLayer = t2 - 1;
+    }
             s.layerAttrs = agg.attrs;
             s.layerScreenY = agg.screenY;
             s.panelLeft = grp->screenRect.left;
@@ -2196,13 +2495,73 @@ void RefreshLayers() {
 std::vector<std::wstring> LayerNames() { return S().layerNames; }
 
 // 点击图层行：在 SAI2 里选中该层（不抓取）
-void DoSelectLayer(int rowIdx) {
+// ---------------------------------------------------------------------------
+// 图层多选（Ctrl+点切换 / Shift+点范围 / 普通点单选）
+//
+// 面板**不去猜** SAI2 里选中了哪几层 —— 图层面板的高亮不经过我们挂钩的那几个
+// GDI 调用，没有可用的数据源（实测 agent 抓到的位图里只有界面各部件的 DIB）。
+// 反过来做：面板是权威，选中集由自己维护，再用 ClickAtScreen/Ctrl+点击把
+// 同一组行"点"给 SAI2，两边因此始终一致。
+// ---------------------------------------------------------------------------
+
+bool RowIsSelected(int row) {
+    const AppState& s = S();
+    for (size_t i = 0; i < s.selLayers.size(); ++i)
+        if (s.selLayers[i] == row) return true;
+    return false;
+}
+
+void SetRowSelection(int row, bool additive, bool range) {
+    AppState& s = S();
+    const int total = static_cast<int>(s.layerNames.size());
+    if (row < 0 || row >= total) return;
+
+    if (range && s.selAnchor >= 0 && s.selAnchor < total) {
+        const int a = std::min(s.selAnchor, row);
+        const int b = std::max(s.selAnchor, row);
+        s.selLayers.clear();
+        for (int i = a; i <= b; ++i) s.selLayers.push_back(i);
+    } else if (additive) {
+        std::vector<int>::iterator it =
+            std::find(s.selLayers.begin(), s.selLayers.end(), row);
+        if (it != s.selLayers.end())
+            s.selLayers.erase(it);
+        else
+            s.selLayers.push_back(row);
+        s.selAnchor = row;
+    } else {
+        s.selLayers.assign(1, row);
+        s.selAnchor = row;
+    }
+
+    // 主层 = 刚点的这行（若它已被 Ctrl 取消，就退回集合里的第一行）。
+    // 单选语义下 selLayers 恰好只含一行，行为与改动前一致。
+    if (!s.selLayers.empty()) {
+        s.selLayer = RowIsSelected(row) ? row : s.selLayers.front();
+        std::sort(s.selLayers.begin(), s.selLayers.end());
+    } else {
+        s.selLayers.assign(1, row);
+        s.selLayer = row;
+        s.selAnchor = row;
+    }
+
+    if (s.selLayers.size() > 1) {
+        s.flash = L"已选中 " + std::to_wstring(s.selLayers.size()) +
+                  L" 个图层（一起液化：逐层施加同一形变）";
+    } else {
+        s.flash = L"已选中图层「" +
+                  s.layerNames[static_cast<size_t>(s.selLayer)] + L"」";
+    }
+}
+
+// 把面板的选中集同步到 SAI2：先普通点一行，再 Ctrl+点其余行。
+void SyncSelectionToSai2() {
     AppState& s = S();
     if (!s.agentOnline) {
         s.flash = L"未连接注入代理 —— 点「连接注入」";
         return;
     }
-    if (rowIdx < 0 || rowIdx >= static_cast<int>(s.layerScreenY.size())) {
+    if (s.layerScreenY.empty() || s.panelLeft <= 0) {
         s.flash = L"没有可用的图层行";
         return;
     }
@@ -2213,12 +2572,31 @@ void DoSelectLayer(int rowIdx) {
     }
     ForceForeground(sai);
     Sleep(140);
-    const POINT p = AgentToScreen(s.panelLeft + 34,
-                                  s.layerScreenY[static_cast<size_t>(rowIdx)] + 6);
-    ClickAtScreen(p.x, p.y);
-    Sleep(220);
-    s.flash = L"已在 SAI2 选中图层「" + s.layerNames[static_cast<size_t>(rowIdx)] +
-              L"」";
+    bool first = true;
+    for (size_t i = 0; i < s.selLayers.size(); ++i) {
+        const int row = s.selLayers[i];
+        if (row < 0 || row >= static_cast<int>(s.layerScreenY.size())) continue;
+        const POINT p = AgentToScreen(
+            s.panelLeft + 34, s.layerScreenY[static_cast<size_t>(row)] + 6);
+        if (first) {
+            ClickAtScreen(p.x, p.y);
+            first = false;
+        } else {
+            CtrlClickAtScreenImpl(p.x, p.y);
+        }
+        Sleep(130);
+    }
+}
+
+void DoSelectLayer(int rowIdx) {
+    AppState& s = S();
+    // 单选入口（按钮/旧路径）：先归一成"只选这一行"，再整组同步
+    if (rowIdx >= 0 && rowIdx < static_cast<int>(s.layerNames.size())) {
+        s.selLayers.assign(1, rowIdx);
+        s.selAnchor = rowIdx;
+        s.selLayer = rowIdx;
+    }
+    SyncSelectionToSai2();
 }
 
 // 选中该层并抓取（点行 → 全选 → 拷贝），走后台线程，抓完自动开窗口
@@ -2231,6 +2609,15 @@ void GrabSelectedLayer(HWND hwnd, int rowIdx, int wantWindow) {
     }
     if (g_cap.busy.load()) return;
     g_cap.row = rowIdx;
+    // 把面板的整个选中集带进任务（主层在前）：应用阶段据此逐层施加同一形变
+    g_cap.selRows.clear();
+    const int capTotal = static_cast<int>(s.layerNames.size());
+    if (rowIdx >= 0 && rowIdx < capTotal) g_cap.selRows.push_back(rowIdx);
+    for (size_t i = 0; i < s.selLayers.size(); ++i) {
+        const int v = s.selLayers[i];
+        if (v == rowIdx || v < 0 || v >= capTotal) continue;
+        g_cap.selRows.push_back(v);
+    }
     g_cap.panelLeft = static_cast<int>(s.panelLeft);
     g_cap.rowScreenY =
         (rowIdx >= 0 && rowIdx < static_cast<int>(s.layerScreenY.size()))
@@ -2438,6 +2825,147 @@ void ScheduleMergeAfterPaste(HWND hwnd) {
     // 结果勾选了「合并回原图层」也永远不会合并——1.15 修复。
     // 粘贴（含 SAI2 新建图层）需要一点时间，大画布更久，给足 1.4 秒。
     SetTimer(hwnd, 5, 1400, nullptr);
+}
+
+// 测试钩子：--ml-sel 预设的图层多选（无人值守验证「一起液化」用）
+std::vector<int> g_mlSelRows;
+
+// ---------------------------------------------------------------------------
+// 多图层一起液化（方案 B）：主层走既有应用流程，其余层在这里逐层补做。
+//
+// 每一层：选中该行 → Ctrl+A/Ctrl+C → 求该层的画布偏移 → 用**同一个置换场**
+// 按偏移渲染（RenderLiquifyLayerToCanvas）→ 补边 → 写剪贴板 → Ctrl+V →
+// 向下合并（F）回该层。全程串行：SAI2 的图层操作不能并发，而且 agent 的
+// 命名管道是单连接同步服务（g_cap.busy 期间 UI 定时器不轮询）。
+//
+// 为什么"同一形变、分层不丢"：置换场是在主层局部坐标里建的，其余层只需把场
+// 按 (本层偏移 − 主层偏移) 采样，几何就完全一致；每层各自补边、各自粘贴并
+// 合并回自己，所以图层结构保持不变。
+// ---------------------------------------------------------------------------
+void RunMultiLayerApply(HWND hwnd) {
+    AppState& s = S();
+    // 用**应用时刻**的选中集，而不是抓取时留下的副本：demo/浮窗等路径不一定
+    // 经过 GrabSelectedLayer，用副本会漏掉层（实测只处理了 1 层）。
+    // 基准层 = 主层 selLayer（它的结果已由既有应用流程贴回），其余层在这里补做。
+    std::vector<int> rows;
+    rows.push_back(s.selLayer);
+    for (size_t k = 0; k < s.selLayers.size(); ++k)
+        if (s.selLayers[k] != s.selLayer) rows.push_back(s.selLayers[k]);
+    if (!s.core || rows.size() <= 1) return;
+    if (!s.core->HasCanvasContext()) {
+        s.core->Log("multilayer: skip (no canvas ctx)");
+        return;
+    }
+    const int cw = s.core->CanvasW();
+    const int ch = s.core->CanvasH();
+    const int baseX = s.core->CanvasX0();
+    const int baseY = s.core->CanvasY0();
+    const size_t total = rows.size();
+    s.core->Log("multilayer: start, layers=" + std::to_string(total) +
+                " canvas=" + std::to_string(cw) + "x" + std::to_string(ch));
+
+    int done = 0;
+    for (size_t i = 1; i < total; ++i) {
+        const int row = rows[i];
+        if (row < 0 || row >= static_cast<int>(s.layerNames.size())) continue;
+        s.flash = L"一起液化：正在处理第 " + std::to_wstring(i + 1) + L"/" +
+                  std::to_wstring(total) + L" 层…";
+        InvalidateAll();
+
+        // 1) 选中该行（每轮重新取一次坐标：上一轮的合并可能动了行/滚动）
+        {
+            HWND sai = FindSai2Window();
+            if (!sai) break;
+            // 必须**确认 SAI2 真的在前台**：否则后面的 Ctrl+A/C 会发给别的窗口，
+            // 剪贴板仍是上一层的图 —— 那样"第二层"渲染出来的其实是同一张图，
+            // 现象是 shift 恒为 (0,0)（实测踩坑）。ForceForeground 用
+            // AttachThreadInput 也未必成功，这里再用 TOPMOST 三步 + 校验。
+            SetWindowPos(sai, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE);
+            SetForegroundWindow(sai);
+            SetWindowPos(sai, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE);
+            Sleep(200);
+            if (GetForegroundWindow() != sai) {
+                s.core->Log("multilayer: cannot bring SAI2 to foreground, skip");
+                continue;
+            }
+            if (s.panelLeft > 0 &&
+                row < static_cast<int>(s.layerScreenY.size())) {
+                const POINT p = AgentToScreen(
+                    s.panelLeft + 34,
+                    s.layerScreenY[static_cast<size_t>(row)] + 6);
+                ClickAtScreen(p.x, p.y);
+                Sleep(260);
+            }
+        }
+        // 2) 全选 + 拷贝（与整层抓取同一套输入），并**确认剪贴板真的换了** ——
+        //    这是"键有没有送到 SAI2"最直接的证据，避免拿上一层的内容重复处理。
+        const DWORD clipSeq0 = GetClipboardSequenceNumber();
+        SendCtrlScan(0x1E);   // A
+        Sleep(140);
+        SendCtrlScan(0x2E);   // C
+        for (int kw = 0; kw < 20; ++kw) {
+            Sleep(80);
+            if (GetClipboardSequenceNumber() != clipSeq0) break;
+        }
+        if (GetClipboardSequenceNumber() == clipSeq0) {
+            s.core->Log("multilayer: clipboard unchanged (keys not delivered?) "
+                        "-> skip layer " + std::to_string(row));
+            continue;
+        }
+
+        // 3) 求该层的画布偏移（与整层抓取完全相同的定位链路）
+        CanvasCtxResult ctx;
+        std::string diag;
+        if (!AcquireCanvasContext(ctx, diag)) {
+            s.core->Log("multilayer: layer " + std::to_string(row) +
+                        " ctx failed: " + diag);
+            continue;
+        }
+        // 4) 取该层图像
+        ImageBuffer layer;
+        std::string err;
+        if (!ReadClipboardImage(layer, err) || !layer.IsValid()) {
+            s.core->Log("multilayer: layer " + std::to_string(row) +
+                        " clipboard read failed: " + err);
+            continue;
+        }
+        // 5) 同一个置换场 + 按偏移采样 + 按本层偏移补边
+        const ImageBuffer out = s.core->RenderLiquifyLayerToCanvas(
+            layer, "ml" + std::to_string(row), ctx.cw, ctx.ch, ctx.x0, ctx.y0,
+            ctx.x0 - baseX, ctx.y0 - baseY);
+        if (!out.IsValid()) {
+            s.core->Log("multilayer: layer " + std::to_string(row) +
+                        " render failed");
+            continue;
+        }
+        // 6) 写剪贴板 → 粘贴 → 合并回该层
+        if (!s.core->WriteImageToClipboard(out, err)) {
+            s.core->Log("multilayer: layer " + std::to_string(row) +
+                        " clipboard write failed: " + err);
+            continue;
+        }
+        s.selfWriteTick = GetTickCount64();
+        AutoPasteToSai2();
+        Sleep(1500);                     // 等 SAI2 把粘贴层建出来
+        if (s.mergeBack) {
+            DoMergeDown(hwnd);           // F：粘贴层转写进它下面的那一层
+            Sleep(700);
+        }
+        ++done;
+        s.core->Log("multilayer: layer " + std::to_string(row) + " done place=(" +
+                    std::to_string(ctx.x0) + "," + std::to_string(ctx.y0) +
+                    ") shift=(" + std::to_string(ctx.x0 - baseX) + "," +
+                    std::to_string(ctx.y0 - baseY) + ")");
+
+        RefreshLayers();                 // 合并可能改了行号/滚动位置 → 重定位
+        Sleep(400);
+    }
+    s.flash = L"一起液化完成：共处理 " + std::to_wstring(done + 1) + L" 层";
+    s.core->Log("multilayer: finished, extra layers done=" +
+                std::to_string(done));
+    InvalidateAll();
 }
 
 // ---------------------------------------------------------------------------
@@ -2832,6 +3360,88 @@ int RunCanvasCtxTest() {
     return 1;
 }
 
+// --multilayer-test <A.bmp> <B.bmp> <cw> <ch> <ax> <ay> <bx> <by> <outPrefix>
+//
+// 离线验证「多图层一起液化」的**桥侧全链路**（置换场 → 按层偏移渲染 → 按层补边），
+// 完全不依赖 SAI2：A 是基准层、B 是另一层，两者是**同一画布的不同子矩形**。
+// 在 A 上刷一笔建立置换场，再用**同一个场**把 B 渲染出来。
+// 期望：两张补边结果在画布空间的重叠区里逐像素一致（同一画布点 = 同一内容）。
+// 这条正是"每层被同一套形变处理，而分层不丢"的可判定形式。
+int RunMultiLayerTest(const std::string& pa, const std::string& pb, int cw,
+                      int ch, int ax, int ay, int bx, int by,
+                      const std::string& outPrefix,
+                      const std::string& pluginsDir,
+                      const std::string& logDir) {
+    AttachParentConsole();
+    std::printf("build: %s\n", BuildStamp().c_str());
+    ImageBuffer A, B;
+    std::string err;
+    if (!ReadBmp32(pa, A, err) || !A.IsValid()) {
+        std::printf("FAIL 读基准层: %s (%s)\n", err.c_str(), pa.c_str());
+        return 2;
+    }
+    if (!ReadBmp32(pb, B, err) || !B.IsValid()) {
+        std::printf("FAIL 读第二层: %s (%s)\n", err.c_str(), pb.c_str());
+        return 2;
+    }
+    std::printf("基准层 %dx%d@(%d,%d)  第二层 %dx%d@(%d,%d)  画布 %dx%d\n",
+                A.Width(), A.Height(), ax, ay, B.Width(), B.Height(), bx, by,
+                cw, ch);
+
+    BridgeCore core(pluginsDir, logDir);
+    if (!core.Startup(err)) {
+        std::printf("FAIL 启动核心: %s\n", err.c_str());
+        return 2;
+    }
+    int idx = -1;
+    const std::vector<EffectDef>& E = core.Effects();
+    for (size_t i = 0; i < E.size(); ++i)
+        if (E[i].id == "liquify.twirl-cw") {
+            idx = static_cast<int>(i);
+            break;
+        }
+    if (idx < 0) {
+        std::printf("FAIL 没有找到 liquify.twirl-cw 效果\n");
+        return 2;
+    }
+    core.SetCurrentEffect(idx, BridgeCore::kWinLiquify);
+    core.SetImage(A, "layerA");
+    core.SetCanvasContext(true, cw, ch, ax, ay);
+
+    // 在基准层上刷一笔 → 建立置换场。
+    // 用 twirl（旋转场）：它是**非均匀**的，如果偏移算错，重叠区立刻对不上；
+    // 用均匀场则可能"错了也看不出来"。
+    core.StrokeBegin(0.35f, 0.35f, BridgeCore::kWinLiquify);
+    core.StrokeMove(0.60f, 0.60f, BridgeCore::kWinLiquify);
+    core.StrokeEnd(BridgeCore::kWinLiquify);
+
+    // 走产品应用路径（全分辨率渲染现有场 + 补边 + 写剪贴板）
+    const BridgeCore::ApplyResult r = core.ApplyToClipboard();
+    if (!r.clipboardWritten) {
+        std::printf("FAIL 基准层应用失败: %s\n", r.error.c_str());
+        return 1;
+    }
+    const ImageBuffer apad = core.PaddedApplied();
+    if (!apad.IsValid() || !WriteBmp32(apad, outPrefix + "_A.bmp", err)) {
+        std::printf("FAIL 写基准层补边图: %s\n", err.c_str());
+        return 1;
+    }
+
+    // 第二层：同一个置换场、换源图、按偏移采样、按自己的画布偏移补边
+    const ImageBuffer bpad = core.RenderLiquifyLayerToCanvas(
+        B, "layerB", cw, ch, bx, by, bx - ax, by - ay);
+    if (!bpad.IsValid() || !WriteBmp32(bpad, outPrefix + "_B.bmp", err)) {
+        std::printf("FAIL 第二层渲染/写出失败: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("OK 基准层补边 %dx%d → %s_A.bmp ；第二层 shift=(%d,%d) 补边 "
+                "%dx%d → %s_B.bmp\n",
+                apad.Width(), apad.Height(), outPrefix.c_str(), bx - ax, by - ay,
+                bpad.Width(), bpad.Height(), outPrefix.c_str());
+    core.Shutdown();
+    return 0;
+}
+
 // --doc-test：只走"SAI2 窗口标题 → .sai2 路径 → 精确画布尺寸"这条链路并逐步
 // 打印结果。加它的原因：精确画布尺寸没生效时，光看 --ctx-test 的 diag 分不清
 // 是**标题没解析出来**、**文件读不到**，还是**被自洽性校验否决了**。
@@ -3024,6 +3634,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     std::string dumpPath;
     bool ctxTest = false;
     bool docTest = false;
+    std::string mlA, mlB, mlOut;
+    std::string clipPadIn, clipPadCw, clipPadCh, clipPadX, clipPadY;
+    std::string mlCW, mlCH, mlAx, mlAy, mlBx, mlBy;
     bool versionOnly = false;
     std::string matchSnap, matchTmpl;
     bool padClipboard = false;
@@ -3093,8 +3706,32 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             }
         }
         else if (a == L"--dump-clipboard") next(dumpPath);
+        else if (a == L"--clip-pad") {
+            next(clipPadIn); next(clipPadCw); next(clipPadCh);
+            next(clipPadX); next(clipPadY);
+        }
         else if (a == L"--ctx-test") ctxTest = true;
         else if (a == L"--doc-test") docTest = true;
+        else if (a == L"--ml-sel") {
+            // 测试钩子：预设图层多选（如 "0,1"），供无人值守验证"一起液化"
+            std::string v;
+            next(v);
+            g_mlSelRows.clear();
+            size_t p0 = 0;
+            for (;;) {
+                const size_t c = v.find(',', p0);
+                const std::string one =
+                    (c == std::string::npos) ? v.substr(p0)
+                                             : v.substr(p0, c - p0);
+                if (!one.empty()) g_mlSelRows.push_back(std::atoi(one.c_str()));
+                if (c == std::string::npos) break;
+                p0 = c + 1;
+            }
+        }
+        else if (a == L"--multilayer-test") {
+            next(mlA); next(mlB); next(mlCW); next(mlCH);
+            next(mlAx); next(mlAy); next(mlBx); next(mlBy); next(mlOut);
+        }
         else if (a == L"--version") versionOnly = true;
         else if (a == L"--match-test") {
             next(matchSnap);
@@ -3126,6 +3763,43 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         for (const std::wstring& t : p.tried)
             std::printf("  %s\n", Wide2Utf8(t).c_str());
         return p.injector.empty() ? 1 : 0;
+    }
+
+    // --clip-pad <in.bmp> <cw> <ch> <x> <y>
+    // 把 in.bmp 摆到 (x,y) 并补边成 cw x ch 后写进剪贴板。
+    // 用途：造多层测试文档时，把某层内容复制一份到画布别处，
+    //       这样两个图层的画布偏移不同，"同一形变"才有可判别性。
+    if (!clipPadIn.empty()) {
+        AttachParentConsole();
+        ImageBuffer in;
+        std::string err;
+        if (!ReadBmp32(clipPadIn, in, err) || !in.IsValid()) {
+            std::printf("FAIL 读入: %s (%s)\n", err.c_str(), clipPadIn.c_str());
+            return 2;
+        }
+        const int cw = std::atoi(clipPadCw.c_str());
+        const int ch = std::atoi(clipPadCh.c_str());
+        const int px = std::atoi(clipPadX.c_str());
+        const int py = std::atoi(clipPadY.c_str());
+        ImageBuffer out(cw, ch, PixelFormat::RGBA8);
+        out.Clear(RGBA{0, 0, 0, 0});
+        for (int y = 0; y < in.Height(); ++y) {
+            const int dy = py + y;
+            if (dy < 0 || dy >= ch) continue;
+            for (int x = 0; x < in.Width(); ++x) {
+                const int dx = px + x;
+                if (dx < 0 || dx >= cw) continue;
+                RGBA c;
+                if (in.GetPixel(x, y, c)) out.SetPixel(dx, dy, c);
+            }
+        }
+        std::string werr;
+        if (!WriteClipboardImage(out, werr)) {
+            std::printf("FAIL 写剪贴板: %s\n", werr.c_str());
+            return 1;
+        }
+        std::printf("OK 已写入剪贴板: %dx%d，内容落在 (%d,%d)\n", cw, ch, px, py);
+        return 0;
     }
 
     if (!dumpPath.empty()) {
@@ -3160,6 +3834,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
                     "  即可确认正在跑的是不是这个构建）\n");
         return 0;
     }
+    if (!mlA.empty())
+        return RunMultiLayerTest(mlA, mlB, std::atoi(mlCW.c_str()),
+                                 std::atoi(mlCH.c_str()),
+                                 std::atoi(mlAx.c_str()),
+                                 std::atoi(mlAy.c_str()),
+                                 std::atoi(mlBx.c_str()),
+                                 std::atoi(mlBy.c_str()), mlOut,
+                                 pluginsDir, logDir);
     if (docTest) return RunDocTest();
     if (ctxTest) return RunCanvasCtxTest();
     if (!matchSnap.empty() && !matchTmpl.empty())

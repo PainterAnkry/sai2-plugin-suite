@@ -87,8 +87,8 @@ public:
                 std::swap(field_, undoStack_.back());
                 undoStack_.pop_back();
             }
-            liquify::RenderLiquify(original_, field_, *canvas,
-                                   host_->GetSelection());
+            liquify::RenderLiquify(original_, field_, *canvas, host_->GetSelection(),
+                               shiftX_, shiftY_);
             host_->Log(LogLevel::Info,
                        ("Liquify stroke undo, stack=" +
                         std::to_string(undoStack_.size()))
@@ -165,8 +165,8 @@ public:
         }
 
         // 一次性逆映射渲染：源恒为 original_，笔笔干净
-        liquify::RenderLiquify(original_, field_, *canvas,
-                               host_->GetSelection());
+        liquify::RenderLiquify(original_, field_, *canvas, host_->GetSelection(),
+                               shiftX_, shiftY_);
         // 注意：这里不能为了日志去调 field_.MaxMagnitude() —— 它是全图 O(N)
         // 求模，每笔鼠标移动都执行一次，大图上就是几十毫秒的纯浪费。
         host_->Log(LogLevel::Info,
@@ -195,25 +195,56 @@ private:
         liquify::RenderLiquify(canvas, field, canvas, nullptr);
     }
 
-    // 新会话（换图 / 尺寸变化 / 显式 reset）时缓存原图并清空置换场
+    // 会话（置换场身份）与源图身份**分开** —— 这是"多图层一起液化"的关键：
+    //
+    //   liquify.session  = 置换场身份。变化才清空置换场（原语义："换了一张图"）。
+    //   liquify.source   = 源图身份。变化**只换源图、保留置换场**，这样同一套
+    //                      笔画可以依次施加到每一层。
+    //   liquify.shiftX/Y = 本图局部坐标 → 置换场坐标 的偏移，等于
+    //                      （本层画布偏移 − 基准层画布偏移）；基准层为 0。
+    //
+    // 兼容性：调用方不传 liquify.source（旧行为）时，尺寸变化仍整套重置，
+    // 与改动前完全一致；只有显式用了新参数才启用"换源不换场"。
     void BeginSessionIfNeeded(const ImageBuffer& canvas) {
         const std::string session =
             GetParamString(*host_, "liquify.session", "default");
-        const bool sizeMismatch = !original_.IsValid() ||
-                                  original_.Width() != canvas.Width() ||
-                                  original_.Height() != canvas.Height();
-        const bool reset =
-            GetParamBool(*host_, "liquify.reset", false) ||
-            session != session_ || sizeMismatch;
-        if (!reset) return;
+        const std::string source =
+            GetParamString(*host_, "liquify.source", "");
+        shiftX_ = GetParamInt(*host_, "liquify.shiftX", 0);
+        shiftY_ = GetParamInt(*host_, "liquify.shiftY", 0);
 
-        original_ = canvas.Clone();
-        field_ = liquify::DisplacementField(original_.Width(),
-                                            original_.Height());
-        undoStack_.clear();
-        session_ = session;
-        host_->Log(LogLevel::Info,
-                   ("Liquify session started: " + session).c_str());
+        const bool srcMismatch = !original_.IsValid() ||
+                                 original_.Width() != canvas.Width() ||
+                                 original_.Height() != canvas.Height();
+        const bool legacy = source.empty();
+        const bool fieldReset =
+            GetParamBool(*host_, "liquify.reset", false) ||
+            session != session_ || !field_.IsValid() ||
+            (legacy && srcMismatch);   // 旧行为：不带 source 时换尺寸即重置
+
+        if (fieldReset) {
+            original_ = canvas.Clone();
+            field_ = liquify::DisplacementField(original_.Width(),
+                                                original_.Height());
+            undoStack_.clear();
+            session_ = session;
+            source_ = source;
+            host_->Log(LogLevel::Info,
+                       ("Liquify session started: " + session).c_str());
+            return;
+        }
+        // 置换场保持不变，只把源图换成新的一层（多图层一起液化走这条）
+        if (srcMismatch || source != source_) {
+            original_ = canvas.Clone();
+            source_ = source;
+            host_->Log(LogLevel::Info,
+                       ("Liquify source switched, shift=(" +
+                        std::to_string(shiftX_) + "," +
+                        std::to_string(shiftY_) + ") size=" +
+                        std::to_string(canvas.Width()) + "x" +
+                        std::to_string(canvas.Height()))
+                           .c_str());
+        }
     }
 
     void ApplyTool(const std::string& tool, float cx, float cy, float radius,
@@ -245,6 +276,9 @@ private:
     liquify::DisplacementField field_; // 跨笔累积的置换场
     std::vector<liquify::DisplacementField> undoStack_; // 笔级撤销快照（按内存预算限深，≤384MB）
     std::string session_;
+    std::string source_;      // 源图身份（多图层一起液化时逐层切换，场不变）
+    int shiftX_ = 0;          // 本图局部坐标 → 置换场坐标 的偏移
+    int shiftY_ = 0;
 };
 
 } // namespace

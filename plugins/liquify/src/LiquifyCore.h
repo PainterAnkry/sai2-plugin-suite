@@ -84,6 +84,19 @@ public:
     float Dy(int x, int y) const {
         return dy_[static_cast<size_t>(y) * w_ + x];
     }
+    // 越界一律返回 0（= 该处无位移）。
+    // 用途：多图层一起液化时，要把"在图层 1 上建立的置换场"按各层的画布偏移
+    // 采样到别的图层上（见下面渲染函数的 shiftX/shiftY）。那时坐标会落到场
+    // 之外，而 Dx/Dy **没有任何边界检查**（直接索引扁平数组）——用它们就是
+    // 读越界内存，所以位移采样一律走 Clamped 版本。
+    float DxClamped(int x, int y) const {
+        if (x < 0 || y < 0 || x >= w_ || y >= h_) return 0.0f;
+        return dx_[static_cast<size_t>(y) * w_ + x];
+    }
+    float DyClamped(int x, int y) const {
+        if (x < 0 || y < 0 || x >= w_ || y >= h_) return 0.0f;
+        return dy_[static_cast<size_t>(y) * w_ + x];
+    }
     void Set(int x, int y, float dx, float dy) {
         const size_t i = static_cast<size_t>(y) * w_ + x;
         dx_[i] = dx;
@@ -218,10 +231,16 @@ private:
 };
 
 // 单波段渲染（多线程时每个线程负责一段行区间，互不重叠）
+//
+// shiftX/shiftY：置换场相对**本图**的坐标偏移。
+//   同一形变施加到不同图层时使用：场是在某一层（基准层）的局部坐标里建的，
+//   对另一层来说，本图局部坐标 (x,y) 对应的场坐标是 (x+shiftX, y+shiftY)，
+//   其中 shift = 本层的画布偏移 − 基准层的画布偏移。基准层自身 shift = 0。
+//   这样每个图层都被**同一套形变**处理，几何完全一致，而分层结构不丢。
 inline void RenderLiquifyRows(const ImageBuffer& src,
                               const DisplacementField& field,
                               ImageBuffer& dst, const Rect& roi, int y0,
-                              int y1) {
+                              int y1, int shiftX = 0, int shiftY = 0) {
     const int w = src.Width();
     for (int y = y0; y < y1; ++y) {
         const bool rowInRoi = y >= roi.y && y < roi.y + roi.h;
@@ -233,7 +252,9 @@ inline void RenderLiquifyRows(const ImageBuffer& src,
                 continue;
             }
             RGBA c;
-            SampleBilinear(src, x + field.Dx(x, y), y + field.Dy(x, y), c);
+            // 必须用 Clamped：带偏移后场坐标会越界
+            SampleBilinear(src, x + field.DxClamped(x + shiftX, y + shiftY),
+                           y + field.DyClamped(x + shiftX, y + shiftY), c);
             dst.SetPixel(x, y, c);
         }
     }
@@ -244,7 +265,8 @@ inline void RenderLiquifyRows(const ImageBuffer& src,
 // 单线程下要 100ms+，是"笔刷卡顿"的主因 —— 按行分波段多线程并行。
 inline void RenderLiquify(const ImageBuffer& src,
                           const DisplacementField& field,
-                          ImageBuffer& dst, const Selection* sel) {
+                          ImageBuffer& dst, const Selection* sel,
+                          int shiftX = 0, int shiftY = 0) {
     if (!src.IsValid() || !field.IsValid()) return;
     if (dst.Width() != src.Width() || dst.Height() != src.Height() ||
         dst.Format() != src.Format())
@@ -261,7 +283,7 @@ inline void RenderLiquify(const ImageBuffer& src,
     if (hc == 0) hc = 1;
     const int bands = static_cast<int>(std::min(hc, 16u));
     if (bands < 2 || h < 128) {
-        RenderLiquifyRows(src, field, dst, roi, 0, h);
+        RenderLiquifyRows(src, field, dst, roi, 0, h, shiftX, shiftY);
         return;
     }
     const int band = (h + bands - 1) / bands;
@@ -271,8 +293,9 @@ inline void RenderLiquify(const ImageBuffer& src,
         const int y0 = i * band;
         if (y0 >= h) break;
         pool.emplace_back([&src, &field, &dst, roi, y0,
-                           y1 = std::min(h, y0 + band)]() mutable {
-            RenderLiquifyRows(src, field, dst, roi, y0, y1);
+                           y1 = std::min(h, y0 + band), shiftX,
+                           shiftY]() mutable {
+            RenderLiquifyRows(src, field, dst, roi, y0, y1, shiftX, shiftY);
         });
     }
     for (auto& t : pool) t.join();

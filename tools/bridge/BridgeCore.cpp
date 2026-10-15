@@ -575,25 +575,28 @@ void BridgeCore::SetCanvasContext(bool has, int canvasW, int canvasH,
     }
 }
 
-ImageBuffer BridgeCore::PadToCanvas(const ImageBuffer& img) const {
-    if (!img.IsValid() ||
-        (img.Width() == canvasW_ && img.Height() == canvasH_))
+// 把 img 摆到画布 (x0,y0) 并补边成 cw x ch（越界裁掉）。
+// 抽成带显式参数的函数：多图层一起液化时，每一层的画布偏移都不同，
+// 不能再用"当前会话记录的单个 ctx"。
+static ImageBuffer PadImageAt(const ImageBuffer& img, int cw, int ch, int x0,
+                              int y0) {
+    if (!img.IsValid()) return ImageBuffer();
+    if (img.Width() == cw && img.Height() == ch && x0 == 0 && y0 == 0)
         return img.Clone();
-    ImageBuffer out(canvasW_, canvasH_, PixelFormat::RGBA8);
+    ImageBuffer out(cw, ch, PixelFormat::RGBA8);
     out.Clear(RGBA{0, 0, 0, 0});
-    // 结果尺寸与抓取时不同（异常情况）：仍按记录的偏移摆放，越界裁掉
-    const int px = canvasX0_, py = canvasY0_;
+    const int px = x0, py = y0;
     const int iw = img.Width(), ih = img.Height();
     for (int y = 0; y < ih; ++y) {
         const int dy = py + y;
-        if (dy < 0 || dy >= canvasH_) continue;
+        if (dy < 0 || dy >= ch) continue;
         int sx = 0;                       // 源列起点（偏移为负时裁掉左侧）
         if (px < 0) {
             sx = -px;
             if (sx >= iw) continue;
         }
         const int dx = std::max(px, 0);   // 目标列起点
-        const int copy = std::min(iw - sx, canvasW_ - dx);
+        const int copy = std::min(iw - sx, cw - dx);
         if (copy <= 0) continue;
         std::memcpy(out.Data() + out.Stride() * static_cast<size_t>(dy) +
                         static_cast<size_t>(dx) * 4,
@@ -602,6 +605,80 @@ ImageBuffer BridgeCore::PadToCanvas(const ImageBuffer& img) const {
                     static_cast<size_t>(copy) * 4);
     }
     return out;
+}
+
+ImageBuffer BridgeCore::PadToCanvas(const ImageBuffer& img) const {
+    return PadImageAt(img, canvasW_, canvasH_, canvasX0_, canvasY0_);
+}
+
+bool BridgeCore::WriteImageToClipboard(const ImageBuffer& img,
+                                       std::string& error) {
+    if (!img.IsValid()) {
+        error = "没有可写入的图像";
+        return false;
+    }
+    return WriteClipboardImage(img, error);
+}
+
+// 多图层一起液化（方案 B：逐层施加同一形变、保留分层）的核心一步。
+//
+// 关键点：**同一个 liquify.session**（= 置换场身份，不许重置）、
+// **新的 liquify.source**（= 换源图，插件只重缓存源图、保留置换场）、
+// **liquify.shiftX/Y**（= 本层偏移 − 基准层偏移，置换场采样偏移）、
+// **liquify.mode = "render"**（只渲染现有场，不要再叠一笔）。
+//
+// 还要显式带 liquify.tool：插件里"没有 liquify.tool 参数"会走 1.0 的
+// LegacyDemoStroke（内置演示笔画），那样会凭空多出一笔形变。
+ImageBuffer BridgeCore::RenderLiquifyLayerToCanvas(
+    const ImageBuffer& layerSrc, const std::string& sourceId, int cw, int ch,
+    int offX, int offY, int shiftX, int shiftY) {
+    if (!started_ || !manager_ || !host_ || !layerSrc.IsValid() || cw <= 0 ||
+        ch <= 0)
+        return ImageBuffer();
+
+    // 用液化窗口正在用的那个效果；当前效果不是液化组时退回第一个液化效果
+    int idx = current_;
+    if (idx < 0 || idx >= static_cast<int>(effects_.size()) ||
+        effects_[static_cast<size_t>(idx)].group != kGroupLiquify) {
+        idx = -1;
+        for (size_t i = 0; i < effects_.size(); ++i)
+            if (effects_[i].group == kGroupLiquify) {
+                idx = static_cast<int>(i);
+                break;
+            }
+        if (idx < 0) {
+            Log("multilayer: no liquify effect available");
+            return ImageBuffer();
+        }
+    }
+    const EffectDef& e = effects_[static_cast<size_t>(idx)];
+
+    host_->ClearParams();
+    for (const auto& kv : e.fixed) host_->SetParam(kv.first, kv.second);
+    host_->SetParam("liquify.session", sessionIds_[kWinLiquify]);
+    host_->SetParam("liquify.source", sourceId);
+    host_->SetParam("liquify.shiftX", shiftX);
+    host_->SetParam("liquify.shiftY", shiftY);
+    host_->SetParam("liquify.mode", std::string("render"));
+    host_->SetRecordingUndo(false);
+    host_->SetCanvas(layerSrc.Clone(), false);
+    std::string err;
+    if (!manager_->ExecutePlugin(e.pluginId, err)) {
+        host_->SetRecordingUndo(true);
+        Log("multilayer: execute failed: " + err);
+        return ImageBuffer();
+    }
+    ImageBuffer out = std::move(host_->Canvas());
+    host_->SetRecordingUndo(true);
+    if (!out.IsValid()) {
+        Log("multilayer: plugin produced no canvas");
+        return ImageBuffer();
+    }
+    Log("multilayer: layer rendered src=" + sourceId + " size=" +
+        std::to_string(out.Width()) + "x" + std::to_string(out.Height()) +
+        " shift=(" + std::to_string(shiftX) + "," + std::to_string(shiftY) +
+        ") place=(" + std::to_string(offX) + "," + std::to_string(offY) + ")");
+    return PadImageAt(out, cw, ch, offX, offY);
 }
 
 bool BridgeCore::WriteAppliedToClipboard(std::string& error) {

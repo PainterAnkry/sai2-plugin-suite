@@ -176,6 +176,22 @@ inline bool ParseLayers(const std::string& json, AgentLayers& out) {
                 if (rE >= g.size()) break;
             }
         }
+        // 丢弃"上一份文档"残留的行。
+        // agent 的文字 ring 是**跨文档累积**的：切换文档后旧文档的图层行仍在
+        // 里面，于是 "行号 → 屏幕 Y" 的映射会错位（实测：切文档后点"第 2 行"
+        // 点的还是第 1 行，多图层流程因此反复处理同一层）。
+        // 同一次面板重绘里的行 tick 很接近，用"最新 tick 前 3 秒"过滤即可。
+        if (!grp.rows.empty()) {
+            long long newest = 0;
+            for (size_t i = 0; i < grp.rows.size(); ++i)
+                if (grp.rows[i].tick > newest) newest = grp.rows[i].tick;
+            std::vector<AgentLayerRow> keep;
+            keep.reserve(grp.rows.size());
+            for (size_t i = 0; i < grp.rows.size(); ++i)
+                if (newest - grp.rows[i].tick <= 3000)
+                    keep.push_back(grp.rows[i]);
+            grp.rows.swap(keep);
+        }
         out.groups.push_back(std::move(grp));
         b = e;
     }

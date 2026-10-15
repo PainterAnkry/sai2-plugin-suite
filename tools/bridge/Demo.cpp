@@ -413,6 +413,27 @@ void RunSai2Demo(int seconds, const std::string& outDir) {
         RefreshLayers(); // 注入代理已就绪时能拿到真实图层行
         Sleep(1500);
 
+        // 测试钩子 --ml-sel：预设图层多选，让随后的"应用"走
+        // 「逐层施加同一形变、各自合并回原层」
+        if (!g_mlSelRows.empty()) {
+            s.selLayers.clear();
+            for (size_t k = 0; k < g_mlSelRows.size(); ++k) {
+                const int rr = g_mlSelRows[k];
+                if (rr >= 0 && rr < static_cast<int>(s.layerNames.size()))
+                    s.selLayers.push_back(rr);
+            }
+            std::sort(s.selLayers.begin(), s.selLayers.end());
+            if (!s.selLayers.empty()) {
+                s.selLayer = s.selLayers.front();
+                s.selAnchor = s.selLayer;
+                // 多图层语义要求"每层各自合并回自己"，所以测试钩子同时打开它
+                s.mergeBack = true;
+                core.Log("ml-sel hook: selected " +
+                         std::to_string(s.selLayers.size()) +
+                         " layer(s), mergeBack=on");
+            }
+        }
+
         // 1) 等价于"点液化按钮"：抓 SAI2 当前图层并弹出液化窗口
         RequestToolWindow(s.mainHwnd, BridgeCore::kWinLiquify, true);
         for (int i = 0; i < 80 && !core.HasImage(); ++i) Sleep(250);

@@ -45,5 +45,6 @@ bool TestCryptoSign();
 bool TestCompute();
 bool TestLiquifySession();
 bool TestGalleryView();
+bool TestLiquifyShift();
 
 } // namespace sai2test

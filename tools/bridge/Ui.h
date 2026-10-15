@@ -214,6 +214,12 @@ struct AppState {
     bool agentOnline = false;
     std::wstring agentHint;
     int selLayer = -1;
+    // 多选（"一起液化"要一次处理多层）：
+    //   Ctrl+点 = 切换单行、Shift+点 = 选范围、普通点 = 单选。
+    // selLayers 升序去重；selLayer 是**主层**（最后点的那行），抓取窗口里编辑
+    // 的就是它，应用时对其余层施加**同一形变**并各自合并回原层。
+    std::vector<int> selLayers;
+    int selAnchor = -1;   // Shift 范围选择的锚点行
     std::vector<std::wstring> layerNames;
     std::vector<int> layerScreenY;
     std::vector<std::wstring> layerAttrs;
@@ -431,6 +437,18 @@ void RefreshLayers();
 std::vector<std::wstring> LayerNames();
 void DoInjectAsync(HWND hwnd);
 void DoSelectLayer(int rowIdx);
+
+// ---- 图层多选（Ctrl+点切换 / Shift+点范围）--------------------------------
+// 面板是选中集的权威，再用真实点击（含 Ctrl+点）把它同步给 SAI2 ——
+// 反过来"读 SAI2 选中了哪几层"没有数据源：图层面板的高亮不经过我们挂钩的
+// 那几个 GDI 调用（实测 agent 抓到的位图里只有界面各部件的 DIB）。
+bool RowIsSelected(int row);
+void SetRowSelection(int row, bool additive, bool range);
+void SyncSelectionToSai2();
+// 测试钩子：--ml-sel 0,1 预设图层多选（无人值守验证「一起液化」用）
+extern std::vector<int> g_mlSelRows;
+// 主层应用完成后，对其余选中层逐一施加同一形变并各自合并回原层
+void RunMultiLayerApply(HWND hwnd);
 // 选中该层并抓取（后台线程；抓完可选打开 wantWindow 功能窗口）
 void GrabSelectedLayer(HWND hwnd, int rowIdx, int wantWindow);
 void DoMergeDown(HWND hwnd);

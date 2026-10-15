@@ -89,6 +89,11 @@ public:
     bool HasImage() const { return original_.IsValid(); }
     const ImageBuffer& OriginalImage() const { return original_; }
     const ImageBuffer& AppliedImage() const { return applied_; }
+    // 当前 applied_ 补边到画布尺寸后的结果（无画布上下文时就是 applied_ 本身）。
+    // 多图层一起液化时每层都要自己摆位，测/诊断也要拿到补边图，故公开。
+    ImageBuffer PaddedApplied() const {
+        return hasCanvasCtx_ ? PadToCanvas(applied_) : applied_.Clone();
+    }
     // 窗口当前应当绘制的图像（预览结果或已应用结果）
     const ImageBuffer& DisplayImage(int winIdx) const;
 
@@ -152,10 +157,32 @@ public:
     bool HasCanvasContext() const { return hasCanvasCtx_; }
     int CanvasW() const { return canvasW_; }
     int CanvasH() const { return canvasH_; }
+    // 基准层（抓取时那层）内容在画布内的偏移。多图层一起液化时，
+    // 其余层要用 "本层偏移 − 基准层偏移" 作为置换场的采样偏移。
+    int CanvasX0() const { return canvasX0_; }
+    int CanvasY0() const { return canvasY0_; }
+
+    // 把任意一张"已经是画布尺寸"的图写进剪贴板（多图层逐层回贴用：
+    // 每层结果由 RenderLiquifyLayerToCanvas 补边好，这里是最后一步）。
+    bool WriteImageToClipboard(const ImageBuffer& img, std::string& error);
     // 把当前 applied_ 补边成画布尺寸后写剪贴板 —— 这就是产品"精确回贴"的
     // 写入路径。公开出来是为了让 `--pad-clipboard` 诊断复跑**同一段**代码，
     // 而不是另写一份（否则测的就不是产品路径了）。
     bool WriteAppliedToClipboard(std::string& error);
+
+    // ---- 多图层一起液化（方案 B）------------------------------------------
+    // 用「液化会话里已经建立的同一个置换场」把**另一层**渲染出来，并补边到
+    // 画布尺寸（供写剪贴板 → Ctrl+V → 向下合并回该层）。
+    //   layerSrc  该层刚抓到的图（1:1 文档像素）
+    //   sourceId  该层的源图身份；变化只会让插件重新缓存源图，**置换场保留**
+    //   cw,ch     画布尺寸（所有层相同）
+    //   offX,offY 该层内容在画布内的偏移
+    //   shiftX/Y  该层偏移 − 基准层偏移（置换场采样偏移；基准层为 0）
+    // 失败返回无效图。所有层因此被**同一套形变**处理，而分层结构不丢。
+    ImageBuffer RenderLiquifyLayerToCanvas(const ImageBuffer& layerSrc,
+                                           const std::string& sourceId,
+                                           int cw, int ch, int offX, int offY,
+                                           int shiftX, int shiftY);
 
     // ---- 液化笔画 -------------------------------------------------------
     // 按"上一采样点 → 本次点"提交一笔（笔刷中心 + 拖动方向）。
