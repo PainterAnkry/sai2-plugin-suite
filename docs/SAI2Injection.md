@@ -567,3 +567,39 @@ PATBLT: 0
    确实走 GDI。
 3. 维持现状：**面板当权威**（本期已实现）——用户在面板里 Ctrl 多选，选中集由
    面板用真实点击同步给 SAI2。这是当前唯一可用的多选入口。
+
+### 10.9 交接：如何一次性完成"真机 Δ≠0"多图层验证
+
+目标：在真机上验证"两个**画布偏移不同**的图层被同一形变处理"。这一步在 2026-10-15
+的会话里没跑成，原因**全在测试编排**，不是功能本身（机制与数学都已分别验证）。
+踩过的坑与正确做法：
+
+1. **文档必须是干净的**。反复重试会在同一位置反复粘贴，最后文档里堆出十几层、
+   其中好几层内容完全相同 —— 于是 `--ml-sel 0,1` 选到的两行是**同一张图**，
+   Δ 恒为 (0,0)，看不出偏移对不对。
+   做法：`Copy-Item 测试.sai2 -> F:\sai2test\X.sai2` 拿新副本，**只粘一次**；
+   一次跑完，不要在失败后原地重试（会继续叠层）。
+2. **打开文档**：`Start-Process <file.sai2>`（走 shell 关联交给已运行实例）。
+   不要用命令行参数重启：异常结束后 SAI2 会弹模态框「强制退出的工程」，
+   **它会吃掉命令行传入的文件参数**（表现为"起来了但没有文档"）。
+3. **抢前台**：`SetWindowPos(TOPMOST) → SetForegroundWindow → SetWindowPos(NOTOPMOST)`，
+   然后**校验** `GetForegroundWindow()==hwnd`。后台进程的 `SetForegroundWindow`
+   常被前台锁拒绝，而 `.NET SendKeys` 的键只发给前台窗口 —— 不校验就会
+   出现"点/键全都像没生效"的假象。
+4. **点行前必须先让面板重绘**：agent 只捕获**注入之后**的绘制。注入后先在图层
+   面板里点一下图层行（`diag/click.py <x> <y>`），再用
+   `sai2_injector.exe layers` 确认行数 ≥ 2 且行名与当前文档一致。
+5. **两层的偏移必须真的不同**：抓一层、跑 `--ctx-test` 记下 `内容偏移`；
+   再抓另一层、再记一次；两者不同才说明 Δ≠0。若两次相同 → 说明点到了同一层。
+6. 期望日志：
+   ```
+   multilayer: start, layers=2 canvas=<画布>
+   Liquify source switched, shift=(Δx,Δy) size=<该层尺寸>   ← Δ 非零
+   multilayer: layer rendered ... place=(...)
+   multilayer: layer N done place=(...) shift=(Δx,Δy)
+   multilayer: finished, extra layers done=1
+   ```
+   并核对：**层数不变**（每层各自合并回自己）、两层都被改动、无整体错位。
+7. 判定"两层被同一形变处理"的**离线**等价物已经存在（不需要 SAI2）：
+   `sai2_bridge.exe --multilayer-test A.bmp B.bmp <cw> <ch> <ax> <ay> <bx> <by> <out>`
+   —— 走的是产品同一段代码，实测重叠内部 87400 像素仅 7 个差 1/255。
