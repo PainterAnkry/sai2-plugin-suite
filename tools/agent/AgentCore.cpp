@@ -32,6 +32,7 @@ void* g_origExtTextOutW = nullptr;
 void* g_origDrawTextW = nullptr;
 void* g_origSetDIBitsToDevice = nullptr;
 void* g_origBitBlt = nullptr;
+
 void* g_origStretchBlt = nullptr;
 IATHook* g_hooks = nullptr;
 AgentCore* g_core = nullptr; // Startup 后有效
