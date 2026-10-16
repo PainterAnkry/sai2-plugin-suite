@@ -2380,6 +2380,27 @@ void DoGrabWholeLayer(HWND hwnd) {
 // ---------------------------------------------------------------------------
 void DoApplyFlow(UiWindow& win) {
     AppState& s = S();
+    // ★ 应用前若缺"画布上下文"，就地补一次定位。
+    //
+    // 根因（用户实测："液化不错位了，但滤镜/调整/模糊还错位"）：
+    //   液化窗口是点「液化」按钮打开的 —— 那条路会先抓图层并
+    //   `SetCanvasContext(true, …)`，所以应用时补边正确；
+    //   而滤镜/调整/模糊窗口是用**已经抓到的图**直接打开的，若用户是先在
+    //   SAI2 里 Ctrl+C（面板的剪贴板监控 → DoGrabFromClipboard）拿的图，
+    //   那条路会 `SetCanvasContext(false, …)` **把上下文清空**，
+    //   于是应用时补边退化成原图 → 粘贴落到 (0,0) → 大幅错位。
+    //
+    // 所以这里不依赖"上下文恰好还在"：缺了就现测一次（与「液化」按钮同一套
+    // 定位：agent 画布快照 + 模板匹配 + .sai2 精确尺寸）。
+    if (s.core->HasImage() && !s.core->HasCanvasContext()) {
+        CanvasCtxResult ctx;
+        std::string diag;
+        if (AcquireCanvasContext(ctx, diag) && ctx.ok) {
+            s.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0);
+        } else {
+            s.flash = U8("没有画布尺寸，粘贴会错位：" + diag);
+        }
+    }
     const BridgeCore::ApplyResult r = s.core->ApplyToClipboard();
     if (r.clipboardWritten) {
         s.selfWriteTick = GetTickCount64();
