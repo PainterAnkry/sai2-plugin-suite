@@ -566,12 +566,188 @@ inline bool GalleryApplyStylize(const char* key, ImageBuffer& img,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 已实现算法：Sketch 批（基底凸现 / 绘图笔 / 半调图案 / 影印 / 图章）
+// 共同骨架：亮度 → （可选模糊）→ 色阶/阈值/纹理 → 前景·背景两色映射。
+// 注：记法里 foreground/background 是 json（颜色），本插件暂无颜色控件 →
+//     用默认黑/白前景背景色（PS 默认即黑前景、白背景）。
+// ---------------------------------------------------------------------------
+inline bool GalleryApplySketch(const char* key, ImageBuffer& img,
+                               const Selection* sel,
+                               const GalleryFilterBase& f) {
+    using namespace galleryfx;
+    const std::string k = key ? key : "";
+    const uint32_t maxV = img.Format() == PixelFormat::RGBA16 ? 65535u : 255u;
+    const float sc = static_cast<float>(maxV) / 255.0f;
+    const Rect roi = FilterRoi(img, sel);
+    if (roi.w <= 0 || roi.h <= 0) return true;
+    const int W = img.Width(), H = img.Height();
+
+    auto luma01 = [&](const ImageBuffer& src, int x, int y) {
+        return Luma(SampleClamp(src, x, y)) / (255.0f * sc);
+    };
+    auto setGray = [&](int x, int y, float v, uint16_t a) {
+        RGBA o;
+        const float c = std::min(static_cast<float>(maxV),
+                                 std::max(0.0f, v * maxV));
+        o.r = o.g = o.b = static_cast<uint16_t>(c);
+        o.a = a;
+        img.SetPixel(x, y, o);
+    };
+
+    if (k == "basRelief") {
+        // 基底凸现：detail(1..15=13) 控制细节、smoothness(1..15=3) 模糊、
+        // light(8 向) 决定打光方向；结果映射到灰阶（PS 的基底凸现观感）
+        const int detail = std::max(1, f.Pi("detail"));
+        const int smooth = std::max(1, f.Pi("smoothness"));
+        const int light = f.Pi("light");
+        const float a = 6.2831853f * static_cast<float>(light) / 8.0f;
+        const float lx = std::cos(a), ly = std::sin(a);
+        ImageBuffer src = img.Clone();
+        if (smooth > 1) BoxBlur(src, std::min(4, smooth / 3));
+        for (int y = roi.y; y < roi.y + roi.h; ++y)
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                const float d = luma01(src, x + static_cast<int>(lx * detail),
+                                       y + static_cast<int>(ly * detail)) -
+                                luma01(src, x, y);
+                RGBA c;
+                img.GetPixel(x, y, c);
+                setGray(x, y, 0.5f + d * 2.2f, c.a);
+            }
+        return true;
+    }
+
+    if (k == "graphicPen") {
+        // 绘图笔：按 strokeDirection(4 向) 画等间距墨线，线密度由亮度决定
+        const int len = std::max(1, f.Pi("strokeLength"));
+        const float balance = f.P("lightDarkBalance") / 100.0f;
+        const int dir = f.Pi("strokeDirection"); // 0=rightDiag 1=horizontal 2=leftDiag 3=vertical
+        const float period = std::max(2.0f, static_cast<float>(len) * 0.55f);
+        for (int y = roi.y; y < roi.y + roi.h; ++y)
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                float coord;
+                if (dir == 1) coord = static_cast<float>(y);
+                else if (dir == 3) coord = static_cast<float>(x);
+                else if (dir == 2) coord = static_cast<float>(x) - static_cast<float>(y);
+                else coord = static_cast<float>(x) + static_cast<float>(y);
+                const float phase = (coord + period * 0.5f) / period;
+                const float frac = phase - std::floor(phase);
+                const float lum = luma01(img, x, y);
+                // 暗 → 线更粗；亮 → 线更细甚至断
+                const float width = std::min(0.95f,
+                    (1.0f - lum) * (0.35f + balance) * 1.4f);
+                RGBA c;
+                img.GetPixel(x, y, c);
+                setGray(x, y, frac < width ? 0.0f : 1.0f, c.a);
+            }
+        return true;
+    }
+
+    if (k == "halftonePattern") {
+        // 半调图案：size(1..12=1) 网点大小、contrast(0..50=5) 对比、
+        // patternType(0=dot 1=circle 2=line)
+        const int size = std::max(1, f.Pi("size"));
+        const float contrast = f.P("contrast") / 50.0f;
+        const int type = f.Pi("patternType");
+        const int cell = std::max(2, size * 3);
+        for (int y = roi.y; y < roi.y + roi.h; ++y)
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                const float lum = luma01(img, x, y);
+                float ink;
+                if (type == 2) {                    // line：线宽随亮度
+                    const float period = static_cast<float>(cell);
+                    const float fpos = static_cast<float>(x % cell) / period;
+                    ink = (fpos < (1.0f - lum)) ? 0.0f : 1.0f;
+                } else {
+                    const int cx = (x / cell) * cell + cell / 2;
+                    const int cy = (y / cell) * cell + cell / 2;
+                    const float dx = static_cast<float>(x - cx);
+                    const float dy = static_cast<float>(y - cy);
+                    const float r = (type == 1) ? std::sqrt(dx * dx + dy * dy)
+                                                : std::max(std::fabs(dx), std::fabs(dy));
+                    const float rad = (1.0f - lum) * (cell * 0.5f) *
+                                      (0.6f + contrast);
+                    ink = (r < rad) ? 0.0f : 1.0f;
+                }
+                RGBA c;
+                img.GetPixel(x, y, c);
+                setGray(x, y, ink, c.a);
+            }
+        return true;
+    }
+
+    if (k == "photocopy" || k == "stamp" || k == "tornEdges" || k == "reticulation") {
+        // 影印 / 图章 / 撕边 / 网状：都是"亮度 → 阈值（带噪声/模糊）"家族
+        const bool isCopy = (k == "photocopy");
+        const bool isStamp = (k == "stamp");
+        const bool isTorn = (k == "tornEdges");
+        const float detail = isCopy ? static_cast<float>(std::max(1, f.Pi("detail"))) : 1.0f;
+        const float darkness = isCopy ? static_cast<float>(std::max(1, f.Pi("darkness"))) / 50.0f : 0.5f;
+        const float balance = isStamp ? f.P("lightDarkBalance") / 50.0f
+                                      : (isTorn ? f.P("imageBalance") / 50.0f : 1.0f);
+        const int smooth = isStamp ? std::max(1, f.Pi("smoothness"))
+                                   : (isTorn ? std::max(1, f.Pi("smoothness")) : 1);
+        ImageBuffer src = img.Clone();
+        if (smooth > 1) BoxBlur(src, std::min(4, smooth / 5));
+        for (int y = roi.y; y < roi.y + roi.h; ++y)
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                float lum = luma01(src, x, y);
+                if (isCopy) {
+                    // 细节越大越"锐"（高频保留），暗度抬升阈值
+                    const float hi = luma01(src, x + static_cast<int>(detail),
+                                            y + static_cast<int>(detail));
+                    lum = std::min(1.0f, std::max(0.0f, lum + (lum - hi) * 1.5f));
+                }
+                float thr = 0.5f;
+                if (isCopy) thr = 0.45f + (1.0f - darkness) * 0.25f;
+                else if (isStamp) thr = 0.25f + balance * 0.5f;
+                else if (isTorn) thr = 0.2f + balance * 0.6f;
+                else thr = 0.5f; // reticulation 走密度
+                float v = (lum < thr) ? 0.0f : 1.0f;
+                if (isTorn) {
+                    // 撕边：阈值附近用噪声抖动出粗糙边缘
+                    const float n = Hash01(x, y, 53u) * 0.12f - 0.06f;
+                    v = ((lum + n) < thr) ? 0.0f : 1.0f;
+                }
+                setGray(x, y, v, [&] { RGBA c; img.GetPixel(x, y, c); return c.a; }());
+            }
+        return true;
+    }
+
+    if (k == "waterPaper") {
+        // 水彩纸：按 fiberLength 画纤维条纹，brightness/contrast 调整观感
+        const int fiber = std::max(3, f.Pi("fiberLength"));
+        const float bright = f.P("brightness") / 100.0f;
+        const float contrast = f.P("contrast") / 100.0f;
+        for (int y = roi.y; y < roi.y + roi.h; ++y)
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                const float along = Hash01(x / fiber, y, 61u);
+                const float across = Hash01(x, y / std::max(2, fiber / 2), 67u);
+                const float f01 = 0.5f + (along - 0.5f) * 0.5f + (across - 0.5f) * 0.35f;
+                RGBA c;
+                img.GetPixel(x, y, c);
+                const float lum = luma01(img, x, y);
+                const float v = std::min(1.0f, std::max(0.0f,
+                    (lum * (0.6f + bright * 0.8f) + (f01 - 0.5f)) * (0.7f + contrast)));
+                setGray(x, y, v, c.a);
+            }
+        return true;
+    }
+
+    return false;
+}
 // 总分派：已实现 Distort 3 + Texture 6 + Stylize 1 = 10 个
 inline bool GalleryApplyAll(const char* key, ImageBuffer& img,
                             const Selection* sel, const GalleryFilterBase& f) {
     if (GalleryApplyDistort(key, img, sel, f)) return true;
     if (GalleryApplyTexture(key, img, sel, f)) return true;
     if (GalleryApplyStylize(key, img, sel, f)) return true;
+    if (GalleryApplySketch(key, img, sel, f)) return true;
     return false; // 未实现（UI 应标灰 / Execute 会记日志）
 }
 
