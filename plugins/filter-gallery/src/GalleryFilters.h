@@ -294,10 +294,285 @@ inline bool GalleryApplyDistort(const char* key, ImageBuffer& img,
     return false; // 未实现（UI 应标灰）
 }
 
-// 总分派：目前只接 Distort；其余分类后续按同样方式追加
+// ---------------------------------------------------------------------------
+// 已实现算法：Texture（龟裂/颗粒/马赛克拼贴/拼缀图/染色玻璃/纹理化）
+//               Stylize（照亮边缘）
+// ---------------------------------------------------------------------------
+inline bool GalleryApplyTexture(const char* key, ImageBuffer& img,
+                                const Selection* sel,
+                                const GalleryFilterBase& f) {
+    using namespace galleryfx;
+    const std::string k = key ? key : "";
+    const int W = img.Width(), H = img.Height();
+    const uint32_t maxV = img.Format() == PixelFormat::RGBA16 ? 65535u : 255u;
+    const float sc = static_cast<float>(maxV) / 255.0f;
+    const Rect roi = FilterRoi(img, sel);
+    if (roi.w <= 0 || roi.h <= 0) return true;
+
+    // 细胞化（马赛克/拼缀图/染色玻璃共用）：按 cell 取整块均值
+    auto cellAverage = [&](ImageBuffer& src, ImageBuffer& dst, int cell) {
+        for (int y = roi.y; y < roi.y + roi.h; ++y) {
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                const int cx = (x / cell) * cell, cy = (y / cell) * cell;
+                float sr = 0, sg = 0, sb = 0, sa = 0;
+                int n = 0;
+                for (int yy = cy; yy < std::min(cy + cell, H); ++yy) {
+                    for (int xx = cx; xx < std::min(cx + cell, W); ++xx) {
+                        RGBA c;
+                        src.GetPixel(xx, yy, c);
+                        sr += c.r; sg += c.g; sb += c.b; sa += c.a; ++n;
+                    }
+                }
+                if (!n) continue;
+                RGBA o;
+                o.r = static_cast<uint16_t>(sr / n);
+                o.g = static_cast<uint16_t>(sg / n);
+                o.b = static_cast<uint16_t>(sb / n);
+                o.a = static_cast<uint16_t>(sa / n);
+                dst.SetPixel(x, y, o);
+            }
+        }
+    };
+
+    if (k == "mosaicTiles") {
+        const int tile = std::max(2, f.Pi("tileSize"));
+        const int grout = std::max(0, f.Pi("groutWidth"));
+        const float lighten = static_cast<float>(f.Pi("lightenGrout")) / 10.0f;
+        ImageBuffer src = img.Clone();
+        ImageBuffer dst = img.Clone();
+        cellAverage(src, dst, tile);
+        for (int y = roi.y; y < roi.y + roi.h; ++y) {
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                RGBA c;
+                dst.GetPixel(x, y, c);
+                const bool isGrout = (x % tile) < grout || (y % tile) < grout;
+                if (isGrout && lighten > 0.0f) {
+                    const float add = lighten * 60.0f * sc;
+                    c.r = ClampCh(c.r + add, maxV);
+                    c.g = ClampCh(c.g + add, maxV);
+                    c.b = ClampCh(c.b + add, maxV);
+                } else if (isGrout) {
+                    c.r = static_cast<uint16_t>(c.r * 0.75f);
+                    c.g = static_cast<uint16_t>(c.g * 0.75f);
+                    c.b = static_cast<uint16_t>(c.b * 0.75f);
+                }
+                img.SetPixel(x, y, c);
+            }
+        }
+        return true;
+    }
+
+    if (k == "patchwork" || k == "stainedGlass") {
+        const bool stained = (k == "stainedGlass");
+        const int cell = stained ? std::max(2, f.Pi("cellSize"))
+                                 : std::max(2, f.Pi("squareSize") * 3 + 4);
+        const int border = stained ? std::max(1, f.Pi("borderThickness")) : 0;
+        const float relief = stained ? 0.0f
+                                     : static_cast<float>(f.Pi("relief")) / 25.0f;
+        const float lightI = stained ? static_cast<float>(f.Pi("lightIntensity")) / 10.0f
+                                     : 0.0f;
+        ImageBuffer src = img.Clone();
+        ImageBuffer dst = img.Clone();
+        cellAverage(src, dst, cell);
+        // 拼缀图的"浮雕"：用相邻细胞均值的差当作高度差做定向打光
+        for (int y = roi.y; y < roi.y + roi.h; ++y) {
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                RGBA c;
+                dst.GetPixel(x, y, c);
+                if (!stained) {
+                    const int cx = (x / cell) * cell, cy = (y / cell) * cell;
+                    const int rx = std::min(W - 1, cx + cell), ry = std::min(H - 1, cy + cell);
+                    RGBA r0, r1;
+                    src.GetPixel(std::min(W - 1, rx), std::min(H - 1, ry), r0);
+                    src.GetPixel(std::min(W - 1, cx), std::min(H - 1, cy), r1);
+                    const float d = (Luma(r0) - Luma(r1)) / (255.0f * sc);
+                    const float add = d * relief * 90.0f * sc;
+                    c.r = ClampCh(c.r + add, maxV);
+                    c.g = ClampCh(c.g + add, maxV);
+                    c.b = ClampCh(c.b + add, maxV);
+                } else {
+                    const bool isBorder = (x % cell) < border || (y % cell) < border;
+                    if (isBorder) {
+                        c.r = static_cast<uint16_t>(c.r * 0.35f);
+                        c.g = static_cast<uint16_t>(c.g * 0.35f);
+                        c.b = static_cast<uint16_t>(c.b * 0.35f);
+                    } else if (lightI > 0.0f) {
+                        const float add = lightI * 40.0f * sc *
+                                          (0.5f + 0.5f * Hash01(x / cell, y / cell, 5u));
+                        c.r = ClampCh(c.r + add, maxV);
+                        c.g = ClampCh(c.g + add, maxV);
+                        c.b = ClampCh(c.b + add, maxV);
+                    }
+                }
+                img.SetPixel(x, y, c);
+            }
+        }
+        return true;
+    }
+
+    if (k == "craquelure") {
+        const int spacing = std::max(2, f.Pi("crackSpacing"));
+        const float depth = static_cast<float>(f.Pi("crackDepth")) / 10.0f;
+        const float bright = static_cast<float>(f.Pi("crackBrightness")) / 10.0f;
+        for (int y = roi.y; y < roi.y + roi.h; ++y) {
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                // 细胞边界 = 裂缝；用抖动让边界不规则（避免规则网格的假感）
+                const int jx = static_cast<int>(Hash01(x / spacing, y / spacing, 13u) * spacing * 0.4f);
+                const int jy = static_cast<int>(Hash01(x / spacing, y / spacing, 17u) * spacing * 0.4f);
+                const bool onCrack = ((x + jx) % spacing) == 0 || ((y + jy) % spacing) == 0;
+                if (!onCrack) continue;
+                RGBA c;
+                img.GetPixel(x, y, c);
+                const float d = (depth * 70.0f - bright * 55.0f) * sc;
+                c.r = ClampCh(c.r - d, maxV);
+                c.g = ClampCh(c.g - d, maxV);
+                c.b = ClampCh(c.b - d, maxV);
+                img.SetPixel(x, y, c);
+            }
+        }
+        return true;
+    }
+
+    if (k == "grain") {
+        const float intensity = static_cast<float>(f.Pi("intensity")) / 100.0f;
+        const float contrast = static_cast<float>(f.Pi("contrast")) / 100.0f;
+        const int type = f.Pi("grainType"); // 0..9 十种颗粒
+        // 颗粒类型 → 噪声的空间尺度（regular 细、enlarged/horizontal/vertical 粗）
+        const int cell = (type == 5) ? 4 : (type == 7 || type == 8) ? 3 : 1;
+        const float amp = intensity * 110.0f * sc;
+        for (int y = roi.y; y < roi.y + roi.h; ++y) {
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                RGBA c;
+                img.GetPixel(x, y, c);
+                float n;
+                const int gx = x / cell, gy = y / cell;
+                if (type == 7) {              // horizontal
+                    n = Hash01(0, gy, 23u) * 2.0f - 1.0f;
+                } else if (type == 8) {       // vertical
+                    n = Hash01(gx, 0, 29u) * 2.0f - 1.0f;
+                } else if (type == 3) {       // clumped：块状
+                    n = Hash01(gx, gy, 31u) * 2.0f - 1.0f;
+                } else {
+                    n = Hash01(x, y, 37u) * 2.0f - 1.0f;
+                }
+                const float v = n * amp * (1.0f + contrast);
+                c.r = ClampCh(c.r + v, maxV);
+                c.g = ClampCh(c.g + v, maxV);
+                c.b = ClampCh(c.b + v, maxV);
+                img.SetPixel(x, y, c);
+            }
+        }
+        return true;
+    }
+
+    if (k == "texturizer") {
+        // 纹理（canvas/brick/burlap/sandstone）+ 缩放 + 浮雕 + 光照方向 + 反相
+        const int tsel = f.Pi("texture");
+        const float scaling = std::max(0.1f, f.P("scaling") / 100.0f);
+        const float relief = static_cast<float>(f.Pi("relief")) / 50.0f;
+        const int light = f.Pi("light");           // 0..7 八个方向
+        const bool invert = f.Pi("invert") != 0;
+        const float baseCell = (tsel == 1) ? 10.0f : (tsel == 2 ? 3.0f : 5.0f);
+        const float cell = std::max(2.0f, baseCell * scaling);
+        // 光照方向 → (dx,dy) 卷积核
+        const float ang = 6.2831853f * static_cast<float>(light) / 8.0f;
+        const float lx = std::cos(ang), ly = std::sin(ang);
+        for (int y = roi.y; y < roi.y + roi.h; ++y) {
+            for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                if (!SelectionAllows(sel, x, y)) continue;
+                auto height = [&](float px, float py) {
+                    const float u = px / cell, v = py / cell;
+                    float h;
+                    if (tsel == 1) {   // brick：横缝 + 错缝
+                        const int row = static_cast<int>(v);
+                        const int off = (row % 2) ? static_cast<int>(cell * 0.5f) : 0;
+                        h = ((static_cast<int>(u * 2.0f + off / cell) % 2) == 0) ? 0.8f : 0.2f;
+                        if ((static_cast<int>(v) % 2) == 0) h += 0.1f;
+                    } else if (tsel == 2) { // burlap：交错的粗织纹
+                        h = (static_cast<int>(u) % 2 == 0 ? 0.7f : 0.3f) *
+                            (static_cast<int>(v) % 2 == 0 ? 0.8f : 0.4f);
+                    } else if (tsel == 3) { // sandstone：细噪
+                        h = Hash01(static_cast<int>(u), static_cast<int>(v), 41u);
+                    } else {                // canvas
+                        h = 0.5f + 0.35f * std::sin(u * 3.14159265f) *
+                                       std::sin(v * 3.14159265f);
+                    }
+                    return invert ? 1.0f - h : h;
+                };
+                const float h0 = height(static_cast<float>(x), static_cast<float>(y));
+                const float h1 = height(static_cast<float>(x) + lx * cell,
+                                        static_cast<float>(y) + ly * cell);
+                const float d = (h1 - h0) * relief * 120.0f * sc;
+                RGBA c;
+                img.GetPixel(x, y, c);
+                c.r = ClampCh(c.r + d, maxV);
+                c.g = ClampCh(c.g + d, maxV);
+                c.b = ClampCh(c.b + d, maxV);
+                img.SetPixel(x, y, c);
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+inline bool GalleryApplyStylize(const char* key, ImageBuffer& img,
+                                const Selection* sel,
+                                const GalleryFilterBase& f) {
+    using namespace galleryfx;
+    const std::string k = key ? key : "";
+    if (k != "glowingEdges") return false;
+    const uint32_t maxV = img.Format() == PixelFormat::RGBA16 ? 65535u : 255u;
+    const float sc = static_cast<float>(maxV) / 255.0f;
+    const int width = std::max(1, f.Pi("edgeWidth"));
+    const float bright = static_cast<float>(f.Pi("edgeBrightness")) / 20.0f;
+    const int smooth = std::max(1, f.Pi("smoothness"));
+    const Rect roi = FilterRoi(img, sel);
+
+    ImageBuffer src = img.Clone();
+    if (smooth > 1) BoxBlur(src, std::min(4, smooth / 3));
+    for (int y = roi.y; y < roi.y + roi.h; ++y) {
+        for (int x = roi.x; x < roi.x + roi.w; ++x) {
+            if (!SelectionAllows(sel, x, y)) continue;
+            // Sobel 幅度（用亮度）
+            auto at = [&](int xx, int yy) {
+                return Luma(SampleClamp(src, xx, yy)) / (255.0f * sc);
+            };
+            const float gx = -at(x - width, y - width) + at(x + width, y - width) +
+                             -2.0f * at(x - width, y) + 2.0f * at(x + width, y) +
+                             -at(x - width, y + width) + at(x + width, y + width);
+            const float gy = -at(x - width, y - width) - 2.0f * at(x, y - width) -
+                             at(x + width, y - width) + at(x - width, y + width) +
+                             2.0f * at(x, y + width) + at(x + width, y + width);
+            const float mag = std::min(1.0f, std::sqrt(gx * gx + gy * gy));
+            // 照亮边缘：边缘亮、其余暗（PS 的观感）
+            const float v = mag * (0.4f + bright) * 255.0f * sc;
+            RGBA o;
+            o.r = ClampCh(v * 1.0f, maxV);
+            o.g = ClampCh(v * 1.0f, maxV);
+            o.b = ClampCh(v * 1.0f, maxV);
+            RGBA c;
+            img.GetPixel(x, y, c);
+            o.a = c.a;
+            img.SetPixel(x, y, o);
+        }
+    }
+    return true;
+}
+
+// 总分派：已实现 Distort 3 + Texture 6 + Stylize 1 = 10 个
 inline bool GalleryApplyAll(const char* key, ImageBuffer& img,
                             const Selection* sel, const GalleryFilterBase& f) {
-    return GalleryApplyDistort(key, img, sel, f);
+    if (GalleryApplyDistort(key, img, sel, f)) return true;
+    if (GalleryApplyTexture(key, img, sel, f)) return true;
+    if (GalleryApplyStylize(key, img, sel, f)) return true;
+    return false; // 未实现（UI 应标灰 / Execute 会记日志）
 }
 
 } // namespace sai2::fg

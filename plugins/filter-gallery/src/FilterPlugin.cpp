@@ -110,7 +110,15 @@ public:
         host_->SnapshotForUndo("Filter Gallery");
 
         const Selection* sel = host_->GetSelection();
-        f->Apply(*canvas, sel);
+        if (!f->Apply(*canvas, sel)) {
+            // 未实现的滤镜（移植中）必须**明确失败**：否则界面显示"已应用"
+            // 而画面毫无变化，用户会以为是 bug。写清 id 并退出撤销组。
+            host_->Log(LogLevel::Warning,
+                       ("filter not implemented yet: " +
+                        std::string(f->GetInfo().id)).c_str());
+            host_->EndUndoGroup();
+            return false;
+        }
 
         host_->Log(LogLevel::Info,
                    ("applied filter: " + std::string(f->GetInfo().id)).c_str());

@@ -162,7 +162,10 @@ bool TestGallerySpecs() {
                 }
             return n;
         };
-        const char* impl[] = {"oceanRipple", "glass", "diffuseGlow"};
+        const char* impl[] = {"oceanRipple", "glass", "diffuseGlow",
+                              "mosaicTiles", "patchwork", "stainedGlass",
+                              "craquelure", "grain", "texturizer",
+                              "glowingEdges"};
         for (const char* want : impl) {
             const GallerySpec* sp = nullptr;
             for (int i = 0; i < count; ++i)
@@ -200,7 +203,7 @@ bool TestGallerySpecs() {
     std::cout << "  47 条规格 / 6 分类  OK；参数 " << totalParams << " 个"
               << "（range " << rangeCount << ", choice " << choiceCount
               << ", bool " << boolCount << "），跳过 json " << totalSkippedJson
-              << " 个；Distort 3 个算法已实现\n";
+              << " 个；已实现算法 10 个（Distort 3 + Texture 6 + Stylize 1）\n";
     return true;
 }
 
