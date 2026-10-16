@@ -2335,17 +2335,14 @@ void DoGrabFromClipboard(UiWindow& win) {
     g_grabKeepCtx = false;
     if (!keepCtx) s.core->SetCanvasContext(false, 0, 0, 0, 0);
     if (s.core->GrabFromClipboard(err)) {
-        // 走「监听剪贴板」这条路时从来没有定位过画布：于是没有画布尺寸 →
-        // 不补边 → 窗口里只显示图层包围盒（用户看到整幅画布显示又没了），
-        // 即使应用时会补定位、回贴仍然正确。这里补一次定位让显示也一致。
-        if (!s.core->HasCanvasContext()) {
-            CanvasCtxResult ctx;
-            std::string diag;
-            if (AcquireCanvasContext(ctx, diag))
-                s.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0);
-            else
-                s.core->Log("grab: canvas locate failed (" + diag + ")");
-        }
+        // ★ 这里**不能**再去"补定位"：AcquireCanvasContext 会给 SAI2 再发一次
+        //   Ctrl+A/Ctrl+C，而它定位的是 SAI2 **当前选中**的层 —— 如果用户复制
+        //   的那一层不是当前层，就会拿到错误的画布偏移 → 补边位置错 → 又错位
+        //   （实测踩坑）。定位只在两条安全路径做：
+        //     1) 抓取流程第 4 步（它本来就会重新选中并复制该层）
+        //     2) 应用前（DoApplyFlow，同样会重新选中该层）
+        //   所以这里只保留"如果已经有画布上下文就补边"（由 SetImage→
+        //   PadBaseToCanvas 完成），不再主动发输入。
         s.flash.clear();
         OnImageAcquired();
     } else {
