@@ -82,17 +82,17 @@ bool TestGalleryQuality() {
         const bool blkOK = (r.blk > 0.75);
         if (noEff) ++noEffect;
         if (blkOK) ++mostlyBlack;
-        if (noEff || blkOK)
-            std::cout << "    [!] " << r.key << "  mean=" << r.mean
-                      << "  black=" << (r.blk * 100) << "%\n";
+        std::cout << (noEff || blkOK ? "    [!] " : "        ") << r.key
+                  << "  mean=" << r.mean << "  black=" << (r.blk * 100) << "%\n";
     }
     std::cout << "  几乎无变化: " << noEffect << " 个；大部分变黑: " << mostlyBlack
               << " 个；全黑: " << hardBlack << " 个\n";
 
-    // 先**只报告**不硬失败：当前已知 8 个待修（全黑 2~3 个、几乎无变化 2 个）。
-    // 等这批修完再打开硬失败（整块变黑 = 用户可见的明显缺陷）：
-    //     CHECK(hardBlack == 0);
-    (void)hardBlack;
+    // 常驻回归：整块变黑与"几乎无效果"都必须为 0。
+    // （修完阈值族偏黑 + posterEdges/watercolor 的整数除法 + sponge/craquelure
+    //   幅度之后，47 个全部通过。）
+    CHECK(hardBlack == 0);
+    CHECK(noEffect == 0);
     return true;
 }
 

@@ -429,7 +429,9 @@ inline bool GalleryApplyTexture(const char* key, ImageBuffer& img,
                 if (!onCrack) continue;
                 RGBA c;
                 img.GetPixel(x, y, c);
-                const float d = (depth * 70.0f - bright * 55.0f) * sc;
+                // 原来 depth/bright 的默认值(0.6/0.9)几乎抵消 → 幅度≈1，看不见；
+                // 改为只让"裂缝亮度"起正向作用、深度走负向，并放大系数
+                const float d = (bright * 90.0f - depth * 40.0f + 20.0f) * sc;
                 c.r = ClampCh(c.r - d, maxV);
                 c.g = ClampCh(c.g - d, maxV);
                 c.b = ClampCh(c.b - d, maxV);
@@ -638,8 +640,9 @@ inline bool GalleryApplySketch(const char* key, ImageBuffer& img,
                 const float frac = phase - std::floor(phase);
                 const float lum = luma01(img, x, y);
                 // 暗 → 线更粗；亮 → 线更细甚至断
+                // 阈值族普遍偏黑：线宽系数从 1.4 降到 0.55（只有明确暗部才落墨）
                 const float width = std::min(0.95f,
-                    (1.0f - lum) * (0.35f + balance) * 1.4f);
+                    (1.0f - lum) * (0.35f + balance) * 0.55f);
                 RGBA c;
                 img.GetPixel(x, y, c);
                 setGray(x, y, frac < width ? 0.0f : 1.0f, c.a);
@@ -671,7 +674,7 @@ inline bool GalleryApplySketch(const char* key, ImageBuffer& img,
                     const float r = (type == 1) ? std::sqrt(dx * dx + dy * dy)
                                                 : std::max(std::fabs(dx), std::fabs(dy));
                     const float rad = (1.0f - lum) * (cell * 0.5f) *
-                                      (0.6f + contrast);
+                                      (0.25f + contrast * 0.5f);
                     ink = (r < rad) ? 0.0f : 1.0f;
                 }
                 RGBA c;
@@ -705,10 +708,11 @@ inline bool GalleryApplySketch(const char* key, ImageBuffer& img,
                     lum = std::min(1.0f, std::max(0.0f, lum + (lum - hi) * 1.5f));
                 }
                 float thr = 0.5f;
-                if (isCopy) thr = 0.45f + (1.0f - darkness) * 0.25f;
-                else if (isStamp) thr = 0.25f + balance * 0.5f;
-                else if (isTorn) thr = 0.2f + balance * 0.6f;
-                else thr = 0.5f; // reticulation 走密度
+                // 阈值族：把阈值整体压低（原来 ~0.45-0.85，中暗图会大片落墨）
+                if (isCopy) thr = 0.12f + (1.0f - darkness) * 0.18f;
+                else if (isStamp) thr = 0.10f + balance * 0.22f;
+                else if (isTorn) thr = 0.08f + balance * 0.26f;
+                else thr = 0.18f; // reticulation 走密度
                 float v = (lum < thr) ? 0.0f : 1.0f;
                 if (isTorn) {
                     // 撕边：阈值附近用噪声抖动出粗糙边缘

@@ -127,7 +127,8 @@ inline bool GalleryApplyArtistic(const char* key, ImageBuffer& img,
                 img.GetPixel(x, y, c);
                 src.GetPixel(x, y, s2);
                 const float hole = Hash01(x / cell, y / cell, 79u);
-                const float w = (hole < (0.25f + def)) ? 1.0f : (1.0f - def) * 0.5f;
+                // 拉开对比：原来孔洞与模糊图差异太小 → 几乎看不出效果（实测 mean≈0.94）
+                const float w = (hole < (0.30f + def * 0.7f)) ? 1.0f : (0.15f - def * 0.1f);
                 RGBA o;
                 o.r = ClampCh(c.r * w + s2.r * (1 - w), maxV);
                 o.g = ClampCh(c.g * w + s2.g * (1 - w), maxV);
@@ -188,9 +189,11 @@ inline bool GalleryApplyArtistic(const char* key, ImageBuffer& img,
                     std::min(1.0f, std::sqrt(gx * gx + gy * gy)) *
                     (0.5f + eInten) * 255.0f * sc;
                 RGBA o;
-                o.r = ClampCh(post(c.r / maxV, levels) * maxV - dark, maxV);
-                o.g = ClampCh(post(c.g / maxV, levels) * maxV - dark, maxV);
-                o.b = ClampCh(post(c.b / maxV, levels) * maxV - dark, maxV);
+                // ★ 必须浮点除：c.r 是 uint16_t、maxV 是 uint32_t，写成 c.r/maxV 是
+                //   整数除法 → 恒为 0 → 整幅变黑（实测 posterEdges/watercolor 100% 黑）
+                o.r = ClampCh(post(static_cast<float>(c.r) / maxV, levels) * maxV - dark, maxV);
+                o.g = ClampCh(post(static_cast<float>(c.g) / maxV, levels) * maxV - dark, maxV);
+                o.b = ClampCh(post(static_cast<float>(c.b) / maxV, levels) * maxV - dark, maxV);
                 o.a = c.a;
                 img.SetPixel(x, y, o);
             }

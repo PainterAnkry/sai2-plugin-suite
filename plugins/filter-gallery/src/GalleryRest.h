@@ -254,9 +254,10 @@ inline bool GalleryApplyRest(const char* key, ImageBuffer& img,
                 src.GetPixel(x, y, s2);
                 const float q = 3.0f + detail / 2.0f;
                 RGBA o;
-                o.r = ClampCh(post(s2.r / maxV, static_cast<int>(q)) * maxV, maxV);
-                o.g = ClampCh(post(s2.g / maxV, static_cast<int>(q)) * maxV, maxV);
-                o.b = ClampCh(post(s2.b / maxV, static_cast<int>(q)) * maxV, maxV);
+                // 同 posterEdges：必须浮点除，否则恒为 0 → 整幅变黑
+                o.r = ClampCh(post(static_cast<float>(s2.r) / maxV, static_cast<int>(q)) * maxV, maxV);
+                o.g = ClampCh(post(static_cast<float>(s2.g) / maxV, static_cast<int>(q)) * maxV, maxV);
+                o.b = ClampCh(post(static_cast<float>(s2.b) / maxV, static_cast<int>(q)) * maxV, maxV);
                 // 暗部沉淀：亮度低的区域再压暗
                 const float lum = Luma(o) / (255.0f * sc);
                 const float dark = std::max(0.0f, 0.55f - lum) * shadow * 160.0f * sc;
@@ -424,7 +425,7 @@ inline bool GalleryApplyRest(const char* key, ImageBuffer& img,
         const float contr = static_cast<float>(f.Pi("contrast")) / 40.0f;
         ImageBuffer src = img.Clone();
         BoxBlur(src, std::max(1, wdt / 4), 1);
-        const float thr = 0.45f + press * 0.25f;
+        const float thr = 0.12f + press * 0.20f;   // 阈值族：压低（原来中暗图全黑）
         for (int y = roi.y; y < roi.y + roi.h; ++y)
             for (int x = roi.x; x < roi.x + roi.w; ++x) {
                 if (!SelectionAllows(sel, x, y)) continue;
