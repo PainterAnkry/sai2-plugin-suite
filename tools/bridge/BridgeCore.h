@@ -154,6 +154,10 @@ public:
     // 画布 (0,0) 对齐，补边后内容正好落回原位置，不再依赖 Ctrl+Shift+V。
     void SetCanvasContext(bool has, int canvasW, int canvasH, int offX,
                           int offY);
+    // 把 original_/applied_ 补边成**整幅画布**（已知画布上下文时），
+    // 维持"图 = 画布坐标"的不变量 —— 所有功能窗口因此以画布为编辑面，
+    // 用户才能把内容液化/模糊到图层包围盒之外（SAI2 的 Ctrl+C 只给包围盒）。
+    void PadBaseToCanvas();
     bool HasCanvasContext() const { return hasCanvasCtx_; }
     int CanvasW() const { return canvasW_; }
     int CanvasH() const { return canvasH_; }

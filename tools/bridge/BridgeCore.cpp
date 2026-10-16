@@ -273,6 +273,10 @@ void BridgeCore::SetImage(ImageBuffer img, const std::string& sourceLabel) {
     thumbDone_.assign(effects_.size(), false);
     thumbSource_ = ImageBuffer();
 
+    // ★ 保持"图 = 画布坐标"：已知画布上下文时立即补边成整幅画布。
+    // 必须在下面重建预览之前调用，否则窗口会以包围盒尺寸建会话。
+    PadBaseToCanvas();
+
     // 打开中的功能窗口全部重建会话（旧基准已过期）
     for (int w = 1; w < kWinCount; ++w)
         if (wins_[static_cast<size_t>(w)].open) OpenWindow(w);
@@ -573,6 +577,16 @@ void BridgeCore::SetCanvasContext(bool has, int canvasW, int canvasH,
     } else {
         Log("canvas ctx: none");
     }
+    // 抓到图层后紧接着就会走到这里（先 SetImage 再 SetCanvasContext），
+    // 此时把基准补边成整幅画布并重建预览，窗口立刻以画布取景。
+    PadBaseToCanvas();
+    if (hasCanvasCtx_ && original_.IsValid() &&
+        original_.Width() == canvasW_ && original_.Height() == canvasH_) {
+        for (int w = 0; w < kWinCount; ++w)
+            if (w == kWinMain || wins_[static_cast<size_t>(w)].open)
+                RebuildPreviewSource(w);
+        UpdatePreview(kWinMain);
+    }
 }
 
 // 把 img 摆到画布 (x0,y0) 并补边成 cw x ch（越界裁掉）。
@@ -605,6 +619,24 @@ static ImageBuffer PadImageAt(const ImageBuffer& img, int cw, int ch, int x0,
                     static_cast<size_t>(copy) * 4);
     }
     return out;
+}
+
+void BridgeCore::PadBaseToCanvas() {
+    if (!hasCanvasCtx_ || !original_.IsValid()) return;
+    if (original_.Width() == canvasW_ && original_.Height() == canvasH_) {
+        canvasX0_ = 0;   // 已经是画布坐标：偏移恒为零
+        canvasY0_ = 0;
+        return;
+    }
+    const int ox = canvasX0_, oy = canvasY0_;
+    original_ = PadImageAt(original_, canvasW_, canvasH_, ox, oy);
+    if (applied_.IsValid())
+        applied_ = PadImageAt(applied_, canvasW_, canvasH_, ox, oy);
+    canvasX0_ = 0;
+    canvasY0_ = 0;
+    Log("base padded to canvas " + std::to_string(canvasW_) + "x" +
+        std::to_string(canvasH_) + " (was at " + std::to_string(ox) + "," +
+        std::to_string(oy) + ")");
 }
 
 ImageBuffer BridgeCore::PadToCanvas(const ImageBuffer& img) const {

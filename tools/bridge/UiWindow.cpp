@@ -77,7 +77,7 @@ void GrabSubtitleHead(wchar_t* out, size_t n, const ImageBuffer& img) {
     const int h = img.IsValid() ? img.Height() : 0;
     const wchar_t* state = s.core->HasImage() ? L"已抓取图层" : L"等待抓取";
     if (s.core->HasCanvasContext()) {
-        swprintf(out, n, L"%s   %d x %d  →  画布 %d x %d（应用时补边）", state,
+        swprintf(out, n, L"%s   %d x %d  →  画布 %d x %d（整幅画布）", state,
                  w, h, s.core->CanvasW(), s.core->CanvasH());
     } else {
         swprintf(out, n, L"%s   %d x %d  ⚠ 无画布尺寸：粘贴会错位", state, w, h);
@@ -445,7 +445,7 @@ void GrabSubtitleHead(wchar_t* out, size_t n, const ImageBuffer& img) {
     const int h = img.IsValid() ? img.Height() : 0;
     const wchar_t* state = s.core->HasImage() ? L"已抓取图层" : L"等待抓取";
     if (s.core->HasCanvasContext()) {
-        swprintf(out, n, L"%s   %d x %d  →  画布 %d x %d（应用时补边）", state,
+        swprintf(out, n, L"%s   %d x %d  →  画布 %d x %d（整幅画布）", state,
                  w, h, s.core->CanvasW(), s.core->CanvasH());
     } else {
         swprintf(out, n, L"%s   %d x %d  ⚠ 无画布尺寸：粘贴会错位", state, w, h);

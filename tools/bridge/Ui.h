@@ -254,7 +254,7 @@ void UiMouseLeave(UiWindow& win, HWND hwnd);
 // 后者是"引擎里最后碰过的那个效果"，多窗口同时开着时会张冠李戴。
 int WindowEffectIndex(const UiWindow& win);
 
-// 功能窗口副标题前半段："已抓取图层 W x H → 画布 CW x CH（应用时补边）"。
+// 功能窗口副标题前半段："已抓取图层 W x H → 画布 CW x CH（整幅画布）"。
 // 抓取到的是 SAI2 给的**图层包围盒**，补边到画布尺寸发生在"应用"时；
 // 两者并排显示可以避免"画布大小和截取大小不一致 = bug"的误解；
 // 拿不到画布尺寸时直接给"粘贴会错位"的警告。
