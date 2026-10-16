@@ -3,6 +3,7 @@
 // 滤镜库规格表 + 参数记法解析器（插件侧 header-only）：界面的滤镜清单直接
 // 来自插件真正支持的集合，避免维护第二份手写清单（曾经因此看不到新滤镜）。
 #include "../../plugins/filter-gallery/src/GalleryParams.h"
+#include "../../plugins/filter-gallery/src/GalleryNamesZh.h"
 #include "../../plugins/filter-gallery/src/GallerySpecs.h"
 // ============================================================================
 // Effects.h - 面板效果清单与参数模型（伴随宿主）
@@ -125,7 +126,11 @@ inline std::vector<EffectDef> BuildEffects() {
         for (int i = 0; i < specCount; ++i) {
             strs.push_back(std::string("filter.gallery.") + specs[i].key);
             const char* eid = strs.back().c_str();
-            strs.push_back(std::string(specs[i].name) + " · " + specs[i].category);
+            // 中文名（Photoshop 官方译名）+ 中文分类；没有译名时回退英文名，
+            // 保证列表里不会出现空白项。
+            strs.push_back(sai2::fg::GalleryDisplayNameZh(specs[i].key,
+                                                    specs[i].name,
+                                                    specs[i].category));
             const char* ename = strs.back().c_str();
             strs.push_back(std::string("com.sai2.filter.gallery.") + specs[i].key);
             const char* efid = strs.back().c_str();
