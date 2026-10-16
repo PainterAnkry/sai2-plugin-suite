@@ -7,6 +7,7 @@
 // ============================================================================
 
 #include "FilterSet.h"
+#include "GallerySpecs.h"  // 47 个 Photoshop 滤镜的规格表（自动生成）
 #include "Filters.h"
 #include "sai2/IHostContext.h"
 #include "sai2/IPlugin.h"
