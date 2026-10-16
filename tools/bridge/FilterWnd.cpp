@@ -121,6 +121,28 @@ void DrawGallery(HDC dc, UiWindow& win, const RECT& box,
                     dst[xx * 4 + 3] = a;
                 }
             }
+            // ★ 透明底用**棋盘格**合成后再贴。
+            //   StretchDIBits + SRCCOPY 会忽略 alpha：透明处的 RGB（通常是 0）
+            //   直接显示成黑色，缩略图就"看不清"（用户反馈"黑底看不清"）。
+            //   这里按 alpha 把缩略图合到棋盘底上，再把 alpha 置满，
+            //   贴图结果就和主预览的透明底一致。
+            {
+                const int cell = 6;             // 棋盘格边长（缩略图很小，6px 够）
+                const int c1 = 0xFF, c2 = 0xCC; // 两种浅灰
+                for (int yy = 0; yy < h; ++yy) {
+                    for (int xx = 0; xx < w; ++xx) {
+                        const int o = xx * 4;       // dst 是 BGRA
+                        const int bg = (((xx / cell) + (yy / cell)) & 1) ? c1 : c2;
+                        const int a8 = dst[o + 3];
+                        for (int k = 0; k < 3; ++k) {
+                            const int v = dst[o + k];
+                            dst[o + k] = static_cast<uint8_t>(
+                                (v * a8 + bg * (255 - a8)) / 255);
+                        }
+                        dst[o + 3] = 255;
+                    }
+                }
+            }
             const int ox = img.left + 1 + (RectW(img) - 2 - w) / 2;
             const int oy = img.top + 1 + (RectH(img) - 2 - h) / 2;
             SetStretchBltMode(dc, HALFTONE);
