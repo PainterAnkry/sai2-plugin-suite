@@ -1,4 +1,9 @@
 #pragma once
+#include <deque>
+// 滤镜库规格表 + 参数记法解析器（插件侧 header-only）：界面的滤镜清单直接
+// 来自插件真正支持的集合，避免维护第二份手写清单（曾经因此看不到新滤镜）。
+#include "../../plugins/filter-gallery/src/GalleryParams.h"
+#include "../../plugins/filter-gallery/src/GallerySpecs.h"
 // ============================================================================
 // Effects.h - 面板效果清单与参数模型（伴随宿主）
 //
@@ -85,7 +90,7 @@ inline std::vector<EffectDef> BuildEffects() {
     struct FP { const char* name; const char* label; float min; float max; float def; bool isInt; bool px; };
     struct FE { const char* id; const char* name; const char* fid; std::vector<FP> ps; };
 
-    const std::vector<FE> filters = {
+    std::vector<FE> filters = {
         {"filter.oil-paint", "油画", "com.sai2.filter.oil-paint",
          {{"radius", "笔刷半径", 1, 8, 3, true, true}, {"levels", "强度级数", 2, 64, 12, true, false}}},
         {"filter.watercolor", "水彩", "com.sai2.filter.watercolor",
@@ -107,6 +112,60 @@ inline std::vector<EffectDef> BuildEffects() {
         {"filter.find-edges", "查找边缘", "com.sai2.filter.find-edges",
          {{"invert", "反相", 0, 1, 0, true, false}}},
     };
+
+    // ---- 从插件侧规格表自动加入 Photoshop 滤镜库（47 个）------------------
+    // 踩坑：这张表原来是手写的，插件里新注册的滤镜界面里根本看不到（移植了
+    // 18 个，界面里还是老 10 个）。现在读插件侧的规格表 + 参数记法解析器
+    // （都是 header-only），保证插件能执行的，界面一定列得出来。
+    // 文本用 deque 存：FE/FP 只保存 const char*，deque 地址稳定不会失效。
+    {
+        static std::deque<std::string> strs;
+        int specCount = 0;
+        const sai2::fg::GallerySpec* specs = sai2::fg::GallerySpecs(specCount);
+        for (int i = 0; i < specCount; ++i) {
+            strs.push_back(std::string("filter.gallery.") + specs[i].key);
+            const char* eid = strs.back().c_str();
+            strs.push_back(std::string(specs[i].name) + " · " + specs[i].category);
+            const char* ename = strs.back().c_str();
+            strs.push_back(std::string("com.sai2.filter.gallery.") + specs[i].key);
+            const char* efid = strs.back().c_str();
+            FE e{eid, ename, efid, {}};
+            const std::vector<sai2::fg::GalleryParamSpec> ps =
+                sai2::fg::ParseGalleryParams(specs[i].params);
+            for (const auto& p : ps) {
+                strs.push_back(p.key);
+                const char* pname = strs.back().c_str();
+                std::string lab = p.key;
+                if (!p.choices.empty()) {
+                    lab += "(";
+                    for (size_t c = 0; c < p.choices.size(); ++c) {
+                        if (c) lab += " ";
+                        lab += std::to_string(c) + "=" + p.choices[c];
+                    }
+                    lab += ")";
+                }
+                strs.push_back(lab);
+                const char* plabel = strs.back().c_str();
+                float lo = p.min, hi = p.max, de = p.def;
+                bool isInt = p.isInt;
+                if (!p.choices.empty()) {
+                    lo = 0.0f;
+                    hi = static_cast<float>(p.choices.size() - 1);
+                    de = 0.0f;
+                    isInt = true;
+                } else if (p.kind == sai2::fg::GalleryParamSpec::Bool) {
+                    lo = 0.0f; hi = 1.0f; de = 0.0f; isInt = true;
+                }
+                const bool px = (lab.find("Size") != std::string::npos ||
+                                 lab.find("Width") != std::string::npos ||
+                                 lab.find("Length") != std::string::npos ||
+                                 lab.find("Radius") != std::string::npos ||
+                                 lab.find("Spacing") != std::string::npos);
+                e.ps.push_back(FP{pname, plabel, lo, hi, de, isInt, px});
+            }
+            filters.push_back(std::move(e));
+        }
+    }
 
     for (const FE& f : filters) {
         EffectDef e;

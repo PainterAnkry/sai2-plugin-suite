@@ -2335,6 +2335,17 @@ void DoGrabFromClipboard(UiWindow& win) {
     g_grabKeepCtx = false;
     if (!keepCtx) s.core->SetCanvasContext(false, 0, 0, 0, 0);
     if (s.core->GrabFromClipboard(err)) {
+        // 走「监听剪贴板」这条路时从来没有定位过画布：于是没有画布尺寸 →
+        // 不补边 → 窗口里只显示图层包围盒（用户看到整幅画布显示又没了），
+        // 即使应用时会补定位、回贴仍然正确。这里补一次定位让显示也一致。
+        if (!s.core->HasCanvasContext()) {
+            CanvasCtxResult ctx;
+            std::string diag;
+            if (AcquireCanvasContext(ctx, diag))
+                s.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0);
+            else
+                s.core->Log("grab: canvas locate failed (" + diag + ")");
+        }
         s.flash.clear();
         OnImageAcquired();
     } else {
