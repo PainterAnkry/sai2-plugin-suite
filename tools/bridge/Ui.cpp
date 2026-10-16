@@ -504,6 +504,12 @@ void DrawCanvas(HDC dc, UiWindow& win, bool allowStroke, bool zoomButtons) {
     bi.bmiHeader.biCompression = BI_RGB;
 
     // 整幅图像等比画到目标矩形（信箱式：比例永与 SAI2 画布一致，不拉伸不裁切）
+    // ★ 裁剪到画布框：不裁剪的话，放大后 StretchDIBits 会把图像**画到左右
+    //   参数栏上面**（用户实测："滚轮放大图像都盖住左右边栏了"）。所有功能
+    //   窗口共用这里，所以几个窗口都会犯同一个毛病。笔刷指示圈一并裁剪。
+    const int savedDc = SaveDC(dc);
+    IntersectClipRect(dc, box.left + 1, box.top + 1, box.right - 1,
+                      box.bottom - 1);
     const int saved = SetStretchBltMode(dc, HALFTONE);
     SetBrushOrgEx(dc, 0, 0, nullptr);
     StretchDIBits(dc, v.dx, v.dy, v.dw, v.dh, 0, 0, img.Width(), img.Height(),
@@ -530,6 +536,8 @@ void DrawCanvas(HDC dc, UiWindow& win, bool allowStroke, bool zoomButtons) {
         SelectObject(dc, oldPen);
         DeleteObject(pen);
     }
+
+    RestoreDC(dc, savedDc);   // 结束"画布框内"裁剪，信息条与缩放控件照常绘制
 
     // 信息条 + 缩放控制（放大镜滑杆 + 100% + 适配）
     {
