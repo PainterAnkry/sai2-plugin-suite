@@ -45,8 +45,12 @@ public:
         {
             int n = 0;
             const GallerySpec* specs = GallerySpecs(n);
+            // ★ 必须注册**规格表里的全部**滤镜：桥的界面是从同一张规格表生成的
+            //   （47 项都在列表里），插件这边只注册一部分的话，界面上能选到、
+            //   插件却不认识该 id → 回退成默认滤镜（find-edges）→ 用户看到
+            //   "几乎全部都是黑色剪影"（实测踩坑，日志里就是
+            //   "未知滤镜 id，回退默认: com.sai2.filter.gallery.xxx"）。
             for (int i = 0; i < n; ++i) {
-                if (std::string(specs[i].category) != "Distort") continue;
                 registry_.AddOwned(
                     std::make_unique<GalleryFilterBase>(specs[i], GalleryApplyAll));
             }
@@ -68,7 +72,7 @@ public:
     bool Initialize(IHostContext* host) override {
         if (!host) return false;
         host_ = host;
-        host_->Log(LogLevel::Info, "FilterGalleryPlugin initialized (gallery specs + legacy)");
+        host_->Log(LogLevel::Info, ("FilterGalleryPlugin initialized: legacy 10 + gallery " + std::to_string(registry_.Count() - 10) + " filters").c_str());
         return true;
     }
 
