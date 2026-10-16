@@ -123,23 +123,27 @@ void DrawGallery(HDC dc, UiWindow& win, const RECT& box,
             }
             // ★ 透明底用**棋盘格**合成后再贴。
             //   StretchDIBits + SRCCOPY 会忽略 alpha：透明处的 RGB（通常是 0）
-            //   直接显示成黑色，缩略图就"看不清"（用户反馈"黑底看不清"）。
-            //   这里按 alpha 把缩略图合到棋盘底上，再把 alpha 置满，
-            //   贴图结果就和主预览的透明底一致。
+            //   会显示成黑色 → 缩略图看不清（用户反馈"黑底看不清"）。
+            //   注意遍历的是**缓冲区尺寸** small.Width()/Height()，不是下面
+            //   用于贴图的绘制尺寸 w/h（w/h 可能小于缓冲区）。
             {
-                const int cell = 6;             // 棋盘格边长（缩略图很小，6px 够）
+                const int cell = 6;             // 棋盘格边长（缩略图小，6px 够）
                 const int c1 = 0xFF, c2 = 0xCC; // 两种浅灰
-                for (int yy = 0; yy < h; ++yy) {
-                    for (int xx = 0; xx < w; ++xx) {
-                        const int o = xx * 4;       // dst 是 BGRA
-                        const int bg = (((xx / cell) + (yy / cell)) & 1) ? c1 : c2;
-                        const int a8 = dst[o + 3];
+                const int bw = small.Width(), bh = small.Height();
+                for (int yy = 0; yy < bh; ++yy) {
+                    uint8_t* row =
+                        px.data() + static_cast<size_t>(yy) * bw * 4;
+                    for (int xx = 0; xx < bw; ++xx) {
+                        const int o = xx * 4;   // 缓冲区布局：BGRA
+                        const int bg =
+                            (((xx / cell) + (yy / cell)) & 1) ? c1 : c2;
+                        const int a8 = row[o + 3];
                         for (int k = 0; k < 3; ++k) {
-                            const int v = dst[o + k];
-                            dst[o + k] = static_cast<uint8_t>(
+                            const int v = row[o + k];
+                            row[o + k] = static_cast<uint8_t>(
                                 (v * a8 + bg * (255 - a8)) / 255);
                         }
-                        dst[o + 3] = 255;
+                        row[o + 3] = 255;
                     }
                 }
             }
