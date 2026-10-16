@@ -44,6 +44,8 @@ inline const GalleryParamNameZhEntry* GalleryParamNameZhTable(int& count) {
         {"rippleSize", "波纹大小"}, {"rippleMagnitude", "波纹幅度"},
         {"charcoalArea", "炭笔区域"}, {"chalkArea", "粉笔区域"},
         {"tileSize_x", "拼贴大小"}, {"invert", "反相"},
+        {"darkness", "暗度"}, {"edgeBrightness", "边缘亮度"},
+        {"strokeDetail", "描边细节"},
         // 枚举
         {"texture", "纹理"}, {"brushType", "画笔类型"}, {"light", "光照方向"},
         {"strokeDirection", "描边方向"}, {"patternType", "图案类型"},
