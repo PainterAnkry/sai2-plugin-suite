@@ -176,7 +176,14 @@ bool TestGallerySpecs() {
                               "roughPastels",
                               // Sketch 第二批
                               "chalkCharcoal", "charcoal", "chrome",
-                              "conteCrayon", "notePaper", "plaster"};
+                              "conteCrayon", "notePaper", "plaster",
+                              // Artistic 后 8 + Brush Strokes 8
+                              "coloredPencil", "cutout", "neonGlow",
+                              "paintDaubs", "paletteKnife", "smudgeStick",
+                              "underpainting", "watercolor",
+                              "accentedEdges", "angledStrokes", "crosshatch",
+                              "darkStrokes", "inkOutlines", "spatter",
+                              "sprayedStrokes", "sumiE"};
         for (const char* want : impl) {
             const GallerySpec* sp = nullptr;
             for (int i = 0; i < count; ++i)
@@ -197,9 +204,11 @@ bool TestGallerySpecs() {
         for (int i = 0; i < count; ++i)
             if (std::string(specs[i].key) == "cutout") cut = &specs[i];
         CHECK(cut != nullptr);
-        GalleryFilterBase notImpl(*cut, GalleryApplyAll);
+        GalleryFilterBase implCut(*cut, GalleryApplyAll);
         ImageBuffer c2 = base.Clone();
-        CHECK(!notImpl.Apply(c2, nullptr));
+        // 47 个全部实现之后，用**假 key** 验证"未知滤镜必须返回 false"这条契约
+        // （原来这里断言 cutout 未实现，移植完成后该断言自然过期 —— 测试抓到了）
+        CHECK(!GalleryApplyAll("__not_a_filter__", c2, nullptr, implCut));
 
         // 规格表驱动的滤镜：id/显示名/分类/参数都来自规格表
         const GallerySpec* gl = nullptr;
@@ -214,7 +223,7 @@ bool TestGallerySpecs() {
     std::cout << "  47 条规格 / 6 分类  OK；参数 " << totalParams << " 个"
               << "（range " << rangeCount << ", choice " << choiceCount
               << ", bool " << boolCount << "），跳过 json " << totalSkippedJson
-              << " 个；已实现算法 31 个（Distort 3 + Texture 6 + Stylize 1 + Sketch 14 + Artistic 7）\n";
+              << " 个；已实现算法 47 个（全部：Distort 3 + Texture 6 + Stylize 1 + Sketch 14 + Artistic 15 + Brush Strokes 8）\n";
     return true;
 }
 

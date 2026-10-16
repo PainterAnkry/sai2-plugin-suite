@@ -33,6 +33,11 @@ inline bool GalleryKeyImplemented(const char* key) {
         // Sketch 第二批（6）
         "chalkCharcoal", "charcoal", "chrome", "conteCrayon", "notePaper",
         "plaster",
+        // Artistic 后 8 + Brush Strokes 8
+        "coloredPencil", "cutout", "neonGlow", "paintDaubs", "paletteKnife",
+        "smudgeStick", "underpainting", "watercolor", "accentedEdges",
+        "angledStrokes", "crosshatch", "darkStrokes", "inkOutlines",
+        "spatter", "sprayedStrokes", "sumiE",
     };
     if (!key) return false;
     for (const char* k : kDone)
@@ -48,7 +53,11 @@ inline int GalleryImplementedCount() {
         "tornEdges", "reticulation", "waterPaper", "dryBrush",
         "fresco", "filmGrain", "sponge", "plasticWrap", "posterEdges",
         "roughPastels", "chalkCharcoal", "charcoal", "chrome",
-        "conteCrayon", "notePaper", "plaster"};
+        "conteCrayon", "notePaper", "plaster",
+        "coloredPencil", "cutout", "neonGlow", "paintDaubs", "paletteKnife",
+        "smudgeStick", "underpainting", "watercolor", "accentedEdges",
+        "angledStrokes", "crosshatch", "darkStrokes", "inkOutlines",
+        "spatter", "sprayedStrokes", "sumiE"};
     return static_cast<int>(sizeof(kDone) / sizeof(kDone[0]));
 }
 
