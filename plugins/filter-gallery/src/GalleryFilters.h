@@ -15,9 +15,11 @@
 
 #include "FilterBase.h"
 #include "Filters.h"
+#include "GalleryImplemented.h"
 #include "GalleryParams.h"
 #include "GallerySpecs.h"
 
+#include <cstring>
 #include <deque>
 #include <string>
 #include <vector>
@@ -741,6 +743,7 @@ inline bool GalleryApplySketch(const char* key, ImageBuffer& img,
 
     return false;
 }
+
 // 总分派：已实现 Distort 3 + Texture 6 + Stylize 1 = 10 个
 inline bool GalleryApplyAll(const char* key, ImageBuffer& img,
                             const Selection* sel, const GalleryFilterBase& f) {

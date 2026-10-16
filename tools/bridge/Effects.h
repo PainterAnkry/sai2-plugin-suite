@@ -3,6 +3,8 @@
 // 滤镜库规格表 + 参数记法解析器（插件侧 header-only）：界面的滤镜清单直接
 // 来自插件真正支持的集合，避免维护第二份手写清单（曾经因此看不到新滤镜）。
 #include "../../plugins/filter-gallery/src/GalleryParams.h"
+#include "../../plugins/filter-gallery/src/GalleryImplemented.h"
+#include "../../plugins/filter-gallery/src/GalleryParamNamesZh.h"
 #include "../../plugins/filter-gallery/src/GalleryNamesZh.h"
 #include "../../plugins/filter-gallery/src/GallerySpecs.h"
 // ============================================================================
@@ -128,9 +130,15 @@ inline std::vector<EffectDef> BuildEffects() {
             const char* eid = strs.back().c_str();
             // 中文名（Photoshop 官方译名）+ 中文分类；没有译名时回退英文名，
             // 保证列表里不会出现空白项。
-            strs.push_back(sai2::fg::GalleryDisplayNameZh(specs[i].key,
-                                                    specs[i].name,
-                                                    specs[i].category));
+            {
+                std::string nm = sai2::fg::GalleryDisplayNameZh(
+                    specs[i].key, specs[i].name, specs[i].category);
+                // 尚未移植的算法：名字上明确标出来。它的缩略图会是黑的（滤镜
+                // 没实现、应用直接失败），标注后就不会被误当成坏掉了。
+                if (!sai2::fg::GalleryKeyImplemented(specs[i].key))
+                    nm += "（未实现）";
+                strs.push_back(nm);
+            }
             const char* ename = strs.back().c_str();
             strs.push_back(std::string("com.sai2.filter.gallery.") + specs[i].key);
             const char* efid = strs.back().c_str();
@@ -140,7 +148,9 @@ inline std::vector<EffectDef> BuildEffects() {
             for (const auto& p : ps) {
                 strs.push_back(p.key);
                 const char* pname = strs.back().c_str();
-                std::string lab = p.key;
+                // 参数名优先用中文（查不到回退英文键名）
+                const char* pz = sai2::fg::GalleryParamNameZh(p.key.c_str());
+                std::string lab = pz ? pz : p.key;
                 if (!p.choices.empty()) {
                     lab += "(";
                     for (size_t c = 0; c < p.choices.size(); ++c) {
