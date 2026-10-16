@@ -92,6 +92,7 @@ public:
     // 当前 applied_ 补边到画布尺寸后的结果（无画布上下文时就是 applied_ 本身）。
     // 多图层一起液化时每层都要自己摆位，测/诊断也要拿到补边图，故公开。
     ImageBuffer PaddedApplied() const {
+        if (baseIsCanvas_) return applied_.Clone();   // 已补边：补边即恒等
         return hasCanvasCtx_ ? PadToCanvas(applied_) : applied_.Clone();
     }
     // 窗口当前应当绘制的图像（预览结果或已应用结果）
@@ -163,8 +164,13 @@ public:
     int CanvasH() const { return canvasH_; }
     // 基准层（抓取时那层）内容在画布内的偏移。多图层一起液化时，
     // 其余层要用 "本层偏移 − 基准层偏移" 作为置换场的采样偏移。
-    int CanvasX0() const { return canvasX0_; }
-    int CanvasY0() const { return canvasY0_; }
+    // 基准图是否**已经是画布坐标**（已补边成画布尺寸）。
+    // 补边**不清零** canvasX0_/canvasY0_ —— 那两个值描述"被抓图层在画布上的
+    // 位置"，下一次抓图还要用它；清零过一次的后果是下一层被按 (0,0) 摆进画布，
+    // 内容整体偏移（实测：偏移 351,84 的层被摆到 0,0）。
+    bool IsBaseCanvas() const { return baseIsCanvas_; }
+    int CanvasX0() const { return baseIsCanvas_ ? 0 : canvasX0_; }
+    int CanvasY0() const { return baseIsCanvas_ ? 0 : canvasY0_; }
 
     // 把任意一张"已经是画布尺寸"的图写进剪贴板（多图层逐层回贴用：
     // 每层结果由 RenderLiquifyLayerToCanvas 补边好，这里是最后一步）。
@@ -319,6 +325,7 @@ private:
 
     // 画布上下文（0 = 无；抓取自外部剪贴板/匹配失败时无效）
     bool hasCanvasCtx_ = false;
+    bool baseIsCanvas_ = false;
     int canvasW_ = 0, canvasH_ = 0, canvasX0_ = 0, canvasY0_ = 0;
 
     std::string status_;

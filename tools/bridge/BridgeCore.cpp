@@ -273,6 +273,12 @@ void BridgeCore::SetImage(ImageBuffer img, const std::string& sourceLabel) {
     thumbDone_.assign(effects_.size(), false);
     thumbSource_ = ImageBuffer();
 
+    // 新图进来：先当作"未补边的原始包围盒"，交给下面重新判定/补边。
+    // 同时**作废旧的画布上下文** —— 新图在画布上的位置未知，沿用上一次的偏移
+    // 会把它摆错（捕获路径会在紧接着的第 4 步重新定位并再补边）。
+    baseIsCanvas_ = false;
+    hasCanvasCtx_ = false;
+
     // ★ 保持"图 = 画布坐标"：已知画布上下文时立即补边成整幅画布。
     // 必须在下面重建预览之前调用，否则窗口会以包围盒尺寸建会话。
     PadBaseToCanvas();
@@ -624,22 +630,23 @@ static ImageBuffer PadImageAt(const ImageBuffer& img, int cw, int ch, int x0,
 void BridgeCore::PadBaseToCanvas() {
     if (!hasCanvasCtx_ || !original_.IsValid()) return;
     if (original_.Width() == canvasW_ && original_.Height() == canvasH_) {
-        canvasX0_ = 0;   // 已经是画布坐标：偏移恒为零
-        canvasY0_ = 0;
+        baseIsCanvas_ = true;   // 本身已是画布尺寸：按画布坐标对待
         return;
     }
     const int ox = canvasX0_, oy = canvasY0_;
     original_ = PadImageAt(original_, canvasW_, canvasH_, ox, oy);
     if (applied_.IsValid())
         applied_ = PadImageAt(applied_, canvasW_, canvasH_, ox, oy);
-    canvasX0_ = 0;
-    canvasY0_ = 0;
+    // ★ 不清零 canvasX0_/canvasY0_：它们描述"被抓图层在画布上的位置"，
+    //   下一次抓图（下一个 900x506 的包围盒）还要用它来补边。
+    baseIsCanvas_ = true;
     Log("base padded to canvas " + std::to_string(canvasW_) + "x" +
         std::to_string(canvasH_) + " (was at " + std::to_string(ox) + "," +
         std::to_string(oy) + ")");
 }
 
 ImageBuffer BridgeCore::PadToCanvas(const ImageBuffer& img) const {
+    if (baseIsCanvas_) return img.Clone();   // 已是画布坐标：补边即恒等
     return PadImageAt(img, canvasW_, canvasH_, canvasX0_, canvasY0_);
 }
 
