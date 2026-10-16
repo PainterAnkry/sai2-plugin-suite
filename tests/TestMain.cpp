@@ -12,7 +12,7 @@ int main(int argc, char** argv) {
         std::cout << "用法: sai2_tests <suite>\n"
                   << "  suites: manifest | imagebuffer | undo | hostcontext"
                   << " | blur | liquify | filter_gallery | plugin_source"
-                  << " | crypto | crypto_sign | plugin_lifecycle | liquify_shift | gallery_specs\n";
+                  << " | crypto | crypto_sign | plugin_lifecycle | liquify_shift | gallery_specs | gallery_quality\n";
         return 2;
     }
     for (int i = 2; i < argc; ++i)
@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
     else if (suite == "gallery_view") ok = sai2test::TestGalleryView();
     else if (suite == "liquify_shift") ok = sai2test::TestLiquifyShift();
 else if (suite == "gallery_specs") ok = sai2test::TestGallerySpecs();
+else if (suite == "gallery_quality") ok = sai2test::TestGalleryQuality();
     else {
         std::cout << "未知套件: " << suite << "\n";
         return 2;

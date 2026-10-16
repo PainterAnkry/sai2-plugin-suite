@@ -47,5 +47,6 @@ bool TestLiquifySession();
 bool TestGalleryView();
 bool TestLiquifyShift();
 bool TestGallerySpecs();
+bool TestGalleryQuality();
 
 } // namespace sai2test

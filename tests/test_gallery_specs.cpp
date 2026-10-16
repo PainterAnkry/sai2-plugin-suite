@@ -140,14 +140,22 @@ bool TestGallerySpecs() {
 
     // ---- 已实现算法（Distort 批）：确实改像素 + 确定性 + 未实现必须失败 ----
     {
+        // ---- 质量度量（不只是"有没有变"）：对**彩色实心图形**统计
+        // 平均色差与"变黑比例"。之前只断言"改过像素"，于是"整体变黑/几乎
+        // 没变化"这类实现缺陷能通过测试（用户实测反馈）——这里把它量出来。
         ImageBuffer base(64, 40, PixelFormat::RGBA8);
         for (int y = 0; y < 40; ++y) {
             for (int x = 0; x < 64; ++x) {
-                RGBA c;
-                c.r = static_cast<uint16_t>(x * 4);
-                c.g = static_cast<uint16_t>(y * 6);
-                c.b = static_cast<uint16_t>((x + y) * 3);
-                c.a = 255;
+                const float dx = static_cast<float>(x) - 28.0f;
+                const float dy = static_cast<float>(y) - 20.0f;
+                RGBA c{0, 0, 0, 0};
+                if (dx * dx / 400.0f + dy * dy / 144.0f < 1.0f) {
+                    // 内部有渐变与色相变化，便于看出"是否保留颜色/是否变黑"
+                    c.r = static_cast<uint16_t>(180 + x);
+                    c.g = static_cast<uint16_t>(40 + y);
+                    c.b = static_cast<uint16_t>(60 + (x + y) / 2);
+                    c.a = 255;
+                }
                 base.SetPixel(x, y, c);
             }
         }
