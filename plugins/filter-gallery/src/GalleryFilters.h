@@ -747,6 +747,9 @@ inline bool GalleryApplySketch(const char* key, ImageBuffer& img,
 // 分类算法的前置声明（定义在各自文件，本文件末尾 include 它们；
 // 这样"新增一个分类"= 新建一个文件 + 在末尾加一行 include，不必改动
 // 中间的任何代码，也就不会出现"锚点失效导致插入失败"的问题）。
+inline bool GalleryApplySketchExtra(const char* key, ImageBuffer& img,
+                                   const Selection* sel,
+                                   const GalleryFilterBase& f);
 inline bool GalleryApplyArtistic(const char* key, ImageBuffer& img,
                                  const Selection* sel,
                                  const GalleryFilterBase& f);
@@ -758,6 +761,7 @@ inline bool GalleryApplyAll(const char* key, ImageBuffer& img,
     if (GalleryApplyStylize(key, img, sel, f)) return true;
     if (GalleryApplySketch(key, img, sel, f)) return true;
     if (GalleryApplyArtistic(key, img, sel, f)) return true;
+    if (GalleryApplySketchExtra(key, img, sel, f)) return true;
     return false; // 未实现（UI 应标灰 / Execute 会记日志）
 }
 
@@ -765,3 +769,5 @@ inline bool GalleryApplyAll(const char* key, ImageBuffer& img,
 
 // 各分类算法（必须在 GalleryFilterBase / galleryfx 之后）
 #include "GalleryArtistic.h"
+
+#include "GallerySketch.h"

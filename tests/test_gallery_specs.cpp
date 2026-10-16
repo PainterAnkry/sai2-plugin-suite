@@ -173,7 +173,10 @@ bool TestGallerySpecs() {
                               // Artistic 批
                               "dryBrush", "fresco", "filmGrain",
                               "sponge", "plasticWrap", "posterEdges",
-                              "roughPastels"};
+                              "roughPastels",
+                              // Sketch 第二批
+                              "chalkCharcoal", "charcoal", "chrome",
+                              "conteCrayon", "notePaper", "plaster"};
         for (const char* want : impl) {
             const GallerySpec* sp = nullptr;
             for (int i = 0; i < count; ++i)
@@ -211,7 +214,7 @@ bool TestGallerySpecs() {
     std::cout << "  47 条规格 / 6 分类  OK；参数 " << totalParams << " 个"
               << "（range " << rangeCount << ", choice " << choiceCount
               << ", bool " << boolCount << "），跳过 json " << totalSkippedJson
-              << " 个；已实现算法 25 个（Distort 3 + Texture 6 + Stylize 1 + Sketch 8 + Artistic 7）\n";
+              << " 个；已实现算法 31 个（Distort 3 + Texture 6 + Stylize 1 + Sketch 14 + Artistic 7）\n";
     return true;
 }
 

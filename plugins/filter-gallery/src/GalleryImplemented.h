@@ -30,6 +30,9 @@ inline bool GalleryKeyImplemented(const char* key) {
         // Artistic（7）
         "dryBrush", "fresco", "filmGrain", "sponge", "plasticWrap",
         "posterEdges", "roughPastels",
+        // Sketch 第二批（6）
+        "chalkCharcoal", "charcoal", "chrome", "conteCrayon", "notePaper",
+        "plaster",
     };
     if (!key) return false;
     for (const char* k : kDone)
@@ -44,7 +47,8 @@ inline int GalleryImplementedCount() {
         "basRelief", "graphicPen", "halftonePattern", "photocopy", "stamp",
         "tornEdges", "reticulation", "waterPaper", "dryBrush",
         "fresco", "filmGrain", "sponge", "plasticWrap", "posterEdges",
-        "roughPastels"};
+        "roughPastels", "chalkCharcoal", "charcoal", "chrome",
+        "conteCrayon", "notePaper", "plaster"};
     return static_cast<int>(sizeof(kDone) / sizeof(kDone[0]));
 }
 
