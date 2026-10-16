@@ -7,6 +7,7 @@
 // ============================================================================
 
 #include "FilterSet.h"
+#include "GalleryFilters.h" // 规格表驱动的滤镜 + 已实现算法（Distort 批）
 #include "GallerySpecs.h"  // 47 个 Photoshop 滤镜的规格表（自动生成）
 #include "Filters.h"
 #include "sai2/IHostContext.h"
@@ -37,6 +38,19 @@ public:
         registry_.Add<GrainFilter>();
         registry_.Add<EmbossFilter>();
         registry_.Add<FindEdgesFilter>();
+
+        // ---- 规格表驱动的新批量（移植自 photocraft 的 Photoshop 滤镜库）----
+        // 每个滤镜的参数由参数记法自动生成，算法按 key 分派；未实现的 key
+        // 由 GalleryApplyAll 返回 false（不会被当成"静默成功"）。
+        {
+            int n = 0;
+            const GallerySpec* specs = GallerySpecs(n);
+            for (int i = 0; i < n; ++i) {
+                if (std::string(specs[i].category) != "Distort") continue;
+                registry_.AddOwned(
+                    std::make_unique<GalleryFilterBase>(specs[i], GalleryApplyAll));
+            }
+        }
     }
 
     PluginInfo GetInfo() const override {
@@ -46,7 +60,7 @@ public:
         info.version = "1.1.0";
         info.author = "SAI2 Plugin Team";
         info.type = "image-effect";
-        info.description = "Photoshop-style filter gallery: 10 filters in "
+        info.description = "Photoshop-style filter gallery: gallery filters in "
                            "Artistic / Sketch / Texture / Stylize categories.";
         return info;
     }
@@ -54,7 +68,7 @@ public:
     bool Initialize(IHostContext* host) override {
         if (!host) return false;
         host_ = host;
-        host_->Log(LogLevel::Info, "FilterGalleryPlugin initialized (10 filters)");
+        host_->Log(LogLevel::Info, "FilterGalleryPlugin initialized (gallery specs + legacy)");
         return true;
     }
 

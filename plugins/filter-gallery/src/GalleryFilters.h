@@ -1,0 +1,303 @@
+#pragma once
+// ============================================================================
+// GalleryFilters.h - 规格表驱动的通用滤镜 + 已实现的算法
+//
+// 设计：47 个 Photoshop 滤镜共用**一个**通用滤镜类 GalleryFilterBase ——
+//   id       = com.sai2.filter.gallery.<key>
+//   name/cat = 规格表里的显示名/分类
+//   参数     = 由 GalleryParams 从参数记法自动生成（Range/Choice/Bool）
+// 算法侧只写一个按 key 分派的函数 GalleryApply(key, img, sel, f)，这样新增
+// 一个滤镜 = 规格表里已有 + 在分派里加一个 case，不需要再手写包装类。
+//
+// 与老的 10 个滤镜（FilterSet.h 里手写的类）共存：它们 id 是
+// com.sai2.filter.<name>，互不冲突；等 47 个实现齐了可以再合并风格。
+// ============================================================================
+
+#include "FilterBase.h"
+#include "Filters.h"
+#include "GalleryParams.h"
+#include "GallerySpecs.h"
+
+#include <deque>
+#include <string>
+#include <vector>
+
+namespace sai2::fg {
+
+// 算法分派函数：按 key 执行；未实现时返回 false（宿主/UI 可据此标灰）
+using GalleryApplyFn = bool (*)(const char* key, ImageBuffer& img,
+                                const Selection* sel,
+                                const class GalleryFilterBase& f);
+
+// ---------------------------------------------------------------------------
+// 通用滤镜类
+// ---------------------------------------------------------------------------
+class GalleryFilterBase final : public FilterBase {
+public:
+    GalleryFilterBase(const GallerySpec& spec, GalleryApplyFn fn)
+        : spec_(spec), fn_(fn) {
+        info_.id = std::string("com.sai2.filter.gallery.") + spec.key;
+        info_.name = spec.name;
+        info_.category = spec.category;
+        info_.version = "1.2.0";
+        const std::vector<GalleryParamSpec> ps = ParseGalleryParams(spec.params);
+        // 标签用 deque 存：DefParam 只保存 const char*，deque 的地址稳定
+        for (const auto& p : ps) {
+            if (p.kind == GalleryParamSpec::Range) {
+                DefParam(p.key.c_str(), p.key.c_str(), p.def, p.min, p.max,
+                         p.isInt);
+            } else if (p.kind == GalleryParamSpec::Choice) {
+                // 参数模型是纯 float：枚举用 0..n-1 的整数表达，标签里写明
+                // 取值含义（`纹理(0=canvas 1=brick …)`），避免用户不知道数字含义
+                std::string lab = p.key + "(";
+                for (size_t k = 0; k < p.choices.size(); ++k) {
+                    if (k) lab += " ";
+                    lab += std::to_string(k) + "=" + p.choices[k];
+                }
+                lab += ")";
+                labels_.push_back(lab);
+                DefParam(p.key.c_str(), labels_.back().c_str(), 0.0f, 0.0f,
+                         static_cast<float>(p.choices.size() - 1), true);
+            } else {
+                DefParam(p.key.c_str(), p.key.c_str(), 0.0f, 0.0f, 1.0f, true);
+            }
+        }
+    }
+
+    bool Apply(ImageBuffer& b, const Selection* s) override {
+        return fn_(spec_.key, b, s, *this);
+    }
+
+    const GallerySpec& Spec() const { return spec_; }
+    int ChoiceCount(const char* key) const {
+        const std::vector<GalleryParamSpec> ps = ParseGalleryParams(spec_.params);
+        for (const auto& p : ps)
+            if (p.key == key && p.kind == GalleryParamSpec::Choice)
+                return static_cast<int>(p.choices.size());
+        return 0;
+    }
+
+private:
+    GallerySpec spec_;
+    GalleryApplyFn fn_;
+    std::deque<std::string> labels_; // DefParam 引用的标签存储（地址稳定）
+};
+
+// ---------------------------------------------------------------------------
+// 算法积木（双线性采样 + 可分离盒式模糊）
+// ---------------------------------------------------------------------------
+namespace galleryfx {
+
+inline RGBA Bilinear(const ImageBuffer& img, float x, float y) {
+    const int W = img.Width(), H = img.Height();
+    x = std::min(static_cast<float>(W - 1), std::max(0.0f, x));
+    y = std::min(static_cast<float>(H - 1), std::max(0.0f, y));
+    const int x0 = static_cast<int>(x), y0 = static_cast<int>(y);
+    const int x1 = std::min(W - 1, x0 + 1), y1 = std::min(H - 1, y0 + 1);
+    const float fx = x - x0, fy = y - y0;
+    RGBA c00, c10, c01, c11;
+    img.GetPixel(x0, y0, c00);
+    img.GetPixel(x1, y0, c10);
+    img.GetPixel(x0, y1, c01);
+    img.GetPixel(x1, y1, c11);
+    auto mix = [](float a, float b, float t) { return a + (b - a) * t; };
+    RGBA o;
+    o.r = static_cast<uint16_t>(mix(mix(c00.r, c10.r, fx), mix(c01.r, c11.r, fx), fy));
+    o.g = static_cast<uint16_t>(mix(mix(c00.g, c10.g, fx), mix(c01.g, c11.g, fx), fy));
+    o.b = static_cast<uint16_t>(mix(mix(c00.b, c10.b, fx), mix(c01.b, c11.b, fx), fy));
+    o.a = static_cast<uint16_t>(mix(mix(c00.a, c10.a, fx), mix(c01.a, c11.a, fx), fy));
+    return o;
+}
+
+// 确定性 hash 噪声（可复现，测试友好）
+inline float Hash01(int x, int y, uint32_t seed) {
+    uint32_t h = static_cast<uint32_t>(x) * 374761393u +
+                 static_cast<uint32_t>(y) * 668265263u + seed * 2246822519u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+    return static_cast<float>(h & 0xFFFFFFu) / 16777215.0f;
+}
+
+// 可分离盒式模糊（半径 r，就地到副本）
+inline void BoxBlur(ImageBuffer& img, int r, int passes = 2) {
+    if (r < 1) return;
+    const int W = img.Width(), H = img.Height();
+    ImageBuffer tmp = img.Clone();
+    for (int p = 0; p < passes; ++p) {
+        // 横向
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                float sr = 0, sg = 0, sb = 0, sa = 0;
+                int n = 0;
+                for (int k = -r; k <= r; ++k) {
+                    const int sx = std::min(W - 1, std::max(0, x + k));
+                    RGBA c;
+                    tmp.GetPixel(sx, y, c);
+                    sr += c.r; sg += c.g; sb += c.b; sa += c.a; ++n;
+                }
+                RGBA o;
+                o.r = static_cast<uint16_t>(sr / n);
+                o.g = static_cast<uint16_t>(sg / n);
+                o.b = static_cast<uint16_t>(sb / n);
+                o.a = static_cast<uint16_t>(sa / n);
+                img.SetPixel(x, y, o);
+            }
+        }
+        // 纵向
+        for (int x = 0; x < W; ++x) {
+            for (int y = 0; y < H; ++y) {
+                float sr = 0, sg = 0, sb = 0, sa = 0;
+                int n = 0;
+                for (int k = -r; k <= r; ++k) {
+                    const int sy = std::min(H - 1, std::max(0, y + k));
+                    RGBA c;
+                    img.GetPixel(x, sy, c);
+                    sr += c.r; sg += c.g; sb += c.b; sa += c.a; ++n;
+                }
+                RGBA o;
+                o.r = static_cast<uint16_t>(sr / n);
+                o.g = static_cast<uint16_t>(sg / n);
+                o.b = static_cast<uint16_t>(sb / n);
+                o.a = static_cast<uint16_t>(sa / n);
+                tmp.SetPixel(x, y, o);
+            }
+        }
+        img = tmp.Clone();
+    }
+}
+
+// 位移渲染：对 ROI 内像素按 (du,dv) 双线性回采
+template <typename Fn>
+inline void Displace(ImageBuffer& img, const Selection* sel, Fn field) {
+    const Rect roi = FilterRoi(img, sel);
+    ImageBuffer src = img.Clone();
+    for (int y = roi.y; y < roi.y + roi.h; ++y) {
+        for (int x = roi.x; x < roi.x + roi.w; ++x) {
+            if (!SelectionAllows(sel, x, y)) continue;
+            float du = 0.0f, dv = 0.0f;
+            field(x, y, du, dv);
+            if (du == 0.0f && dv == 0.0f) continue;
+            img.SetPixel(x, y, Bilinear(src, x + du, y + dv));
+        }
+    }
+}
+
+} // namespace galleryfx
+
+// ---------------------------------------------------------------------------
+// 已实现算法：Distort（Glass / Ocean Ripple / Diffuse Glow）
+// ---------------------------------------------------------------------------
+inline bool GalleryApplyDistort(const char* key, ImageBuffer& img,
+                                const Selection* sel,
+                                const GalleryFilterBase& f) {
+    using namespace galleryfx;
+    const std::string k = key ? key : "";
+    const int W = img.Width(), H = img.Height();
+    const uint32_t maxV = img.Format() == PixelFormat::RGBA16 ? 65535u : 255u;
+    const float scaleToMax = static_cast<float>(maxV) / 255.0f;
+
+    if (k == "oceanRipple") {
+        // 涟漪尺寸 1..15=9 → 波长；幅度 0..20=9 → 位移像素
+        const int size = std::max(1, f.Pi("rippleSize"));
+        const float mag = static_cast<float>(f.Pi("rippleMagnitude")) * 0.6f;
+        const float lambda = std::max(2.0f, size * 4.0f);
+        if (mag <= 0.0f) return true;
+        Displace(img, sel, [&](int x, int y, float& du, float& dv) {
+            const float t = 6.2831853f;
+            du = mag * std::sin(t * static_cast<float>(y) / lambda);
+            dv = mag * std::cos(t * static_cast<float>(x) / lambda);
+        });
+        return true;
+    }
+
+    if (k == "glass") {
+        // 扭曲量 0..20=5、平滑度 1..15=3、纹理选择、缩放 50..200=100
+        const float dist = static_cast<float>(f.Pi("distortion"));
+        if (dist <= 0.0f) return true;
+        const int smooth = std::max(1, f.Pi("smoothness"));
+        const int tsel = f.Pi("texture");
+        const float scaling = std::max(0.1f, f.P("scaling") / 100.0f);
+        const bool invert = f.Pi("invert") != 0;
+        // 纹理 → 位移场：0=frosted(细噪) 1=blocks(方块) 2=canvas 3=tinyLens
+        const float cell = (tsel == 1) ? 12.0f : (tsel == 2 ? 4.0f : 2.0f);
+        const float amp = dist * 0.8f * (invert ? -1.0f : 1.0f);
+        const float inv = 1.0f / (cell * scaling);
+        Displace(img, sel, [&](int x, int y, float& du, float& dv) {
+            const float u = static_cast<float>(x) * inv;
+            const float v = static_cast<float>(y) * inv;
+            float nx, ny;
+            if (tsel == 1) { // blocks：整块常量
+                nx = Hash01(static_cast<int>(u), static_cast<int>(v), 7u) * 2 - 1;
+                ny = Hash01(static_cast<int>(u), static_cast<int>(v), 11u) * 2 - 1;
+            } else {
+                nx = Hash01(static_cast<int>(u), static_cast<int>(v), 7u) * 2 - 1;
+                ny = Hash01(static_cast<int>(u), static_cast<int>(v + 37), 11u) * 2 - 1;
+            }
+            du = nx * amp;
+            dv = ny * amp;
+        });
+        if (smooth > 1) BoxBlur(img, std::min(3, smooth / 4));
+        return true;
+    }
+
+    if (k == "diffuseGlow") {
+        // 颗粒 0..10=6、发光量 0..20=10、清除量 0..20=15
+        const float grain = static_cast<float>(f.Pi("graininess")) / 10.0f;
+        const float glow = static_cast<float>(f.Pi("glowAmount")) / 20.0f;
+        const float clearAmt = static_cast<float>(f.Pi("clearAmount")) / 20.0f;
+        const Rect roi = FilterRoi(img, sel);
+
+        // 发光：亮部模糊后叠加（暗部被 clearAmount 压回）
+        if (glow > 0.0f) {
+            ImageBuffer bl = img.Clone();
+            BoxBlur(bl, 3, 2);
+            for (int y = roi.y; y < roi.y + roi.h; ++y) {
+                for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                    if (!SelectionAllows(sel, x, y)) continue;
+                    RGBA c, b;
+                    img.GetPixel(x, y, c);
+                    bl.GetPixel(x, y, b);
+                    const float lum = Luma(c) / (255.0f * scaleToMax);
+                    // 亮部发光更强；clearAmount 把"清除"的那部分拉回原图
+                    const float w = glow * lum * (1.0f - 0.5f * clearAmt);
+                    RGBA o;
+                    o.r = ClampCh((c.r + (b.r + maxV * 0.25f) * w) / (1.0f + w * 0.5f), maxV);
+                    o.g = ClampCh((c.g + (b.g + maxV * 0.25f) * w) / (1.0f + w * 0.5f), maxV);
+                    o.b = ClampCh((c.b + (b.b + maxV * 0.25f) * w) / (1.0f + w * 0.5f), maxV);
+                    o.a = c.a;
+                    img.SetPixel(x, y, o);
+                }
+            }
+        }
+        // 颗粒：确定性噪声，按亮度调制（亮部颗粒弱，符合"漫射"观感）
+        if (grain > 0.0f) {
+            for (int y = roi.y; y < roi.y + roi.h; ++y) {
+                for (int x = roi.x; x < roi.x + roi.w; ++x) {
+                    if (!SelectionAllows(sel, x, y)) continue;
+                    RGBA c;
+                    img.GetPixel(x, y, c);
+                    const float lum = Luma(c) / (255.0f * scaleToMax);
+                    const float n = (Hash01(x, y, 3u) * 2.0f - 1.0f) * grain * 40.0f *
+                                    scaleToMax * (1.0f - 0.6f * lum);
+                    RGBA o;
+                    o.r = ClampCh(c.r + n, maxV);
+                    o.g = ClampCh(c.g + n, maxV);
+                    o.b = ClampCh(c.b + n, maxV);
+                    o.a = c.a;
+                    img.SetPixel(x, y, o);
+                }
+            }
+        }
+        return true;
+    }
+
+    return false; // 未实现（UI 应标灰）
+}
+
+// 总分派：目前只接 Distort；其余分类后续按同样方式追加
+inline bool GalleryApplyAll(const char* key, ImageBuffer& img,
+                            const Selection* sel, const GalleryFilterBase& f) {
+    return GalleryApplyDistort(key, img, sel, f);
+}
+
+} // namespace sai2::fg

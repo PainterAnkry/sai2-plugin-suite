@@ -120,6 +120,14 @@ public:
         return raw;
     }
 
+    // 注册一个**已构造好**的滤镜。规格表驱动的滤镜（GalleryFilterBase）需要
+    // 构造参数（规格条目 + 分派函数），无法走 Add<T>() 的默认构造，故补这个入口。
+    FilterBase* AddOwned(std::unique_ptr<FilterBase> f) {
+        FilterBase* raw = f.get();
+        filters_.push_back(std::move(f));
+        return raw;
+    }
+
     size_t Count() const { return filters_.size(); }
 
     FilterBase* At(size_t i) {

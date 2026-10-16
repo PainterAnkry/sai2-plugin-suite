@@ -13,6 +13,7 @@
 #include "Tests.h"
 
 #include "GalleryParams.h"
+#include "GalleryFilters.h"
 #include "GallerySpecs.h"
 
 #include <map>
@@ -21,7 +22,8 @@
 namespace sai2test {
 
 bool TestGallerySpecs() {
-    using namespace sai2::fg;
+    using namespace sai2;      // ImageBuffer / RGBA / PixelFormat
+    using namespace sai2::fg;  // 滤镜与规格表
 
     int count = 0;
     const GallerySpec* specs = GallerySpecs(count);
@@ -136,10 +138,69 @@ bool TestGallerySpecs() {
         CHECK(diag.find("skip-json:glowColor") != std::string::npos);
     }
 
+    // ---- 已实现算法（Distort 批）：确实改像素 + 确定性 + 未实现必须失败 ----
+    {
+        ImageBuffer base(64, 40, PixelFormat::RGBA8);
+        for (int y = 0; y < 40; ++y) {
+            for (int x = 0; x < 64; ++x) {
+                RGBA c;
+                c.r = static_cast<uint16_t>(x * 4);
+                c.g = static_cast<uint16_t>(y * 6);
+                c.b = static_cast<uint16_t>((x + y) * 3);
+                c.a = 255;
+                base.SetPixel(x, y, c);
+            }
+        }
+        auto changed = [](const ImageBuffer& a, const ImageBuffer& b) {
+            int n = 0;
+            for (int y = 0; y < a.Height(); ++y)
+                for (int x = 0; x < a.Width(); ++x) {
+                    RGBA p, q;
+                    a.GetPixel(x, y, p);
+                    b.GetPixel(x, y, q);
+                    if (p.r != q.r || p.g != q.g || p.b != q.b || p.a != q.a) ++n;
+                }
+            return n;
+        };
+        const char* impl[] = {"oceanRipple", "glass", "diffuseGlow"};
+        for (const char* want : impl) {
+            const GallerySpec* sp = nullptr;
+            for (int i = 0; i < count; ++i)
+                if (std::string(specs[i].key) == want) sp = &specs[i];
+            CHECK(sp != nullptr);
+            GalleryFilterBase filt(*sp, GalleryApplyAll);
+            // 参数默认值来自记法；glass 的 distortion 默认 5、oceanRipple 幅度 9
+            ImageBuffer a = base.Clone();
+            CHECK(filt.Apply(a, nullptr));
+            CHECK(changed(base, a) > 0); // 必须真的改了像素
+            // 确定性：同样输入两次结果逐字节一致
+            ImageBuffer b = base.Clone();
+            CHECK(filt.Apply(b, nullptr));
+            CHECK(changed(a, b) == 0);
+        }
+        // 未实现的 key：必须返回 false（不能静默"成功但什么也没做"）
+        const GallerySpec* cut = nullptr;
+        for (int i = 0; i < count; ++i)
+            if (std::string(specs[i].key) == "cutout") cut = &specs[i];
+        CHECK(cut != nullptr);
+        GalleryFilterBase notImpl(*cut, GalleryApplyAll);
+        ImageBuffer c2 = base.Clone();
+        CHECK(!notImpl.Apply(c2, nullptr));
+
+        // 规格表驱动的滤镜：id/显示名/分类/参数都来自规格表
+        const GallerySpec* gl = nullptr;
+        for (int i = 0; i < count; ++i)
+            if (std::string(specs[i].key) == "glass") gl = &specs[i];
+        GalleryFilterBase gf(*gl, GalleryApplyAll);
+        CHECK(std::string(gf.GetInfo().id) == "com.sai2.filter.gallery.glass");
+        CHECK(std::string(gf.GetInfo().category) == "Distort");
+        CHECK(gf.ParamDefs().size() == ParseGalleryParams(gl->params).size());
+    }
+
     std::cout << "  47 条规格 / 6 分类  OK；参数 " << totalParams << " 个"
               << "（range " << rangeCount << ", choice " << choiceCount
               << ", bool " << boolCount << "），跳过 json " << totalSkippedJson
-              << " 个\n";
+              << " 个；Distort 3 个算法已实现\n";
     return true;
 }
 
