@@ -27,6 +27,9 @@ inline bool GalleryKeyImplemented(const char* key) {
         // Sketch（8）
         "basRelief", "graphicPen", "halftonePattern", "photocopy", "stamp",
         "tornEdges", "reticulation", "waterPaper",
+        // Artistic（7）
+        "dryBrush", "fresco", "filmGrain", "sponge", "plasticWrap",
+        "posterEdges", "roughPastels",
     };
     if (!key) return false;
     for (const char* k : kDone)
@@ -39,7 +42,9 @@ inline int GalleryImplementedCount() {
         "oceanRipple", "glass", "diffuseGlow", "mosaicTiles", "patchwork",
         "stainedGlass", "craquelure", "grain", "texturizer", "glowingEdges",
         "basRelief", "graphicPen", "halftonePattern", "photocopy", "stamp",
-        "tornEdges", "reticulation", "waterPaper"};
+        "tornEdges", "reticulation", "waterPaper", "dryBrush",
+        "fresco", "filmGrain", "sponge", "plasticWrap", "posterEdges",
+        "roughPastels"};
     return static_cast<int>(sizeof(kDone) / sizeof(kDone[0]));
 }
 
