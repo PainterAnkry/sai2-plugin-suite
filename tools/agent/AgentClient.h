@@ -45,7 +45,21 @@ public:
 
     DWORD lastErr = 0; // 诊断：最近一次失败的 Win32 错误码
 
-    bool Connect(const wchar_t* pipeName = nullptr, DWORD timeoutMs = 3000) {
+    // 全局"连接预算"（毫秒）。默认 3000：正常操作时给足重试窗口（服务端每服务
+    // 完一个客户端都会重建管道名，存在"名字短暂不存在"的窗口）。
+    // 但**启动首刷**要调小：面板刚显示时若 agent 还没注入，3 秒预算会白等，
+    // 界面表现为"起来后一段时间不响应"。启动时先设 400ms → 没注入就快速失败
+    // 并显示未连接；已注入则第一次 CreateFileW 就成功，等于零等待。
+    static DWORD& DefaultConnectTimeout() {
+        static DWORD ms = 3000;
+        return ms;
+    }
+    static void SetDefaultConnectTimeout(DWORD ms) {
+        DefaultConnectTimeout() = (ms == 0) ? 3000 : ms;
+    }
+
+    bool Connect(const wchar_t* pipeName = nullptr, DWORD timeoutMs = 0) {
+        if (timeoutMs == 0) timeoutMs = DefaultConnectTimeout();
         Close();
         // 取进程内独占锁（UI 定时器单次查询是毫秒级，拿不到就等）
         lock_ = std::unique_lock<std::mutex>(PipeMutex());

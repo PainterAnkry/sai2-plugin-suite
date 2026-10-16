@@ -3910,13 +3910,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     s.mainHwnd = hwnd;
     EnableRoundedWindow(hwnd); // Win11 圆角窗口
 
-    // 启动时若剪贴板里已经有图，直接抓一次，省一次操作
-    if (ClipboardHasImage()) DoGrabFromClipboard(s.main);
-    RefreshLayers();
-
-
+    // ★ 顺序很关键：**先让窗口显示**，再做启动时的抓取/图层刷新。
+    // 原来 ShowWindow 在这两步之后，而 RefreshLayers() 里的 agent 查询
+    // 每次连接预算 3 秒（AgentClient::Connect 的默认值）：agent 还没注入时会
+    // 连续白等 → 表现为"启动慢，而且起来后一段时间不响应"。
+    // 现在：窗口先出来（首帧立刻呈现），随后用 400ms 的**启动预算**做首刷 ——
+    // 已注入时第一次 CreateFileW 就成功（等于零等待），未注入则快速失败并
+    // 显示未连接，用户点「连接注入」即可；最后恢复 3 秒的正常预算。
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
+
+    sai2agent::AgentClient::SetDefaultConnectTimeout(400);
+    if (ClipboardHasImage()) DoGrabFromClipboard(s.main);
+    RefreshLayers();
+    sai2agent::AgentClient::SetDefaultConnectTimeout(3000);
 
     // 功能演示模式：自动编排操作流程 + 逐帧导出 BMP（合成视频用）
     if (demoSeconds > 0) {
