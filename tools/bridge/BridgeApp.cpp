@@ -2327,7 +2327,11 @@ void DoGrabFromClipboard(UiWindow& win) {
     (void)win;
     AppState& s = S();
     std::string err;
-    const bool keepCtx = g_grabKeepCtx;
+    // 默认**保留**画布上下文：只走「监听剪贴板 / 从剪贴板抓取」的用户不会经过
+    // 抓取路径的第 4 步重新定位，一旦这里清空，窗口就再也拿不到"整幅画布"显示。
+    // 偏差由 SetCanvasContext 的"偏移变化 → 平移纠正"和"应用前就地补定位"兜住。
+    const bool keepCtx = true;
+    g_grabKeepCtx = false;
     g_grabKeepCtx = false;
     if (!keepCtx) s.core->SetCanvasContext(false, 0, 0, 0, 0);
     if (s.core->GrabFromClipboard(err)) {

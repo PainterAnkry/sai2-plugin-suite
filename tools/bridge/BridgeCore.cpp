@@ -277,7 +277,6 @@ void BridgeCore::SetImage(ImageBuffer img, const std::string& sourceLabel) {
     // 同时**作废旧的画布上下文** —— 新图在画布上的位置未知，沿用上一次的偏移
     // 会把它摆错（捕获路径会在紧接着的第 4 步重新定位并再补边）。
     baseIsCanvas_ = false;
-    hasCanvasCtx_ = false;
 
     // ★ 保持"图 = 画布坐标"：已知画布上下文时立即补边成整幅画布。
     // 必须在下面重建预览之前调用，否则窗口会以包围盒尺寸建会话。
@@ -586,6 +585,16 @@ void BridgeCore::SetCanvasContext(bool has, int canvasW, int canvasH,
     // 抓到图层后紧接着就会走到这里（先 SetImage 再 SetCanvasContext），
     // 此时把基准补边成整幅画布并重建预览，窗口立刻以画布取景。
     PadBaseToCanvas();
+    // 定位结果与上次补边用的偏移不同（同一图层重新定位、或用户换了层）：
+    // 把**已经补好的画布图整体平移**纠正 —— 比"作废上下文重抓"好得多：
+    // 后者会让只走「监听剪贴板」抓图的用户永远拿不到整幅画布显示。
+    if (hasCanvasCtx_ && baseIsCanvas_ && original_.IsValid() &&
+        original_.Width() == canvasW_ && original_.Height() == canvasH_ &&
+        (canvasX0_ != paddedAtX_ || canvasY0_ != paddedAtY_)) {
+        ShiftBaseBy(canvasX0_ - paddedAtX_, canvasY0_ - paddedAtY_);
+        paddedAtX_ = canvasX0_;
+        paddedAtY_ = canvasY0_;
+    }
     if (hasCanvasCtx_ && original_.IsValid() &&
         original_.Width() == canvasW_ && original_.Height() == canvasH_) {
         for (int w = 0; w < kWinCount; ++w)
@@ -631,6 +640,8 @@ void BridgeCore::PadBaseToCanvas() {
     if (!hasCanvasCtx_ || !original_.IsValid()) return;
     if (original_.Width() == canvasW_ && original_.Height() == canvasH_) {
         baseIsCanvas_ = true;   // 本身已是画布尺寸：按画布坐标对待
+        paddedAtX_ = canvasX0_;
+        paddedAtY_ = canvasY0_;
         return;
     }
     const int ox = canvasX0_, oy = canvasY0_;
@@ -640,9 +651,39 @@ void BridgeCore::PadBaseToCanvas() {
     // ★ 不清零 canvasX0_/canvasY0_：它们描述"被抓图层在画布上的位置"，
     //   下一次抓图（下一个 900x506 的包围盒）还要用它来补边。
     baseIsCanvas_ = true;
+    paddedAtX_ = ox;
+    paddedAtY_ = oy;
     Log("base padded to canvas " + std::to_string(canvasW_) + "x" +
         std::to_string(canvasH_) + " (was at " + std::to_string(ox) + "," +
         std::to_string(oy) + ")");
+}
+
+void BridgeCore::ShiftBaseBy(int dx, int dy) {
+    if ((dx == 0 && dy == 0) || !original_.IsValid()) return;
+    const int W = original_.Width(), H = original_.Height();
+    auto shiftOne = [&](const ImageBuffer& src) {
+        ImageBuffer dst(W, H, src.Format());
+        dst.Clear(RGBA{0, 0, 0, 0});
+        for (int y = 0; y < H; ++y) {
+            const int sy = y - dy;
+            if (sy < 0 || sy >= H) continue;
+            int sx = 0, sdx = 0, cnt = W;
+            if (dx > 0) { sdx = dx; cnt = W - dx; }
+            else if (dx < 0) { sx = -dx; cnt = W + dx; }
+            if (cnt <= 0) continue;
+            std::memcpy(dst.Data() + dst.Stride() * static_cast<size_t>(y) +
+                            static_cast<size_t>(sdx) * 4,
+                        src.Data() + src.Stride() * static_cast<size_t>(sy) +
+                            static_cast<size_t>(sx) * 4,
+                        static_cast<size_t>(cnt) * 4);
+        }
+        return dst;
+    };
+    original_ = shiftOne(original_);
+    if (applied_.IsValid() && applied_.Width() == W && applied_.Height() == H)
+        applied_ = shiftOne(applied_);
+    Log("base shifted by (" + std::to_string(dx) + "," + std::to_string(dy) +
+        ") to match canvas ctx");
 }
 
 ImageBuffer BridgeCore::PadToCanvas(const ImageBuffer& img) const {

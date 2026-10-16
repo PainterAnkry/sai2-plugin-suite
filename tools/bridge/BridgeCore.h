@@ -159,6 +159,7 @@ public:
     // 维持"图 = 画布坐标"的不变量 —— 所有功能窗口因此以画布为编辑面，
     // 用户才能把内容液化/模糊到图层包围盒之外（SAI2 的 Ctrl+C 只给包围盒）。
     void PadBaseToCanvas();
+    void ShiftBaseBy(int dx, int dy);
     bool HasCanvasContext() const { return hasCanvasCtx_; }
     int CanvasW() const { return canvasW_; }
     int CanvasH() const { return canvasH_; }
@@ -326,6 +327,7 @@ private:
     // 画布上下文（0 = 无；抓取自外部剪贴板/匹配失败时无效）
     bool hasCanvasCtx_ = false;
     bool baseIsCanvas_ = false;
+    int paddedAtX_ = 0, paddedAtY_ = 0;   // 当前基准补边时用的画布偏移
     int canvasW_ = 0, canvasH_ = 0, canvasX0_ = 0, canvasY0_ = 0;
 
     std::string status_;
