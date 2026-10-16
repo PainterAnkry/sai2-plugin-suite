@@ -78,6 +78,22 @@ inline bool GalleryApplyRest(const char* key, ImageBuffer& img,
         return std::min(1.0f, std::sqrt(gx * gx + gy * gy));
     };
 
+    // ★ 亮度分位数阈值：按**图像自身的分布**定阈值，而不是写死一个 0.1~0.5。
+    //   写死阈值的后果：主体整体偏暗时（例如深色红心）几乎所有像素都在阈值
+    //   以下 → 整片落墨 → 缩略图/画面变成一块黑（用户实测反馈）。用分位数
+    //   就能保证"只有最暗的 q 比例落墨"，对明暗不同的主体都稳定。
+    auto lumQuantile = [&](double q) {
+        std::vector<float> v;
+        v.reserve(static_cast<size_t>(roi.w / 2 + 1) * (roi.h / 2 + 1));
+        for (int y = roi.y; y < roi.y + roi.h; y += 2)
+            for (int x = roi.x; x < roi.x + roi.w; x += 2)
+                if (SelectionAllows(sel, x, y)) v.push_back(luma01(img, x, y));
+        if (v.empty()) return 0.5f;
+        std::sort(v.begin(), v.end());
+        const size_t i = static_cast<size_t>(q * static_cast<double>(v.size() - 1));
+        return v[i];
+    };
+
     // ================= Artistic 后 8 个 =================
 
     // 彩色铅笔：保留原色 + 纸纹方向的细铅笔线，背景按纸张亮度抬亮
@@ -387,7 +403,7 @@ inline bool GalleryApplyRest(const char* key, ImageBuffer& img,
                 // 在半径内撒点：越靠近中心概率越高（smoothness 控制衰减）
                 const float n = Hash01(x / std::max(1, rad / 2 + 1),
                                        y / std::max(1, rad / 2 + 1), 113u);
-                const float thr = 0.5f + 0.4f * (1.0f - 1.0f / smooth);
+                const float thr = 0.5f + 0.4f * (1.0f - 1.0f / smooth);  // 撒点密度
                 if (n > thr) continue;   // 大部分像素保持原样，只有散点被改
                 const float v = (n < thr * 0.5f) ? 0.0f : 1.0f;
                 gray(x, y, v, c.a);
@@ -412,7 +428,7 @@ inline bool GalleryApplyRest(const char* key, ImageBuffer& img,
                 const float n = Hash01(x / std::max(1, rad / 2 + 1),
                                        y / std::max(1, rad / 2 + 1), 127u);
                 const float lum = Luma(s2) / (255.0f * sc);
-                const float v = (n < 0.35f) ? 0.1f : (0.35f + 0.65f * lum);
+                const float v = (n < 0.35f) ? 0.35f : (0.25f + 0.75f * lum);
                 gray(x, y, std::min(1.0f, std::max(0.0f, v)), alphaAt(x, y));
             }
         return true;
@@ -425,14 +441,14 @@ inline bool GalleryApplyRest(const char* key, ImageBuffer& img,
         const float contr = static_cast<float>(f.Pi("contrast")) / 40.0f;
         ImageBuffer src = img.Clone();
         BoxBlur(src, std::max(1, wdt / 4), 1);
-        const float thr = 0.12f + press * 0.20f;   // 阈值族：压低（原来中暗图全黑）
+        const float thr = lumQuantile(0.18f + press * 0.25f);  // 分位数阈值（按主体明暗自适应）
         for (int y = roi.y; y < roi.y + roi.h; ++y)
             for (int x = roi.x; x < roi.x + roi.w; ++x) {
                 if (!SelectionAllows(sel, x, y)) continue;
                 float lum = luma01(src, x, y);
                 // 对比拉伸 + 阈值 → 水墨块面
                 lum = std::min(1.0f, std::max(0.0f, (lum - 0.5f) * (1.0f + contr * 3.0f) + 0.5f));
-                const float v = (lum < thr) ? 0.05f : 0.95f;
+                const float v = (lum < thr) ? 0.25f : 0.95f;   // 墨不要纯黑，保留层次
                 gray(x, y, v, alphaAt(x, y));
             }
         return true;
