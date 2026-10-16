@@ -389,6 +389,11 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSEWHEEL: {
         // 自由缩放：滚轮以光标为锚点连续缩放（与 PS/SAI 一致）
+        // ★ 先给"窗口自己"处理的机会：滤镜库的左栏列表滚动走这里。
+        //   原来本分支处理完无条件 return，窗口的 Msg 收不到滚轮 →
+        //   滤镜库左边栏滚不动（用户反馈"左边栏不能下拉"）。
+        if (win.id == BridgeCore::kWinFilter && FilterWheelScroll(win, wp, lp))
+            return 0;
         const int delta = GET_WHEEL_DELTA_WPARAM(wp);
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd, &pt);

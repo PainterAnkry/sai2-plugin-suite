@@ -236,23 +236,9 @@ bool OnFilterHit(UiWindow& win, const UiHit& h) {
     return false;
 }
 
+
 bool FilterMsg(UiWindow& win, UINT msg, WPARAM wp, LPARAM lp) {
-    (void)win;
-    if (msg == WM_MOUSEWHEEL) {
-        POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        ScreenToClient(win.hwnd, &pt);
-        // 缩略图墙在窗口左侧 1/3 区域内滚动
-        RECT client;
-        GetClientRect(win.hwnd, &client);
-        if (pt.x < client.right / 3) {
-            const int delta = GET_WHEEL_DELTA_WPARAM(wp);
-            g_scroll -= delta / WHEEL_DELTA * GalleryRowH();
-            if (g_scroll < 0) g_scroll = 0;
-            InvalidateRect(win.hwnd, nullptr, FALSE);
-            return true;
-        }
-        return false;
-    }
+    if (msg == WM_MOUSEWHEEL) return FilterWheelScroll(win, wp, lp);
     if (msg == WM_KEYDOWN && wp == VK_ESCAPE) {
         CloseToolWindow(BridgeCore::kWinFilter);
         return true;
@@ -262,6 +248,22 @@ bool FilterMsg(UiWindow& win, UINT msg, WPARAM wp, LPARAM lp) {
 
 } // namespace
 
+// 缩略图墙的滚轮滚动。抽成外部可见的函数是因为 UiWindow 的 WndProc 会先
+// 自己处理 WM_MOUSEWHEEL（预览缩放）并无条件 return —— 窗口自己的 Msg
+// 根本收不到滚轮，导致"滤镜库左边栏不能下拉"（用户反馈）。现在 WndProc
+// 在缩放之前先调用本函数，光标在左栏时交给它滚动列表。
+bool FilterWheelScroll(UiWindow& win, WPARAM wp, LPARAM lp) {
+    POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    ScreenToClient(win.hwnd, &pt);
+    RECT client;
+    GetClientRect(win.hwnd, &client);
+    if (pt.x >= client.right / 3) return false;   // 不在缩略图墙上
+    const int delta = GET_WHEEL_DELTA_WPARAM(wp);
+    g_scroll -= delta / WHEEL_DELTA * GalleryRowH();
+    if (g_scroll < 0) g_scroll = 0;
+    InvalidateRect(win.hwnd, nullptr, FALSE);
+    return true;
+}
 void FilterThumbsArrived() { g_builtCount = 0; }
 
 const ToolWindowSpec& FilterWindowSpec() {

@@ -297,6 +297,9 @@ bool OnZoomSliderDrag(UiWindow& win, int mx);
 // 画布绘制：把 core 的显示图按窗口缩放/平移画到 win.canvas 里，
 // 并登记 HK_PREVIEW / HK_ZIN / HK_ZOUT / HK_Z100 / HK_ZFIT / 液化笔刷圈。
 void DrawCanvas(HDC dc, UiWindow& win, bool allowStroke, bool zoomButtons = true);
+// 滤镜库缩略图墙的滚轮滚动（UiWindow 的 WndProc 在预览缩放之前先问它，
+// 否则窗口自己的 Msg 收不到滚轮 → 左栏不能下拉）
+bool FilterWheelScroll(UiWindow& win, WPARAM wp, LPARAM lp);
 
 // 画一段参数面板（标签 + 滑杆 + 数值），返回下一行的 y。
 // 数值框由 SyncParamEdits 负责摆放。
