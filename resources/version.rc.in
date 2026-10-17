@@ -2,16 +2,22 @@
 // 经 `zig rc` 编译为 .res 并链入各二进制。杀软启发式引擎对"无版本信息的
 // 裸二进制"评分更狠，带齐元数据可明显降低误报率。
 //
-// 占位符：@DESC@ 文件描述  @NAME@ 内部名  @FILE@ 原始文件名
-//         @TYPE@ VFT_APP / VFT_DLL  @VER@ 版本号
+// 占位符（下面注释里不要出现占位符原文，否则 sed 会把注释也替换掉）：
+//   描述 / 内部名 / 原始文件名 / 类型 VFT_APP|VFT_DLL / 版本号 / 四段版本 / 图标行
 #define VS_VERSION_INFO       1
 #define VOS_NT_WINDOWS32      0x00040004L
 #define VFT_APP               0x00000001L
 #define VFT_DLL               0x00000002L
 
+// 应用图标。ID 固定 101：UiWindow.cpp 里窗口类用 MAKEINTRESOURCEW(101) 取。
+// 为什么要嵌图标：面板和 4 个功能窗口此前**没有任何图标资源**（也不调
+// WM_SETICON），任务栏/标题栏用的是 Windows 的"未知应用"默认图标 ——
+// 用户反馈的"任务栏里本插件的图标比别的图标低/不齐"就是它。
+@ICONLINE@
+
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    1,19,0,0
- PRODUCTVERSION 1,19,0,0
+ FILEVERSION    @VER4@
+ PRODUCTVERSION @VER4@
  FILEFLAGSMASK  0x3fL
  FILEFLAGS      0x0L
  FILEOS         VOS_NT_WINDOWS32

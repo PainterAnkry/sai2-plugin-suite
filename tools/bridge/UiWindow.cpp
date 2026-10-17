@@ -460,6 +460,26 @@ void GrabSubtitleHead(wchar_t* out, size_t n, const ImageBuffer& img) {
 // ---------------------------------------------------------------------------
 // 窗口类注册 / 创建
 // ---------------------------------------------------------------------------
+// 应用图标：sai2_bridge.exe 的资源 IDI 固定 101（resources/sai2_suite.ico，
+// 见 scripts/build-zig.sh 的 make_res 第 6 参 + resources/version.rc.in）。
+// 为什么必须显式设置：面板和 4 个功能窗口此前**没有图标**（也没有资源），
+// Windows 只好用"未知应用"的默认图标 —— 任务栏里那一格看着比旁边的图标
+// 偏低/不齐（用户反馈"程序图标莫名其妙下移"），标题栏图标也是通用图标。
+static HICON AppIconLarge(HINSTANCE hInst) {
+    HICON h = static_cast<HICON>(LoadImageW(hInst, MAKEINTRESOURCEW(101),
+                                           IMAGE_ICON, 0, 0,
+                                           LR_DEFAULTSIZE | LR_SHARED));
+    if (!h) h = LoadIconW(hInst, MAKEINTRESOURCEW(101));
+    return h;
+}
+static HICON AppIconSmall(HINSTANCE hInst) {
+    return static_cast<HICON>(LoadImageW(hInst, MAKEINTRESOURCEW(101),
+                                         IMAGE_ICON,
+                                         GetSystemMetrics(SM_CXSMICON),
+                                         GetSystemMetrics(SM_CYSMICON),
+                                         LR_SHARED));
+}
+
 bool RegisterWindowClasses(HINSTANCE hInst) {
     // 主面板窗口类：用 BridgeApp.cpp 里的 MainWndProc（主面板自己的过程）。
     // 这是注册主面板类的**唯一**地方 —— 千万不能在别处再注册一次同名类，
@@ -473,6 +493,8 @@ bool RegisterWindowClasses(HINSTANCE hInst) {
         wc.hInstance = hInst;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.hbrBackground = nullptr;
+        wc.hIcon = AppIconLarge(hInst);
+        wc.hIconSm = AppIconSmall(hInst);
         wc.lpszClassName = MainWindowClassName();
         if (!RegisterClassExW(&wc) &&
             GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
@@ -490,6 +512,8 @@ bool RegisterWindowClasses(HINSTANCE hInst) {
         wc.hInstance = hInst;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.hbrBackground = nullptr;
+        wc.hIcon = AppIconLarge(hInst);
+        wc.hIconSm = AppIconSmall(hInst);
         wc.lpszClassName = sp.cls;
         if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
             return false;

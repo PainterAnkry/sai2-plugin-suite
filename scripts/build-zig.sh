@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # ============================================================================
 # build-zig.sh - 使用 zig c++（clang 21, MinGW ABI）构建整个工程
 # 用途：本机无 CMake/MSVC 时的验证构建；正式发布仍推荐 CMake
@@ -16,15 +16,26 @@ ZIGC=("$ZIG" c++)
 # 这样在受限环境（不能写用户目录）里也能编译
 export ZIG_GLOBAL_CACHE_DIR="$BUILD/zig-cache"
 
+ICON="$ROOT/resources/sai2_suite.ico"
+# rc 文件里写的是**字面路径**，resinator 不认 MSYS 风格 /f/... ；
+# 用 cygpath -m 转成 F:/... （正斜杠 Windows 路径，既能被 rc 打开，
+# 又不会在 sed 替换串里被当成转义）
+if command -v cygpath >/dev/null 2>&1; then ICON="$(cygpath -m "$ROOT/resources/sai2_suite.ico")"; fi
 # 版本资源：每个随包二进制都带 VERSIONINFO（无版本信息的裸二进制
 # 最容易被杀软启发式引擎误报）。模板见 resources/version.rc.in。
 VER="1.23.0"
+VER4="${VER//./,},0"          # 1.23.0 -> 1,23,0,0（VERSIONINFO 要逗号分隔四段）
 RES="$BUILD/res"
 mkdir -p "$RES"
-# make_res <描述> <内部名> <原始文件名> <VFT_APP|VFT_DLL> <输出.res>
+# make_res <描述> <内部名> <原始文件名> <VFT_APP|VFT_DLL> <输出.res> [图标路径]
+# 图标只给 sai2_bridge（面板 + 4 个功能窗口共用）：此前没有任何图标资源，
+# 任务栏/标题栏显示的是 Windows"未知应用"默认图标（用户反馈图标位置不齐）。
 make_res() {
+    local iconline=""
+    if [ -n "$6" ]; then iconline="101 ICON \"$6\""; fi
     sed -e "s|@DESC@|$1|g" -e "s|@NAME@|$2|g" -e "s|@FILE@|$3|g" \
-        -e "s|@TYPE@|$4|g" -e "s|@VER@|$VER|g" \
+        -e "s|@TYPE@|$4|g" -e "s|@VER@|$VER|g" -e "s|@VER4@|$VER4|g" \
+        -e "s|@ICONLINE@|$iconline|g" \
         "$ROOT/resources/version.rc.in" > "$RES/$2.rc"
     # /c 65001：模板是 UTF-8，不带此参数中文会被按 cp1252 解析成乱码；
     # 写成 //c 是防止 Git Bash 把 /c 当 POSIX 路径转换（MSYS 折叠 // → /）
@@ -93,7 +104,7 @@ echo "==> [5/7] sai2_tests.exe + sai2_hostdemo.exe + sai2_computebench.exe"
 echo "==> [6/7] sai2_bridge.exe（伴随宿主：剪贴板桥 + 主面板 + 4 个功能窗口）"
 # 保持控制台子系统（--selftest/--uitest/--demo 的输出要能被测试管道捕获）。
 # 双击/.bat 启动时由 wWinMain 主动隐藏控制台窗口（见 BridgeApp.cpp）。
-make_res "SAI2 伴随宿主面板（图层抓取 + 液化/滤镜/模糊/调整）" sai2_bridge sai2_bridge.exe VFT_APP "$RES/sai2_bridge.res"
+make_res "SAI2 伴随宿主面板（图层抓取 + 液化/滤镜/模糊/调整）" sai2_bridge sai2_bridge.exe VFT_APP "$RES/sai2_bridge.res" "$ICON"
 "${ZIGC[@]}" "${CXXFLAGS[@]}" -municode \
     "-I$ROOT/tools/bridge" \
     -o "$BUILD/tools/sai2_bridge.exe" \
