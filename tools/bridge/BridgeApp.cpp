@@ -854,6 +854,9 @@ struct CanvasCtxResult {
     double score = 1e9;
 };
 
+// SAI2 屏幕上的"缩放比例"读数候选（定义在下面；定位在 .sai2 尺寸过期时要靠它）
+void ReadSai2ZoomCandidates(std::vector<double>& out);
+
 // 纯数学的画布上下文定位（实现在 AcquireCanvasContext 之后）
 bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
                      CanvasCtxResult& out, std::string& diag, int docW = 0,
@@ -1435,6 +1438,91 @@ bool ColorNear(const ImageBuffer& img, int x, int y, const RGBA& c,
 
 } // namespace canvasctx
 
+// ---------------------------------------------------------------------------
+// 不依赖 agent DIB 钩子的兜底抓屏：直接截 SAI2 主窗口客户区。
+//
+// 为什么需要：**改画布大小 / 删图层之后**，agent 的 DIB 钩子可能还攥着上一帧
+// （实测：SAI2 已经显示 1920x1080 的横图，快照里还是改之前的 1080x1640 竖图，
+// 于是模板在快照里当然找不到 → 定位失败 → 图不补边 → 用户看到"又错位了"）。
+// 截图永远是最新画面，所以定位失败时用它兜底。
+// ---------------------------------------------------------------------------
+bool GrabSai2ClientByWindow(ImageBuffer& out) {
+    HWND sai = FindSai2Window();
+    if (!sai) return false;
+    ForceForeground(sai);
+    Sleep(150);                      // 等重绘完成
+    RECT wr{};
+    if (!GetWindowRect(sai, &wr)) return false;
+    const int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
+    if (ww < 200 || wh < 200 || ww > 8000 || wh > 8000) return false;
+    RECT cr{};
+    if (!GetClientRect(sai, &cr)) return false;
+    const int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+    if (cw < 200 || ch < 200) return false;
+    // 客户区相对窗口的偏移（非客户区宽度）
+    POINT o{0, 0};
+    if (!ClientToScreen(sai, &o)) return false;
+    const int ncx = o.x - wr.left, ncy = o.y - wr.top;
+
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, ww, wh);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    // PW_RENDERFULLCONTENT：能拿到被遮挡的内容（DWM 下的唯一可靠方式）
+    BOOL ok = PrintWindow(sai, mem, 2);
+    if (!ok) ok = PrintWindow(sai, mem, 0);
+    bool built = false;
+    if (ok) {
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = cw;
+        bi.bmiHeader.biHeight = -ch;      // 自下而上存储，读出来是正的
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        std::vector<uint8_t> px(size_t(cw) * ch * 4, 0);
+        // 只取客户区那一块（跳过标题栏/边框）
+        HDC crop = CreateCompatibleDC(screen);
+        HBITMAP cbmp = CreateCompatibleBitmap(screen, cw, ch);
+        HGDIOBJ cold = SelectObject(crop, cbmp);
+        BitBlt(crop, 0, 0, cw, ch, mem, ncx, ncy, SRCCOPY);
+        if (GetDIBits(crop, cbmp, 0, UINT(ch), px.data(), &bi, DIB_RGB_COLORS)) {
+            out.Create(cw, ch, PixelFormat::RGBA8);
+            uint8_t* dst = out.Data();
+            for (int y = 0; y < ch; ++y) {
+                std::memcpy(dst + out.Stride() * size_t(y),
+                            px.data() + size_t(y) * cw * 4, size_t(cw) * 4);
+            }
+            built = true;
+        }
+        SelectObject(crop, cold);
+        DeleteObject(cbmp);
+        DeleteDC(crop);
+    }
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    return built && out.IsValid();
+}
+
+// 用窗口截图再定位一次（快照过期时的兜底）。成功时 out 就是最终结果。
+bool LocateFromWindowShot(const ImageBuffer& tmpl, CanvasCtxResult& out,
+                          std::string& diag, int docW, int docH) {
+    ImageBuffer shot;
+    if (!GrabSai2ClientByWindow(shot)) return false;
+    CanvasCtxResult r;
+    std::string d2;
+    if (!LocateCanvasCtx(shot, tmpl, r, d2, docW, docH)) {
+        diag += " | 窗口截图兜底也失败: " + d2;
+        return false;
+    }
+    out = r;
+    diag = "window-shot: " + d2;
+    if (S().core) S().core->Log("canvas locate via window shot: " + d2);
+    return true;
+}
+
 bool AcquireCanvasContext(CanvasCtxResult& out, std::string& diag) {
     // 等 agent 完成画布快照（canvas.arm 在抓取开始前已设置；抓取期间的
     // 前台切换与 Ctrl+A 通常已触发画布重绘）。第 5 轮还没抓到就让宿主
@@ -1609,12 +1697,17 @@ bool AcquireCanvasContext(CanvasCtxResult& out, std::string& diag) {
             //   纸的偏移）与裁剪无关。以前那句 `out.x0 += x0` 把裁剪原点当成了
             //   画布偏移的一部分（实测多加了 (272,128)，正好等于黑边宽度），
             //   于是 v2 明明算出 (0,0)，返回给产品的却是 (272,128)。
-            return LocateCanvasCtx(cr, tmpl, out, diag, docW, docH);
+            if (LocateCanvasCtx(cr, tmpl, out, diag, docW, docH)) return true;
+            if (LocateFromWindowShot(tmpl, out, diag, docW, docH)) return true;
+            return false;
         }
     }
     (void)cropX;
     (void)cropY;
-    return LocateCanvasCtx(view, tmpl, out, diag, docW, docH);
+    if (LocateCanvasCtx(view, tmpl, out, diag, docW, docH)) return true;
+    // ★ 快照可能"过期"（改画布大小/删图层之后钩子还攥着上一帧）：改用窗口
+    //   截图兜底，否则用户看到的就是"定位失败 → 图不补边 → 又错位了"。
+    return LocateFromWindowShot(tmpl, out, diag, docW, docH);
 }
 
 // 定位"画布上下文"：纯数学部分，输入只有两张 RGBA8 图 ——
@@ -2287,7 +2380,8 @@ struct Rect {
 //   **纸色**，一剥就把纸和内容一起剥掉，只剩内容包围盒 → 长宽比对不上 →
 //   整条定位失败。按边框剥则永远是"先剥视口、再剥纸"，与两者面积比例无关。
 bool FindCanvasRect(const ImageBuffer& view, int docW, int docH, Rect& out,
-                    std::string& diag, std::string* note) {
+                    std::string& diag, std::string* note,
+                    std::vector<Rect>* allRects = nullptr) {
     const int vw = view.Width(), vh = view.Height();
     const double targetAR = double(docW) / double(docH);
     std::vector<uint8_t> excl(size_t(vw) * vh, 0);
@@ -2366,6 +2460,9 @@ bool FindCanvasRect(const ImageBuffer& view, int docW, int docH, Rect& out,
         if (r.w < 32 || r.h < 32) break;
         cur = r;
         const bool isWholeView = (r.w >= vw - 1 && r.h >= vh - 1);
+        // 记下每一级的包围盒：.sai2 尺寸过期时（改了画布大小没保存）要靠它们
+        // 配合屏幕上的缩放读数反推画布尺寸。
+        if (allRects && !isWholeView) allRects->push_back(r);
         if (!isWholeView) {
             const double arErr = std::fabs(double(r.w) / double(r.h) - targetAR) /
                                  targetAR;
@@ -2701,6 +2798,107 @@ double ScoreAt(const ImageBuffer& v, const Samples& sm, int px, int py,
     return d + haloW * halo;
 }
 
+// ---------------------------------------------------------------------------
+// 尺度自恢复：.sai2 里的画布尺寸过期（用户改了画布大小但没保存）时，
+// 用"哪个缩放比例能把模板对进去"来确定尺度。
+//
+// 判据与 v2 一致（颜色吻合 + 轮廓外环渗色），但**取满足阈值的最大尺度**：
+// 纯色内容缩小后总能塞进色块里（代价≈0），所以"最小代价"会偏小；
+// 而"能对上的最大尺度"恰好是真实尺度（内容不可能比色块还大）。
+// 得到 s 之后画布尺寸 = 画布矩形 / s。
+// ---------------------------------------------------------------------------
+// 给定一个确定的缩放比例，在画布矩形内找最佳落位并返回代价值。
+// 用于"缩放读数候选"之间的判别：错的 s 代价会明显偏高。
+bool ScoreAtScale(const ImageBuffer& view, const ImageBuffer& tmpl,
+                  const Rect& rect, double s, double haloW, double& outCost,
+                  double& outD) {
+    const int tw = tmpl.Width(), th = tmpl.Height();
+    const int tsw = static_cast<int>(std::lround(tw * s));
+    const int tsh = static_cast<int>(std::lround(th * s));
+    if (tsw < 8 || tsh < 8 || tsw > rect.w + 2 || tsh > rect.h + 2) return false;
+    const int D = 8;
+    const ImageBuffer v8 = BoxDownRgb(view, D);
+    const ImageBuffer tS = ScaleArea(tmpl, tsw, tsh);
+    const ImageBuffer t8 = BoxDownRgb(tS, D, true);
+    if (t8.Width() < 2 || t8.Height() < 2) return false;
+    Samples sm;
+    if (!BuildSamples(t8, sm, 220, 180, 1, 3)) return false;
+    const int px0 = std::max(0, (rect.x0 + D - 1) / D);
+    const int py0 = std::max(0, (rect.y0 + D - 1) / D);
+    const int pxMax = (rect.x0 + rect.w) / D;
+    const int pyMax = (rect.y0 + rect.h) / D;
+    double best = 1e9, bestD = 1e9;
+    for (int py = py0; py <= pyMax - t8.Height(); py += 2) {
+        for (int px = px0; px <= pxMax - t8.Width(); px += 2) {
+            double d = 0, halo = 0;
+            const double c = ScoreAt(v8, sm, px, py, haloW, d, halo);
+            if (c < best) { best = c; bestD = d; }
+        }
+    }
+    if (best > 1e8) return false;
+    outCost = best;
+    outD = bestD;
+    return true;
+}
+
+bool ScanScale(const ImageBuffer& view, const ImageBuffer& tmpl, const Rect& rect,
+               double haloW, double& outS, int& outPx, int& outPy, double& outCost,
+               double& outD, std::string& note) {
+    const int tw = tmpl.Width(), th = tmpl.Height();
+    if (tw < 8 || th < 8) return false;
+    const int D = 8;
+    const ImageBuffer v8 = BoxDownRgb(view, D);
+    struct Hit { double cost; double d; double s; int x8, y8; };
+    std::vector<Hit> hits;
+    const int px0 = std::max(0, (rect.x0 + D - 1) / D);
+    const int py0 = std::max(0, (rect.y0 + D - 1) / D);
+    const int pxMax = (rect.x0 + rect.w) / D;
+    const int pyMax = (rect.y0 + rect.h) / D;
+    for (int k = 0; k <= 120; ++k) {
+        // 0.06 ~ 4.0 对数扫描（每步 1.035 倍）
+        const double s = 0.06 * std::pow(1.035, k);
+        if (s > 4.0) break;
+        const int tsw = static_cast<int>(std::lround(tw * s));
+        const int tsh = static_cast<int>(std::lround(th * s));
+        if (tsw < 8 || tsh < 8) continue;
+        if (tsw > rect.w + 2 || tsh > rect.h + 2) continue;
+        const ImageBuffer tS = ScaleArea(tmpl, tsw, tsh);
+        const ImageBuffer t8 = BoxDownRgb(tS, D, true);
+        if (t8.Width() < 2 || t8.Height() < 2) continue;
+        Samples sm;
+        if (!BuildSamples(t8, sm, 200, 160, 1, 3)) continue;
+        Hit best{1e9, 1e9, s, -1, -1};
+        for (int py = py0; py <= pyMax - t8.Height(); py += 2) {
+            for (int px = px0; px <= pxMax - t8.Width(); px += 2) {
+                double d = 0, halo = 0;
+                const double c = ScoreAt(v8, sm, px, py, haloW, d, halo);
+                if (c < best.cost) best = Hit{c, d, s, px, py};
+            }
+        }
+        if (best.x8 >= 0) hits.push_back(best);
+    }
+    if (hits.empty()) return false;
+    // 阈值：以最小代价为基准放宽（纯色/稀疏内容代价都接近 0）
+    double minCost = 1e9;
+    for (const Hit& h : hits) minCost = std::min(minCost, h.cost);
+    const double thr = std::max(minCost * 1.6 + 1.0, 4.0);
+    const Hit* best = nullptr;
+    for (const Hit& h : hits) {
+        if (h.cost > thr) continue;
+        if (!best || h.s > best->s) best = &h;   // 取最大尺度
+    }
+    if (!best) return false;
+    outS = best->s;
+    outPx = best->x8 * D;
+    outPy = best->y8 * D;
+    outCost = best->cost;
+    outD = best->d;
+    note = "scale-scan s=" + std::to_string(best->s) + " cost=" +
+           std::to_string(best->cost) + " (hits=" + std::to_string(hits.size()) +
+           ")";
+    return true;
+}
+
 } // namespace canloc
 
 // ===========================================================================
@@ -2733,9 +2931,115 @@ bool LocateCanvasCtxExact(const ImageBuffer& viewIn, const ImageBuffer& tmplIn,
     out.srcH = tmpl.Height();
 
     // ---- ① 画布矩形 + 尺度 -------------------------------------------------
+    // 两条路：
+    //   a) .sai2 文件头里的精确尺寸能与快照里的画布矩形对上 → 直接用（最准）；
+    //   b) 对不上（用户**改了画布大小但没保存**，文件里是旧尺寸 —— 实测就会
+    //      整条定位失败、图也不补边）→ 改用 SAI2 屏幕上的"缩放比例"读数反推
+    //      画布尺寸：docW = 矩形宽 / s。约束是"内容必须放得下 + 尺寸必须整数"，
+    //      这样就自动排除了状态栏里的 82%、100% 这些噪声。
     std::string trace;
     canloc::Rect rect;
-    if (!canloc::FindCanvasRect(view, docW, docH, rect, diag, &trace)) return false;
+    std::vector<canloc::Rect> allRects;
+    const int tw0 = tmpl.Width(), th0 = tmpl.Height();
+    bool docFromZoom = false;
+    if (!canloc::FindCanvasRect(view, docW, docH, rect, diag, &trace, &allRects)) {
+        // 用 SAI2 自己的"缩放比例"读数确定尺度，再用**匹配代价**判别是哪一个：
+        // 读数环里还有 82%(磁盘)/100%(别的控件)/10% 之类噪声，但错的 s 会让
+        // 模板明显对不上（代价高几个数量级），所以"取代价最低且内容放得下"的
+        // 那一个就够准。先补一次重绘：缩放读数是"状态控件"，只有重画才会重新
+        // 进文字环（实测不重绘时环里根本没有这个数）。
+        {
+            std::string rr;
+            sai2agent::AgentClient::Query("{\"cmd\":\"canvas.redraw\"}", rr);
+            Sleep(250);
+        }
+        std::vector<double> zooms;
+        ReadSai2ZoomCandidates(zooms);
+        struct Cand { double cost; double d; double s; canloc::Rect rect; int cw, ch; };
+        std::vector<Cand> cands;
+        bool found = false;
+        double bestCost = 1e9;
+        double bestD = 1e9;
+        std::string tries;
+        for (const canloc::Rect& cr : allRects) {
+            for (double s : zooms) {
+                const int cw0 = static_cast<int>(std::lround(cr.w / s));
+                const int ch0 = static_cast<int>(std::lround(cr.h / s));
+                if (cw0 < 16 || ch0 < 16 || cw0 > 100000 || ch0 > 100000) continue;
+                if (tw0 > cw0 + 2 || th0 > ch0 + 2) continue;   // 内容必须放得下
+                double cost = 0.0, dd = 0.0;
+                if (!canloc::ScoreAtScale(view, tmpl, cr, s, 30.0, cost, dd)) continue;
+                if (tries.size() < 260)
+                    tries += " [" + std::to_string(cw0) + "x" + std::to_string(ch0) +
+                             " s=" + std::to_string(s) + " cost=" +
+                             std::to_string(cost) + "]";
+                cands.push_back(Cand{cost, dd, s, cr, cw0, ch0});
+                if (cost < bestCost) {
+                    bestCost = cost;
+                    bestD = dd;
+                }
+            }
+        }
+        // 逐个候选（矩形 × 缩放读数）打分后这样选：
+        //   先按"代价够低"过滤（错的 s 明显更高），再取**最大 s**。
+        //   为什么是最大 s：纯色内容缩小后总能塞进色块里（代价也低），只有
+        //   "内容刚好和色块一样大"的那个 s 才是真的 —— 内容不会比自己的色块大。
+        if (!cands.empty()) {
+            const double thr = std::max(bestCost * 1.8 + 3.0, 6.0);
+            const Cand* pick = nullptr;
+            for (const Cand& c : cands) {
+                if (c.cost > thr) continue;
+                if (!pick || c.s > pick->s) pick = &c;
+            }
+            if (pick) {
+                docW = pick->cw;
+                docH = pick->ch;
+                rect = pick->rect;
+                bestCost = pick->cost;
+                bestD = pick->d;
+                found = true;
+            }
+        }
+        // 代价太高 = 没找到内容（遮挡/快照过期），宁可失败也不乱贴
+        if (found && bestD > 25.0) {
+            diag = "scale candidates all mismatch (best d=" +
+                   std::to_string(bestD) + ")" + tries;
+            return false;
+        }
+        if (!found) {
+            // 再兜一层：扫描尺度（不需要知道画布尺寸），由"模板能对上"反推 s，
+            // 再画布尺寸 = 矩形 / s。这是改了画布大小又没保存时的唯一出路。
+            double s2 = 0.0, cost = 0.0, d2 = 0.0;
+            int pxs = 0, pys = 0;
+            std::string note;
+            // 矩形候选里挑面积最大的那个当画布（内容不会比画布大）
+            const canloc::Rect* rc = nullptr;
+            for (const canloc::Rect& cr : allRects)
+                if (!rc || cr.w * cr.h > rc->w * rc->h) rc = &cr;
+            if (rc && canloc::ScanScale(view, tmpl, *rc, 30.0, s2, pxs, pys, cost,
+                                        d2, note)) {
+                const int cw0 = static_cast<int>(std::lround(rc->w / s2));
+                const int ch0 = static_cast<int>(std::lround(rc->h / s2));
+                if (cw0 >= 16 && ch0 >= 16 && tw0 <= cw0 + 2 && th0 <= ch0 + 2) {
+                    docW = cw0;
+                    docH = ch0;
+                    rect = *rc;
+                    docFromZoom = true;   // 同一路"尺寸是推出来的"
+                    trace += " [" + note + "]";
+                    found = true;
+                }
+            }
+        }
+        if (!found) {
+            diag = "canvas rect not found (view " + std::to_string(view.Width()) +
+                   "x" + std::to_string(view.Height()) + ", doc " +
+                   std::to_string(docW) + "x" + std::to_string(docH) + trace +
+                   "; 缩放读数候选 " + std::to_string(zooms.size()) + " 个" + tries +
+                   "; 若刚改过画布大小，请先保存一次或把视图缩放到能看见整块画布)";
+            return false;
+        }
+        docFromZoom = true;
+    }
     const double sW = double(rect.w) / double(docW);
     const double sH = double(rect.h) / double(docH);
     const double sAvg = 0.5 * (sW + sH);
@@ -2976,7 +3280,8 @@ bool LocateCanvasCtxExact(const ImageBuffer& viewIn, const ImageBuffer& tmplIn,
     out.y0 = y0;
     out.score = win.cost;
     out.ok = true;
-    diag = "v2 s=" + std::to_string(sAvg) + " cost=" + std::to_string(win.cost) +
+    diag = std::string(docFromZoom ? "[size from SAI2 zoom readout] " : "") +
+           "v2 s=" + std::to_string(sAvg) + " cost=" + std::to_string(win.cost) +
            " d=" + std::to_string(win.d) + " halo=" + std::to_string(win.halo) +
            " rect=" + std::to_string(rect.x0) + "," + std::to_string(rect.y0) + " " +
            std::to_string(rect.w) + "x" + std::to_string(rect.h) + trace;
@@ -3488,6 +3793,56 @@ void CtrlClickAtScreenImpl(int x, int y) {
     in[4].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(5, in, sizeof(INPUT));
 }
+
+// SAI2 自己的"缩放比例"读数（左面板里画的那串 "50%"）。
+// 为什么需要它：精确画布尺寸是从 .sai2 文件头读的，而**改了画布大小还没保存**
+// 时文件里是旧尺寸（用户实测：改完画布再抓就整条定位失败）。这时唯一还准的
+// 信息是屏幕上的缩放比例 —— 有了 s，画布尺寸 = 画布矩形 / s。
+//
+// 返回一串候选（因为文字环里还有 "100%"、"82%"、"2% (2%)" 这类状态栏读数），
+// 由调用方用"内容必须放得下 + 尺寸必须是整数"来挑。
+namespace {
+void ReadSai2ZoomCandidates(std::vector<double>& out) {
+    out.clear();
+    std::string resp;
+    if (!sai2agent::AgentClient::Query("{\"cmd\":\"text.recent\",\"n\":400}",
+                                       resp))
+        return;
+    size_t pos = resp.find("\"items\":[");
+    if (pos == std::string::npos) return;
+    size_t cur = pos + 9;
+    size_t objBegin;
+    while (sai2bridge::detail::NextObject(resp, cur, resp.size(), &objBegin,
+                                          &cur)) {
+        const std::string obj = resp.substr(objBegin, cur - objBegin);
+        std::string t8;
+        if (!sai2agent::JsonFindString(obj, "text", t8)) continue;
+        const std::wstring t = sai2bridge::detail::Utf8ToWide(t8);
+        // 只认纯数字 + "%"，允许前后空白；"2% (2%)" 这种带括号的自动排除
+        size_t b = 0, e = t.size();
+        while (b < e && (t[b] == L' ' || t[b] == L'\t')) ++b;
+        while (e > b && (t[e - 1] == L' ' || t[e - 1] == L'\t')) --e;
+        if (e < b + 2 || t[e - 1] != L'%') continue;
+        const std::wstring num = t.substr(b, e - b - 1);
+        bool ok = !num.empty();
+        int digits = 0, dots = 0;
+        for (size_t i = 0; i < num.size() && ok; ++i) {
+            if (num[i] == L'.') { ++dots; ok = (dots <= 1); }
+            else if (num[i] >= L'0' && num[i] <= L'9') ++digits;
+            else ok = false;
+        }
+        if (!ok || digits == 0 || digits > 3) continue;
+        const double pct = wcstod(num.c_str(), nullptr);
+        if (pct <= 0.0 || pct > 4000.0) continue;
+        const double s = pct / 100.0;
+        bool dup = false;
+        for (double v : out)
+            if (std::fabs(v - s) < 1e-6) { dup = true; break; }
+        if (!dup) out.push_back(s);
+    }
+}
+
+} // namespace
 
 bool FindCapturedText(const wchar_t* text, int& outX, int& outY,
                       ULONGLONG minTick) {
