@@ -277,10 +277,18 @@ void BridgeCore::SetImage(ImageBuffer img, const std::string& sourceLabel) {
     // 同时**作废过期的画布上下文** —— 偏移是针对某一块包围盒算出来的，
     // 换了一张尺寸不同的图（用户复制了选区、换了图层、从外部剪贴板抓图）
     // 就不能再拿它补边，否则内容会被摆到错误位置（用户看到的"位置不对"）。
+    //
+    // ★ 判定必须用 original_（移动后的新图），**不能用 img**：img 已被
+    //   std::move 搬空，IsValid() 为 false，于是 CanvasCtxFits 恒返回 false →
+    //   每次 SetImage 都把刚定位好的上下文作废。实测后果：抓取流程第 4 步刚
+    //   SetCanvasContext(true, 1080,1640, …)，紧接着 SetImage 就把它丢了 →
+    //   面板永远显示"⚠ 无画布尺寸"、图永远不补边（用户 21:26 那次就是这个，
+    //   日志里 "canvas ctx dropped: image 760x611 != ctx source 760x611"
+    //   两个尺寸一模一样却还是被丢弃）。
     baseIsCanvas_ = false;
-    if (hasCanvasCtx_ && !CanvasCtxFits(img)) {
-        Log("canvas ctx dropped: image " + std::to_string(img.Width()) + "x" +
-            std::to_string(img.Height()) + " != ctx source " +
+    if (hasCanvasCtx_ && !CanvasCtxFits(original_)) {
+        Log("canvas ctx dropped: image " + std::to_string(original_.Width()) +
+            "x" + std::to_string(original_.Height()) + " != ctx source " +
             std::to_string(ctxSrcW_) + "x" + std::to_string(ctxSrcH_) +
             " (需重新定位)");
         SetCanvasContext(false, 0, 0, 0, 0);

@@ -934,9 +934,15 @@ void CollectWindowTitles(DWORD pid, std::vector<std::wstring>& titles) {
     TitleCtx ctx{pid, &titles};
     EnumWindows(&TitleEnumProc, reinterpret_cast<LPARAM>(&ctx));
 }
+// 诊断用：Sai2DocCanvasSize 试过的候选路径（--doc-test 打印）。
+// "拿不到 .sai2 精确尺寸"有很多种原因（标题格式/目录名本地化/回退拼接），
+// 只有把真正尝试过的路径摆出来才能一眼看出是哪一步断的。
+std::vector<std::wstring> g_docSizeTrace;
+
 bool Sai2DocCanvasSize(int& w, int& h) {
     w = 0;
     h = 0;
+    g_docSizeTrace.clear();
     std::vector<std::wstring> titles;
     wchar_t title[512] = {0};
     HWND sai = FindSai2Window();
@@ -966,9 +972,18 @@ bool Sai2DocCanvasSize(int& w, int& h) {
         if (dash == std::wstring::npos) continue;
         std::wstring tail = tt.substr(dash + 3);
         // 去掉未保存标记 " (*)" / " *"
+        // ★ 这里以前写的是 tail.compare(tail.size()-3, 3, L" (*)") —— 用 3 个
+        //   字符去和 4 个字符的字面量比，**永远不相等**，于是 " (*)" 从来没被
+        //   去掉过：候选路径全都带着 " (*)"，一个都打不开 → Sai2DocCanvasSize
+        //   永远失败 → 拿不到精确画布尺寸（退回快照估算）→ 整条"精确回贴"
+        //   长期静默降级。而用户的标题几乎总有 " (*)"（画过就有未保存修改），
+        //   所以这是普遍现象，不是边缘情况。
+        static const std::wstring kUnsavedTail = L" (*)";
         for (;;) {
-            if (tail.size() >= 3 && tail.compare(tail.size() - 3, 3, L" (*)") == 0) {
-                tail.erase(tail.size() - 3);
+            if (tail.size() >= kUnsavedTail.size() &&
+                tail.compare(tail.size() - kUnsavedTail.size(),
+                             kUnsavedTail.size(), kUnsavedTail) == 0) {
+                tail.erase(tail.size() - kUnsavedTail.size());
                 continue;
             }
             if (!tail.empty() && (tail.back() == L'*' || tail.back() == L' ')) {
@@ -977,13 +992,24 @@ bool Sai2DocCanvasSize(int& w, int& h) {
             }
             break;
         }
-        std::wstring rel = tail;
-        for (size_t i = 0; i + 2 < rel.size(); ++i)
-            if (rel[i] == L' ' && rel[i + 1] == L'/' && rel[i + 2] == L' ') {
-                rel[i] = L'\\';
-                rel[i + 1] = L' ';
-                rel[i + 2] = L'\\';
+        // " / " 分隔的层级 → 反斜杠。
+        // ★ 这里以前把三个字符原地改写成 `\`、` `、`\`（中间那个空格没删），
+        //   结果相对路径变成 `桌面\ \测试.sai2` —— 后面无论怎么拼都打不开文件，
+        //   于是整条"无盘符回退"永远失败 → 拿不到精确画布尺寸 → 退回旧的多尺度
+        //   定位（实测给出 offset(442,498)，真值 (0,0)）→ 用户看到的"位置不对/
+        //   回贴错位"。必须真正**删掉**两侧空格，只留一个反斜杠。
+        std::wstring rel;
+        rel.reserve(tail.size());
+        for (size_t i = 0; i < tail.size();) {
+            if (i + 2 < tail.size() + 0 && tail[i] == L' ' &&
+                tail[i + 1] == L'/' && tail[i + 2] == L' ') {
+                rel += L'\\';
+                i += 3;
+            } else {
+                rel += tail[i];
+                ++i;
             }
+        }
         // 本地化文件夹名 → 真实目录名
         struct Map { const wchar_t* from; const wchar_t* to; };
         const Map kNames[] = {{L"桌面", L"Desktop"}, {L"文档", L"Documents"},
@@ -1013,8 +1039,11 @@ bool Sai2DocCanvasSize(int& w, int& h) {
             cands.push_back(std::wstring(prof) + L"\\" + root + L"\\" + tailNoFolder);
             cands.push_back(std::wstring(prof) + L"\\" + root + L"\\" + rel);
         }
-        for (const std::wstring& c : cands)
-            if (ReadSai2CanvasSize(c, w, h)) return true;
+        for (const std::wstring& c : cands) {
+            const bool ok = ReadSai2CanvasSize(c, w, h);
+            g_docSizeTrace.push_back(std::wstring(ok ? L"OK   " : L"miss ") + c);
+            if (ok) return true;
+        }
     }
     return false;
 }
@@ -3296,7 +3325,12 @@ void RunCaptureJob() {
                 break;
             }
         }
-        if (!j.grabbed && ClipboardHasImage()) j.grabbed = true;
+        // ★ 以前这里还有一句 `if (!j.grabbed && ClipboardHasImage())
+        //   j.grabbed = true;` —— 只要剪贴板里**本来就有图**（用户刚截的屏、
+        //   上一次的抓取结果、从别的程序复制的图）就算抓取成功。后果是抓到的
+        //   根本不是本层内容：尺寸对不上、内容对不上，定位必然失败，用户看到
+        //   的就是"抓取不完整 / 不是画布大小 / 位置不对"。
+        //   现在只认"剪贴板序列号变了"这一条硬证据。
     }
 
     // 3) 兜底：快捷键没拿到图再退回旧菜单点击链路
@@ -3325,8 +3359,9 @@ void RunCaptureJob() {
                 break;
             }
         }
-        if (!j.grabbed && ClipboardHasImage()) j.grabbed = true;
-        if (!j.grabbed) j.message = L"SAI2 没有把图像放进剪贴板（拷贝失败？）";
+        // 同上：不再"剪贴板里有图就算成功"（那是别人的图，不是这一层）。
+        if (!j.grabbed)
+            j.message = L"SAI2 没有把图像放进剪贴板（拷贝失败？剪贴板里的旧图不会被当成图层）";
     }
     // 4) 画布上下文（精确回贴）：读画布快照 + 模板匹配求内容偏移
     if (j.grabbed && ctxArmed) {
@@ -3334,7 +3369,10 @@ void RunCaptureJob() {
         std::string diag;
         if (AcquireCanvasContext(ctx, diag)) {
             st.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0,
-                                    ctx.srcW, ctx.srcH);
+                                      ctx.srcW, ctx.srcH);
+            // 把定位细节写日志：用户反馈"位置不对"时，光看 cw/ch/offset 分不清
+            // 是尺度过估、画布矩形量错，还是内容本来就被同色内容包住。
+            st.core->Log("canvas locate: " + diag);
         } else {
             st.core->SetCanvasContext(false, 0, 0, 0, 0);
             st.core->Log("canvas ctx: locate failed (" + diag + "), no auto-paste on apply");
@@ -3699,6 +3737,7 @@ void DoApplyFlow(UiWindow& win) {
         if (AcquireCanvasContext(ctx, ctxDiag) && ctx.ok) {
             s.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0,
                                      ctx.srcW, ctx.srcH);
+            s.core->Log("canvas locate (on apply): " + ctxDiag);
             aligned = true;
         }
     }
@@ -4805,9 +4844,21 @@ int RunDocTest() {
 
     std::wstring path;
     const bool parsed = Sai2DocPathFromTitle(title, path);
-    std::printf("[1] 标题解析: %s\n", parsed ? "OK" : "失败");
+    std::printf("[1] 标题解析（严格：必须带盘符）: %s\n", parsed ? "OK" : "失败");
     if (parsed) std::printf("    -> %s\n", W2U8(path).c_str());
-    if (!parsed) return 1;
+    if (!parsed) {
+        // 标题里没有盘符（实测 `… - 桌面 / 测试.sai2 (*)`）时严格解析必然失败，
+        // 生产链路要靠 Sai2DocCanvasSize 里的用户目录回退 —— 直接跳到 [8]。
+        int dw = 0, dh = 0;
+        const bool docSized = Sai2DocCanvasSize(dw, dh);
+        std::printf("[8] Sai2DocCanvasSize（生产链路，含无盘符回退）: %s  画布=%dx%d\n",
+                    docSized ? "OK" : "失败", dw, dh);
+        std::printf("[9] 尝试过的候选路径 %d 条:\n",
+                    static_cast<int>(g_docSizeTrace.size()));
+        for (const std::wstring& t : g_docSizeTrace)
+            std::printf("      %s\n", W2U8(t).c_str());
+        return docSized ? 0 : 1;
+    }
 
     const DWORD attr = GetFileAttributesW(path.c_str());
     std::printf("[2] 文件存在: %s (attr=0x%08lX)\n",
@@ -4841,7 +4892,15 @@ int RunDocTest() {
     const bool sized = ReadSai2CanvasSize(path, w, h);
     std::printf("[7] ReadSai2CanvasSize: %s  画布=%dx%d\n",
                 sized ? "OK" : "失败", w, h);
-    return sized ? 0 : 1;
+    // ★ 生产链路走的是 Sai2DocCanvasSize（会遍历该进程所有窗口标题 + 无盘符
+    //   时的用户目录回退）。用户标题实测是 `… - 桌面 / 测试.sai2 (*)`（没有
+    //   盘符），单测 [1] 解析必然失败，但 [8] 才是真正的判定 —— 以前这里只
+    //   跑到 [1] 就 return，看不出回退路径到底有没有生效。
+    int dw = 0, dh = 0;
+    const bool docSized = Sai2DocCanvasSize(dw, dh);
+    std::printf("[8] Sai2DocCanvasSize（生产链路，含无盘符回退）: %s  画布=%dx%d\n",
+                docSized ? "OK" : "失败", dw, dh);
+    return (sized || docSized) ? 0 : 1;
 }
 
 // 不碰 agent、不碰剪贴板、不改 SAI2 —— 用已经落盘的两张图确定性复现匹配，
