@@ -10,6 +10,7 @@
 
 #include "BridgeCore.h"
 
+#include "BmpIO.h"
 #include "BridgeHostContext.h"
 #include "ClipboardImage.h"
 #include "sai2/host/PluginManager.h"
@@ -17,12 +18,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <string>
 
 namespace sai2 {
 namespace bridge {
@@ -399,6 +402,26 @@ void BridgeCore::RebuildPreviewSource(int winIdx) {
     wp->scale = static_cast<float>(wp->src.Width()) /
                 static_cast<float>(std::max(1, base.Width()));
     wp->commitScale = wp->scale;
+    // 诊断开关：设了 SAI2_BRIDGE_DUMP_PREVIEW 就把窗口实际显示的那张预览落盘。
+    // "窗口里显示不全 / 位置不对"这类问题只有看到这张图才能判断是补边错了
+    // 还是窗口拿到了旧图（界面上两者长得差不多）。
+    {
+        char dumpDir[512] = {0};
+        if (GetEnvironmentVariableA("SAI2_BRIDGE_DUMP_PREVIEW", dumpDir, 512) > 0) {
+            char path[MAX_PATH] = {0};
+            std::snprintf(path, sizeof(path), "%s\\preview_w%d.bmp", dumpDir, w);
+            std::string werr;
+            WriteBmp32(wp->src, path, werr);
+            char bp[MAX_PATH] = {0};
+            std::snprintf(bp, sizeof(bp), "%s\\base_w%d.bmp", dumpDir, w);
+            WriteBmp32(base, bp, werr);
+            Log(std::string("preview dumped: ") + path + " " +
+                std::to_string(wp->src.Width()) + "x" +
+                std::to_string(wp->src.Height()) + " base=" +
+                std::to_string(base.Width()) + "x" +
+                std::to_string(base.Height()));
+        }
+    }
 }
 
 // 最近邻 + 邻域平均的简单降采样（预览足够，且不引入额外依赖）
@@ -414,18 +437,25 @@ ImageBuffer BridgeCore::Downscale(const ImageBuffer& src, int maxDim) {
 
     ImageBuffer out;
     out.Create(nw, nh, src.Format());
-    const int bx = std::max(1, w / nw);
-    const int by = std::max(1, h / nh);
     const uint32_t bpc = src.BytesPerChannel();
-
+    // ★ 采样盒必须按**浮点比例**算，不能 w/nw 整除。
+    //   原来写的是 bx = max(1, w/nw)：1080x1640 缩到 592x900 时
+    //   bx=by=1（整数除法），于是"降采样"退化成**取左上角 592x900 的裁剪**——
+    //   预览只显示画布左上角那一块，窗口里看着就是"图像显示不全 / 内容被切掉"，
+    //   而图像本身、补边、回贴都没问题（用户反馈的正是这个现象）。
+    //   液化预览（按像素预算算 limit）同样中招。
     for (int y = 0; y < nh; ++y) {
+        const int sy0 = static_cast<int>(static_cast<long long>(y) * h / nh);
+        const int sy1 = std::max(sy0 + 1, static_cast<int>(
+            static_cast<long long>(y + 1) * h / nh));
         for (int x = 0; x < nw; ++x) {
+            const int sx0 = static_cast<int>(static_cast<long long>(x) * w / nw);
+            const int sx1 = std::max(sx0 + 1, static_cast<int>(
+                static_cast<long long>(x + 1) * w / nw));
             uint32_t acc[4] = {0, 0, 0, 0};
             uint32_t n = 0;
-            for (int dy = 0; dy < by; ++dy) {
-                const int sy = std::min(h - 1, y * by + dy);
-                for (int dx = 0; dx < bx; ++dx) {
-                    const int sx = std::min(w - 1, x * bx + dx);
+            for (int sy = sy0; sy < std::min(h, sy1); ++sy) {
+                for (int sx = sx0; sx < std::min(w, sx1); ++sx) {
                     const uint8_t* p = src.Data() +
                                        static_cast<size_t>(sy) * src.Stride() +
                                        static_cast<size_t>(sx) * 4 * bpc;

@@ -2726,6 +2726,11 @@ bool LocateCanvasCtxExact(const ImageBuffer& viewIn, const ImageBuffer& tmplIn,
         (viewIn.Format() == PixelFormat::RGBA8) ? viewIn : ImageBuffer::Convert(viewIn, PixelFormat::RGBA8);
     const ImageBuffer tmpl =
         (tmplIn.Format() == PixelFormat::RGBA8) ? tmplIn : ImageBuffer::Convert(tmplIn, PixelFormat::RGBA8);
+    // 这套偏移是针对哪块包围盒算的：任何调用方都要拿到（以前只在
+    // AcquireCanvasContext 里填，别处直接调 LocateCanvasCtx 就会留下 0，
+    // 之后 SetImage 一看"尺寸对不上"就把刚定位好的上下文作废）。
+    out.srcW = tmpl.Width();
+    out.srcH = tmpl.Height();
 
     // ---- ① 画布矩形 + 尺度 -------------------------------------------------
     std::string trace;
@@ -5011,6 +5016,78 @@ int RunPadClipboard(const std::string& snapPath, const std::string& tmplPath,
     return 0;
 }
 
+// --ctx-flow-test <snapshot.bmp> <template.bmp>
+// 复现"抓取"的真实先后顺序（先定位 SetCanvasContext，再把图交给核心 SetImage），
+// 并在每一步后打印基准图里内容的实际偏移。用途：定位"内容被摆了两次"这类
+// 只在特定顺序下出现的坐标 bug（窗口里显示的位置 = 偏移的两倍时就是它）。
+static int ContentOffsetOf(const ImageBuffer& img, int& ox, int& oy) {
+    if (!img.IsValid()) return 0;
+    int x0 = img.Width(), y0 = img.Height(), xn = -1, yn = -1;
+    for (int y = 0; y < img.Height(); ++y)
+        for (int x = 0; x < img.Width(); ++x) {
+            RGBA c;
+            if (!img.GetPixel(x, y, c)) continue;
+            if (c.a < 8) continue;
+            if (x < x0) x0 = x;
+            if (x > xn) xn = x;
+            if (y < y0) y0 = y;
+            if (y > yn) yn = y;
+        }
+    if (xn < x0 || yn < y0) return 0;
+    ox = x0;
+    oy = y0;
+    return (xn - x0 + 1) * 100000 + (yn - y0 + 1);
+}
+
+int RunCtxFlowTest(const std::string& snapPath, const std::string& tmplPath,
+                   const std::string& pluginsDir, const std::string& logDir) {
+    AttachParentConsole();
+    ImageBuffer view, tmpl;
+    std::string err;
+    if (!ReadBmp32(snapPath, view, err) || !ReadBmp32(tmplPath, tmpl, err)) {
+        std::printf("FAIL 读图: %s\n", err.c_str());
+        return 2;
+    }
+    int docW = 0, docH = 0;
+    if (!Sai2DocCanvasSize(docW, docH)) {
+        std::printf("FAIL 读不到 .sai2 画布尺寸（SAI2 没开或文档没保存）\n");
+        return 2;
+    }
+    CanvasCtxResult ctx;
+    std::string diag;
+    if (!LocateCanvasCtx(view, tmpl, ctx, diag, docW, docH)) {
+        std::printf("FAIL 定位失败: %s\n", diag.c_str());
+        return 1;
+    }
+    std::printf("定位: 画布=%dx%d 偏移=(%d,%d) %s\n", ctx.cw, ctx.ch, ctx.x0,
+                ctx.y0, diag.c_str());
+    BridgeCore core(pluginsDir, logDir);
+    if (!core.Startup(err)) {
+        std::printf("FAIL 启动核心: %s\n", err.c_str());
+        return 2;
+    }
+    auto dump = [&](const char* tag) {
+        int ox = -1, oy = -1;
+        const int wh = ContentOffsetOf(core.OriginalImage(), ox, oy);
+        std::printf("  %-28s base=%dx%d content@(%d,%d) size=%dx%d ctx=%s\n", tag,
+                    core.OriginalImage().Width(), core.OriginalImage().Height(), ox,
+                    oy, wh / 100000, wh % 100000,
+                    core.HasCanvasContext() ? "yes" : "no");
+    };
+    // 真实顺序：启动时剪贴板里可能先有一张旧图
+    core.SetImage(tmpl.Clone(), "startup-clipboard");
+    dump("1 SetImage(旧剪贴板图)");
+    core.SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0, ctx.srcW, ctx.srcH);
+    dump("2 SetCanvasContext(定位)");
+    core.SetImage(tmpl.Clone(), "captured-layer");
+    dump("3 SetImage(本次抓到的图)");
+    // 应用前可能再定位一次（DoApplyFlow 的分支）
+    core.SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0, ctx.srcW, ctx.srcH);
+    dump("4 SetCanvasContext(应用前再次)");
+    core.Shutdown();
+    return 0;
+}
+
 // 主面板窗口类名与窗口过程：给 UiWindow.cpp 的 RegisterWindowClasses 用。
 // 这里必须是**唯一**注册主面板类的地方 —— 重复注册同名类会让窗口挂上
 // 错误的窗口过程（现象：主面板整块空白，这个 bug 已经踩过一次）。
@@ -5053,6 +5130,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     std::string dumpPath;
     bool ctxTest = false;
     bool locateTest = false;
+    bool ctxFlowTest = false;
     bool docTest = false;
     std::string mlA, mlB, mlOut;
     std::string clipPadIn, clipPadCw, clipPadCh, clipPadX, clipPadY;
@@ -5132,6 +5210,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         }
         else if (a == L"--ctx-test") ctxTest = true;
         else if (a == L"--locate-test") locateTest = true;
+        else if (a == L"--ctx-flow-test") {
+            next(matchSnap);
+            next(matchTmpl);
+            ctxFlowTest = true;
+        }
         else if (a == L"--doc-test") docTest = true;
         else if (a == L"--ml-sel") {
             // 测试钩子：预设图层多选（如 "0,1"），供无人值守验证"一起液化"
@@ -5266,6 +5349,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
                                  std::atoi(mlBx.c_str()),
                                  std::atoi(mlBy.c_str()), mlOut,
                                  pluginsDir, logDir);
+    if (ctxFlowTest && !matchSnap.empty() && !matchTmpl.empty())
+        return RunCtxFlowTest(matchSnap, matchTmpl, pluginsDir, logDir);
     if (docTest) return RunDocTest();
     if (ctxTest) return RunCanvasCtxTest();
     // --locate-test：画布定位 v2 的合成回归（不碰 SAI2 / 剪贴板 / 文件）
