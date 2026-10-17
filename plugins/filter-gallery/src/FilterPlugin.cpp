@@ -113,6 +113,24 @@ public:
                                std::string(f->GetInfo().name)).c_str());
         host_->SnapshotForUndo("Filter Gallery");
 
+        // ★ 先记下原始 alpha 遮罩。滤镜只应作用于**图层内容**；否则会把
+        //   alpha=0 的透明区也写成不透明（素描类写灰白、阈值类写黑白），
+        //   补边成画布后整片糊住画面（用户实测："一大片淡黄色糊住画面"）。
+        //   这里是**中心化**修复：执行后按原始 alpha 还原，47 个新滤镜与老的
+        //   10 个一并生效，不必逐个改算法。
+        const int aw = canvas->Width(), ah = canvas->Height();
+        std::vector<uint16_t> a0;
+        const bool is16 = canvas->Format() == PixelFormat::RGBA16;
+        if (aw > 0 && ah > 0) {
+            a0.resize(static_cast<size_t>(aw) * ah);
+            for (int y = 0; y < ah; ++y)
+                for (int x = 0; x < aw; ++x) {
+                    RGBA c;
+                    canvas->GetPixel(x, y, c);
+                    a0[static_cast<size_t>(y) * aw + x] = c.a;
+                }
+        }
+
         const Selection* sel = host_->GetSelection();
         if (!f->Apply(*canvas, sel)) {
             // 未实现的滤镜（移植中）必须**明确失败**：否则界面显示"已应用"
@@ -124,6 +142,20 @@ public:
             return false;
         }
 
+        // 还原 alpha：透明处保持透明，半透明处恢复原始不透明度
+        if (!a0.empty()) {
+            for (int y = 0; y < ah; ++y)
+                for (int x = 0; x < aw; ++x) {
+                    const uint16_t a = a0[static_cast<size_t>(y) * aw + x];
+                    RGBA c;
+                    canvas->GetPixel(x, y, c);
+                    if (c.a != a) {
+                        c.a = a;
+                        canvas->SetPixel(x, y, c);
+                    }
+                }
+        }
+        (void)is16;
         host_->Log(LogLevel::Info,
                    ("applied filter: " + std::string(f->GetInfo().id)).c_str());
         host_->RefreshCanvas();
