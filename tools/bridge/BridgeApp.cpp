@@ -26,6 +26,7 @@
 #include "Demo.h"
 
 #include <algorithm>
+#include <cwchar>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -888,15 +889,99 @@ bool ReadSai2CanvasSize(const std::wstring& path, int& w, int& h) {
 // 便利封装：SAI2 主窗口标题 → 当前 .sai2 → 精确画布尺寸。
 // 任何一步失败都返回 false（未保存文档 / 标题格式变化 / 文件读不到），
 // 调用方静默退回"从快照推算"，行为与加这个功能之前完全一致。
+namespace {
+struct TitleCtx { DWORD pid; std::vector<std::wstring>* out; };
+BOOL CALLBACK TitleEnumProc(HWND h, LPARAM lp) {
+    TitleCtx* c = reinterpret_cast<TitleCtx*>(lp);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != c->pid) return TRUE;
+    wchar_t buf[512] = {0};
+    if (GetWindowTextW(h, buf, 512) <= 0) return TRUE;
+    const std::wstring s(buf);
+    for (const std::wstring& e : *c->out)
+        if (e == s) return TRUE;
+    c->out->push_back(s);
+    return TRUE;
+}
+} // namespace
+
+void CollectWindowTitles(DWORD pid, std::vector<std::wstring>& titles) {
+    TitleCtx ctx{pid, &titles};
+    EnumWindows(&TitleEnumProc, reinterpret_cast<LPARAM>(&ctx));
+}
 bool Sai2DocCanvasSize(int& w, int& h) {
     w = 0;
     h = 0;
+    std::vector<std::wstring> titles;
     wchar_t title[512] = {0};
-    if (HWND sai = FindSai2Window()) GetWindowTextW(sai, title, 512);
-    if (title[0] == 0) return false;
-    std::wstring docPath;
-    if (!Sai2DocPathFromTitle(title, docPath)) return false;
-    return ReadSai2CanvasSize(docPath, w, h);
+    HWND sai = FindSai2Window();
+    if (sai) {
+        GetWindowTextW(sai, title, 512);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(sai, &pid);
+        // ★ 只读"主窗口标题"是不够的：实测拿到的是 "SAI2 插件入口" ✗
+        //   （不是文档标题）→ 解析不出 .sai2 路径 → 拿不到精确画布尺寸 ✗。
+        //   这里把该进程**所有**顶层窗口的标题都收一遍，取第一个能解析出
+        //   文档路径的 —— 精确尺寸（2160x3280 之类）从此不再依赖窗口标题格式。
+        if (pid) CollectWindowTitles(pid, titles);
+    }
+    if (title[0]) titles.insert(titles.begin(), std::wstring(title));
+    for (const std::wstring& tt : titles) {
+        std::wstring docPath;
+        if (Sai2DocPathFromTitle(tt, docPath) && ReadSai2CanvasSize(docPath, w, h))
+            return true;
+    }
+    // ★ 回退：标题里**没有盘符**时（实测 `… - 桌面 / 博丽灵梦.sai2 (*)`），
+    //   把尾部相对路径拼到常见用户目录下再试。
+    //   这是"拿不到精确画布尺寸"最常见的原因（SAI2 的标题只给文件夹名）。
+    const wchar_t* kRoots[] = {L"Desktop", L"Documents", L"Downloads", L"Pictures",
+                               L"OneDrive\\Desktop", L"OneDrive\\Documents"};
+    for (const std::wstring& tt : titles) {
+        const size_t dash = tt.rfind(L" - ");
+        if (dash == std::wstring::npos) continue;
+        std::wstring tail = tt.substr(dash + 3);
+        // 去掉未保存标记 " (*)" / " *"
+        for (;;) {
+            if (tail.size() >= 3 && tail.compare(tail.size() - 3, 3, L" (*)") == 0) {
+                tail.erase(tail.size() - 3);
+                continue;
+            }
+            if (!tail.empty() && (tail.back() == L'*' || tail.back() == L' ')) {
+                tail.pop_back();
+                continue;
+            }
+            break;
+        }
+        std::wstring rel = tail;
+        for (size_t i = 0; i + 2 < rel.size(); ++i)
+            if (rel[i] == L' ' && rel[i + 1] == L'/' && rel[i + 2] == L' ') {
+                rel[i] = L'\\';
+                rel[i + 1] = L' ';
+                rel[i + 2] = L'\\';
+            }
+        // 本地化文件夹名 → 真实目录名
+        struct Map { const wchar_t* from; const wchar_t* to; };
+        const Map kNames[] = {{L"桌面", L"Desktop"}, {L"文档", L"Documents"},
+                              {L"下载", L"Downloads"}, {L"图片", L"Pictures"}};
+        std::wstring tailNoFolder = rel;
+        for (const Map& m : kNames) {
+            if (rel.rfind(m.from, 0) == 0) {
+                tailNoFolder = std::wstring(m.to) + rel.substr(std::wcslen(m.from));
+                break;
+            }
+        }
+        wchar_t prof[512] = {0};
+        if (!GetEnvironmentVariableW(L"USERPROFILE", prof, 512)) break;
+        std::vector<std::wstring> cands;
+        for (const wchar_t* root : kRoots) {
+            cands.push_back(std::wstring(prof) + L"\\" + root + L"\\" + tailNoFolder);
+            cands.push_back(std::wstring(prof) + L"\\" + root + L"\\" + rel);
+        }
+        for (const std::wstring& c : cands)
+            if (ReadSai2CanvasSize(c, w, h)) return true;
+    }
+    return false;
 }
 
 // SAI2 主窗口标题 → 当前文档完整路径。
@@ -1396,6 +1481,43 @@ bool AcquireCanvasContext(CanvasCtxResult& out, std::string& diag) {
     // 钉死 —— 不依赖任何逆向/内存读取，只是读一个普通文件。
     int docW = 0, docH = 0;
     Sai2DocCanvasSize(docW, docH);
+    // ★ 先把快照裁到"非黑内容区"再定位。
+    //   agent 抓的画布快照里，画布之外是一大片**纯黑未用区**（实测整幅 69.9% 是黑）。
+    //   它会让"纸色"被识别成黑（[paper] rgb=(0,0,0)），并把粗搜尺度带偏
+    //   （实测 s=0.18，真值≈0.333）→ 定位失败 → 应用时退化成普通粘贴 →
+    //   整张画布尺寸的结果被**错位**贴上（用户看到"一大片淡黄糊住画面"）。
+    int cropX = 0, cropY = 0;
+    {
+        int x0 = view.Width(), y0 = view.Height(), x1 = -1, y1 = -1;
+        for (int y = 0; y < view.Height(); ++y)
+            for (int x = 0; x < view.Width(); ++x) {
+                RGBA c;
+                if (!view.GetPixel(x, y, c)) continue;
+                // 近黑 = 未用区（真实画布/纸几乎不会是纯黑）
+                if (c.r < 24 && c.g < 24 && c.b < 24) continue;
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+        if (x1 > x0 && y1 > y0 &&
+            (x1 - x0 + 1) < view.Width()) {   // 确实有黑边才裁
+            ImageBuffer cr(x1 - x0 + 1, y1 - y0 + 1, view.Format());
+            for (int y = y0; y <= y1; ++y)
+                for (int x = x0; x <= x1; ++x) {
+                    RGBA c;
+                    if (view.GetPixel(x, y, c)) cr.SetPixel(x - x0, y - y0, c);
+                }
+            const bool ok = LocateCanvasCtx(cr, tmpl, out, diag, docW, docH);
+            if (ok) {
+                out.x0 += x0;   // 偏移换算回原快照坐标
+                out.y0 += y0;
+            }
+            return ok;
+        }
+    }
+    (void)cropX;
+    (void)cropY;
     return LocateCanvasCtx(view, tmpl, out, diag, docW, docH);
 }
 
@@ -1426,12 +1548,20 @@ bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
         1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.22,
         0.2, 0.18, 0.16, 0.15, 0.14, 0.13, 0.12, 0.11, 0.1,
         1.15, 1.3, 1.5, 1.75, 2.0, 2.3, 2.6, 3.0, 3.5, 4.0};
-    constexpr double kSadEps = 15.0;
+    constexpr double kSadEps = 40.0;   // 粗搜阈值（原 15 对"稀疏/软边"图层过严：实测头发层报 coarse no scale）
     const ImageBuffer v8 = DownscaleRGBA(view, 8);
     double bestS = 0.0;
     int bestX8 = -1, bestY8 = -1;
     double bestSad = 1e9;
-    for (double s : kScales) {
+    // ★ 加**密集**尺度扫描：kScales 的步长太粗（0.35 与 0.3 之间漏掉真实的
+    //   0.333），而"稀疏 + 软边"的图层在 ±5% 尺度误差下 SAD 就会超标 →
+    //   实测报 "coarse no scale"（头发层 1930x1391，SAI2 缩放 33.3%）。
+    //   加 0.08~0.70 步长 0.01 的一圈，真实尺度必被命中（误差 ≤0.5%）。
+    std::vector<double> scales;
+    scales.reserve(static_cast<size_t>(64));
+    for (double s : kScales) scales.push_back(s);
+    for (double s = 0.08; s <= 0.70 + 1e-9; s += 0.01) scales.push_back(s);
+    for (double s : scales) {
         const int rw = static_cast<int>(std::lround(tw * s));
         const int rh = static_cast<int>(std::lround(th * s));
         if (rw < 16 || rh < 16 || rw > vw || rh > vh) continue;
@@ -1656,6 +1786,13 @@ bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
             paperFound = true;
         }
     }
+    // ★ 纸色不可能是纯黑：agent 抓的画布快照里，**画布之外的未用区常被填成黑**。
+    //   环带一旦落在那里，modal 色就是黑 → 后续全错。实测（博丽灵梦 2160x3280）：
+    //   [paper] rgb=(0,0,0) → ambiguous paper color → 定位失败 → 应用时普通粘贴
+    //   → 整张画布尺寸的结果被错位贴上（用户看到"一大片淡黄糊住画面"）。
+    //   把"黑纸色"作废，交给下面的"最大均匀亮区"检测兜底。
+    if (paperFound && paper.r < 40 && paper.g < 40 && paper.b < 40)
+        paperFound = false;
     if (!paperFound) {
         struct Region {
             RGBA c{};
