@@ -153,8 +153,12 @@ public:
     // 整层抓取时由抓取流程设置：SAI2 画布尺寸与抓取内容在画布内的偏移。
     // 设置后，写剪贴板的都是"补边到画布尺寸"的图 —— SAI2 的 Ctrl+V 按
     // 画布 (0,0) 对齐，补边后内容正好落回原位置，不再依赖 Ctrl+Shift+V。
-    void SetCanvasContext(bool has, int canvasW, int canvasH, int offX,
-                          int offY);
+    //
+    // srcW/srcH = **这个偏移是针对哪一块包围盒算出来的**（= 定位时剪贴板里
+    // 那张图的尺寸）。之后再来一张尺寸不同的图（例如用户在 SAI2 里复制了
+    // 一个选区、或换了图层），这套偏移就不再适用 —— 见 SetImage 里的判定。
+    void SetCanvasContext(bool has, int canvasW, int canvasH, int offX, int offY,
+                          int srcW = 0, int srcH = 0);
     // 把 original_/applied_ 补边成**整幅画布**（已知画布上下文时），
     // 维持"图 = 画布坐标"的不变量 —— 所有功能窗口因此以画布为编辑面，
     // 用户才能把内容液化/模糊到图层包围盒之外（SAI2 的 Ctrl+C 只给包围盒）。
@@ -163,6 +167,13 @@ public:
     bool HasCanvasContext() const { return hasCanvasCtx_; }
     int CanvasW() const { return canvasW_; }
     int CanvasH() const { return canvasH_; }
+    // 当前偏移是否**就是**针对这张图（尺寸相同）算出来的。尺寸不同 = 偏移
+    // 过期，绝不能用它补边（会把内容摆到错误位置）。
+    bool CanvasCtxFits(const ImageBuffer& img) const {
+        if (!hasCanvasCtx_ || !img.IsValid()) return false;
+        if (img.Width() == canvasW_ && img.Height() == canvasH_) return true;
+        return ctxSrcW_ > 0 && img.Width() == ctxSrcW_ && img.Height() == ctxSrcH_;
+    }
     // 基准层（抓取时那层）内容在画布内的偏移。多图层一起液化时，
     // 其余层要用 "本层偏移 − 基准层偏移" 作为置换场的采样偏移。
     // 基准图是否**已经是画布坐标**（已补边成画布尺寸）。
@@ -329,6 +340,7 @@ private:
     bool baseIsCanvas_ = false;
     int paddedAtX_ = 0, paddedAtY_ = 0;   // 当前基准补边时用的画布偏移
     int canvasW_ = 0, canvasH_ = 0, canvasX0_ = 0, canvasY0_ = 0;
+    int ctxSrcW_ = 0, ctxSrcH_ = 0;   // 偏移是针对哪块包围盒算的
 
     std::string status_;
     std::vector<std::string> logLines_;

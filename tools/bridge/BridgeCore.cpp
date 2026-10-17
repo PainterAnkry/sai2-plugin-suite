@@ -274,9 +274,17 @@ void BridgeCore::SetImage(ImageBuffer img, const std::string& sourceLabel) {
     thumbSource_ = ImageBuffer();
 
     // 新图进来：先当作"未补边的原始包围盒"，交给下面重新判定/补边。
-    // 同时**作废旧的画布上下文** —— 新图在画布上的位置未知，沿用上一次的偏移
-    // 会把它摆错（捕获路径会在紧接着的第 4 步重新定位并再补边）。
+    // 同时**作废过期的画布上下文** —— 偏移是针对某一块包围盒算出来的，
+    // 换了一张尺寸不同的图（用户复制了选区、换了图层、从外部剪贴板抓图）
+    // 就不能再拿它补边，否则内容会被摆到错误位置（用户看到的"位置不对"）。
     baseIsCanvas_ = false;
+    if (hasCanvasCtx_ && !CanvasCtxFits(img)) {
+        Log("canvas ctx dropped: image " + std::to_string(img.Width()) + "x" +
+            std::to_string(img.Height()) + " != ctx source " +
+            std::to_string(ctxSrcW_) + "x" + std::to_string(ctxSrcH_) +
+            " (需重新定位)");
+        SetCanvasContext(false, 0, 0, 0, 0);
+    }
 
     // ★ 保持"图 = 画布坐标"：已知画布上下文时立即补边成整幅画布。
     // 必须在下面重建预览之前调用，否则窗口会以包围盒尺寸建会话。
@@ -569,12 +577,14 @@ void BridgeCore::PushAppliedHistory() {
 }
 
 void BridgeCore::SetCanvasContext(bool has, int canvasW, int canvasH,
-                                  int offX, int offY) {
+                                  int offX, int offY, int srcW, int srcH) {
     hasCanvasCtx_ = has && canvasW > 0 && canvasH > 0;
     canvasW_ = canvasW;
     canvasH_ = canvasH;
     canvasX0_ = offX;
     canvasY0_ = offY;
+    ctxSrcW_ = hasCanvasCtx_ ? srcW : 0;
+    ctxSrcH_ = hasCanvasCtx_ ? srcH : 0;
     if (hasCanvasCtx_) {
         Log("canvas ctx: " + std::to_string(canvasW_) + "x" +
             std::to_string(canvasH_) + " offset(" +

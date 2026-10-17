@@ -20,6 +20,7 @@
 #include "Diag.h"
 
 #include "BmpIO.h"
+#include "CanvasLocateTest.h"
 #include "ClipboardImage.h"
 #include "SelfTest.h"
 #include "AgentBridge.h"
@@ -201,18 +202,36 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
           DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     {
         const ImageBuffer& img = core.DisplayImage(BridgeCore::kWinMain);
-        wchar_t sub[220];
+        wchar_t sub[320];
         const int pLoaded = core.PluginLoadedCount();
         const int pTotal = core.PluginTotalCount();
-        swprintf(sub, 220, L"%s   %d x %d   插件 %d/%d%s",
-                 (core.HasImage() ? L"已抓取图层" : L"等待抓取"),
-                 img.IsValid() ? img.Width() : 0,
-                 img.IsValid() ? img.Height() : 0, pLoaded, pTotal,
-                 (pLoaded < pTotal) ? L"（未全载，见日志）" : L"");
-        RECT rr = {Scale(300), 0, client.right - Scale(140), Scale(38)};
-        TextC(dc, sub, rr,
-              (core.HasImage() && pLoaded >= pTotal) ? C_OK : C_DIM, s.fSmall,
-              DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        // 明确区分三种状态：
+        //   ① 已补边成整幅画布 → 位置与原层一致（这才是用户要的）
+        //   ② 只抓到包围盒、没定位画布 → 窗口里的位置与原层不同，回贴也会错位
+        //   ③ 还没抓
+        // 以前这里只有尺寸，①②看起来一样，用户根本判断不出哪次是好的。
+        const bool hasCtx = core.HasCanvasContext();
+        const bool isCanvas =
+            img.IsValid() && hasCtx && img.Width() == core.CanvasW() &&
+            img.Height() == core.CanvasH();
+        if (!core.HasImage()) {
+            swprintf(sub, 320, L"等待抓取   插件 %d/%d%s", pLoaded, pTotal,
+                     (pLoaded < pTotal) ? L"（未全载，见日志）" : L"");
+        } else if (isCanvas) {
+            swprintf(sub, 320, L"已抓取图层 %d x %d → 画布 %d x %d（整幅）   插件 %d/%d%s",
+                     img.Width(), img.Height(), core.CanvasW(), core.CanvasH(),
+                     pLoaded, pTotal,
+                     (pLoaded < pTotal) ? L"（未全载，见日志）" : L"");
+        } else {
+            // 文案要短：这一行右边还有主题按钮，长句会被省略号吃掉后半截，
+            // 用户就看不到"为什么位置不对"了。详细原因放在状态栏 flash 里。
+            swprintf(sub, 320, L"已抓取图层 %d x %d  ⚠ 未定位画布   插件 %d/%d%s",
+                     img.Width(), img.Height(), pLoaded, pTotal,
+                     (pLoaded < pTotal) ? L"（未全载，见日志）" : L"");
+        }
+        RECT rr = {Scale(240), 0, client.right - Scale(140), Scale(38)};
+        TextC(dc, sub, rr, isCanvas ? C_OK : C_DIM, s.fSmall,
+              DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     // 主题按钮（跟随系统 → 浅色 → 深色 循环）
     {
@@ -831,6 +850,7 @@ bool MenuItemClickImpl(HWND sai, int menuBarOffsetX, const wchar_t* itemPrefix) 
 struct CanvasCtxResult {
     bool ok = false;
     int cw = 0, ch = 0, x0 = 0, y0 = 0;
+    int srcW = 0, srcH = 0;   // 这套偏移对应的包围盒尺寸（= 定位用的模板）
     double score = 1e9;
 };
 
@@ -838,6 +858,10 @@ struct CanvasCtxResult {
 bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
                      CanvasCtxResult& out, std::string& diag, int docW = 0,
                      int docH = 0);
+// 旧的多尺度算法（画布尺寸未知时的回退）
+bool LocateCanvasCtxLegacy(const ImageBuffer& view, const ImageBuffer& tmpl,
+                           CanvasCtxResult& out, std::string& diag, int docW,
+                           int docH);
 
 // ---------------------------------------------------------------------------
 // 精确画布尺寸：读当前 .sai2 的文件头
@@ -974,6 +998,17 @@ bool Sai2DocCanvasSize(int& w, int& h) {
         wchar_t prof[512] = {0};
         if (!GetEnvironmentVariableW(L"USERPROFILE", prof, 512)) break;
         std::vector<std::wstring> cands;
+        // ★ 关键：SAI2 的标题里那个"文件夹"**就是** （用户名下的）一级目录名，
+        //   所以正确拼法是 USERPROFILE\Desktop\xxx.sai2，
+        //   **不是** USERPROFILE\Desktop\Desktop\xxx.sai2。
+        //   以前只拼了后者（root 前缀 + 已含 root 的相对路径），于是这条回退
+        //   从来没成功过 —— 而它正是"标题里没有盘符"（实测
+        //   `… - 桌面 / 测试.sai2 (*)`）时的唯一出路 → 精确画布尺寸静默失效 →
+        //   画布尺寸靠快照推算（实测 1080x1640 被估成 1083x1644）→ 尺度偏差
+        //   直接变成几个像素的落位误差。这条属于"一个常量写错整条路静默失效"，
+        //   和 magic 那次同类。
+        cands.push_back(std::wstring(prof) + L"\\" + tailNoFolder);
+        cands.push_back(std::wstring(prof) + L"\\" + rel);
         for (const wchar_t* root : kRoots) {
             cands.push_back(std::wstring(prof) + L"\\" + root + L"\\" + tailNoFolder);
             cands.push_back(std::wstring(prof) + L"\\" + root + L"\\" + rel);
@@ -1396,6 +1431,29 @@ bool AcquireCanvasContext(CanvasCtxResult& out, std::string& diag) {
             sai2agent::AgentClient::Query("{\"cmd\":\"canvas.redraw\"}", r2);
         }
     }
+    // ★ 没抓到也不是绝路：arm 有 9 秒窗口，抓取流程之外的调用（"应用前补
+    //   定位"、只走剪贴板监听的路径）早就过期了。这里自己补一次 arm + 强制
+    //   重绘再等 —— 否则那些调用**永远**只会得到 "no snapshot"，定位形同
+    //   虚设（用户看到的就是"有时候补边了、有时候没补"）。
+    if (!captured) {
+        std::string r2;
+        sai2agent::AgentClient::Query("{\"cmd\":\"canvas.arm\",\"ms\":9000}", r2);
+        sai2agent::AgentClient::Query("{\"cmd\":\"canvas.redraw\"}", r2);
+        for (int i = 0; i < 30; ++i) {
+            Sleep(100);
+            r2.clear();
+            if (!sai2agent::AgentClient::Query("{\"cmd\":\"canvas.state\"}", r2))
+                continue;
+            if (r2.find("\"captured\":true") != std::string::npos) {
+                captured = true;
+                break;
+            }
+            if (i == 8) {
+                std::string r3;
+                sai2agent::AgentClient::Query("{\"cmd\":\"canvas.redraw\"}", r3);
+            }
+        }
+    }
     if (!captured) {
         diag = "no snapshot";
         return false;
@@ -1474,6 +1532,10 @@ bool AcquireCanvasContext(CanvasCtxResult& out, std::string& diag) {
         diag = "read clipboard failed";
         return false;
     }
+    // 记住这套偏移是针对哪块包围盒算出来的：换图（选区复制/换层）后
+    // BridgeCore::SetImage 会据此作废过期上下文，不再拿旧偏移补边。
+    out.srcW = tmpl.Width();
+    out.srcH = tmpl.Height();
 
     // ★ 精确画布尺寸：从 SAI2 窗口标题拿到当前 .sai2 路径，读它的文件头。
     // 画布尺寸本来只能从快照**推算**（纸矩形 / 缩放），实测有 1%~3.5% 的波动，
@@ -1508,7 +1570,7 @@ bool AcquireCanvasContext(CanvasCtxResult& out, std::string& diag) {
                     RGBA c;
                     if (view.GetPixel(x, y, c)) cr.SetPixel(x - x0, y - y0, c);
                 }
-            const bool ok = LocateCanvasCtx(cr, tmpl, out, diag, docW, docH);
+            const bool ok = LocateCanvasCtxLegacy(cr, tmpl, out, diag, docW, docH);
             if (ok) {
                 out.x0 += x0;   // 偏移换算回原快照坐标
                 out.y0 += y0;
@@ -1518,7 +1580,7 @@ bool AcquireCanvasContext(CanvasCtxResult& out, std::string& diag) {
     }
     (void)cropX;
     (void)cropY;
-    return LocateCanvasCtx(view, tmpl, out, diag, docW, docH);
+    return LocateCanvasCtxLegacy(view, tmpl, out, diag, docW, docH);
 }
 
 // 定位"画布上下文"：纯数学部分，输入只有两张 RGBA8 图 ——
@@ -1526,9 +1588,12 @@ bool AcquireCanvasContext(CanvasCtxResult& out, std::string& diag) {
 //   docW/docH = .sai2 头部读到的精确画布尺寸（0 = 未知，则退回推算）
 // 与 agent/剪贴板完全解耦，因此可以用 --match-test 离线复跑（两条链路抢
 // 同一个管道时无法稳定复现问题，这个测试缝就是为此留的）。
-bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
-                     CanvasCtxResult& out, std::string& diag, int docW,
-                     int docH) {
+// 【旧算法】多尺度 SAD 搜索 + 纸色环带。仅在**画布尺寸未知**（文档没保存过，
+// 读不到 .sai2 头部）时才会走到这里；已知精确尺寸时走 LocateCanvasCtxExact
+// （确定性更强，见下面 v2 段）。
+bool LocateCanvasCtxLegacy(const ImageBuffer& view, const ImageBuffer& tmpl,
+                           CanvasCtxResult& out, std::string& diag, int docW,
+                           int docH) {
     if (!view.IsValid() || view.Width() < 256 || view.Height() < 256) {
         diag = "bad snapshot size";
         return false;
@@ -2084,6 +2149,1013 @@ bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
     return true;
 }
 
+// ===========================================================================
+// 画布定位 v2：确定性算法（已知精确画布尺寸时使用）
+//
+// 为什么重写（用户实测三条反馈其实是同一个根因）：
+//   ① 抓到的图常常不是画布尺寸  ② 窗口里的位置与原层不一致  ③ 回贴错位。
+//   旧算法先做"多尺度模板匹配"求内容落位，再用纸色环带推画布尺寸。它对
+//   **纯色内容**先天退化：一个心形模板整块落进另一层的同色块内部时，任意
+//   位置的 SAD 都≈0（模板的不透明像素全都比对同色），"取 SAD≤阈值的最大
+//   尺度"只能把尺度固定住，**位置仍然任意**。实测就是这样给出 offset(442,498)
+//   而真值≈(190,375) —— 补边时内容被推到画布右缘外，窗口里看着"偏右且被切"，
+//   回贴自然错位。而且这个结果还越过了"内容必须落在画布内"的常识校验。
+//
+// v2 把顺序倒过来，把已知量全部用上：
+//   ① 画布矩形：在快照里**逐级剥离大面积均匀底色**（视口灰、未用黑…），
+//      取长宽比与 .sai2 头部精确尺寸吻合的那块矩形 → 视图里的画布位置。
+//   ② 尺度钉死：s = 矩形宽 / docW（再用高度方向交叉校验），不再是搜索变量。
+//   ③ 内容落位：只在画布矩形内、只用这一个尺度做平移搜索。评分 =
+//      不透明像素的颜色吻合度 + **轮廓外环"渗色"惩罚**（模板透明区的外圈
+//      一旦压到同色内容就罚分）→ 纯色块内部的退化平台不再是最优解。
+//   ④ 结果校验：越界 / 吻合过差 / 两个不同位置同样吻合（重复图案、被遮挡）
+//      → 明确失败并给出可操作提示，绝不静默拿一个错位置去补边。
+// ===========================================================================
+namespace canloc {
+
+// 用 5bit 直方图求"未被排除像素"的模态色；返回占比。
+// 比 canvasctx::ModalColor 快（定长数组代替哈希），因为这里每级都要全图扫。
+bool ModalColorFast(const ImageBuffer& img, const std::vector<uint8_t>& excl,
+                    RGBA& out, double& frac) {
+    const int w = img.Width(), h = img.Height();
+    const PixelFormat fmt = img.Format();
+    const int shift = (fmt == PixelFormat::RGBA16) ? 11 : 3;
+    std::vector<long long> hist(size_t(32) * 32 * 32, 0);
+    long long total = 0;
+    long long sr = 0, sg = 0, sb = 0, sn = 0;
+    int bestKey = -1;
+    long long bestN = 0;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t idx = size_t(y) * w + x;
+            if (!excl.empty() && excl[idx]) continue;
+            RGBA c;
+            if (!img.GetPixel(x, y, c)) continue;
+            const int key = ((c.r >> shift) << 10) | ((c.g >> shift) << 5) |
+                            (c.b >> shift);
+            if (++hist[size_t(key)] > bestN) {
+                bestN = hist[size_t(key)];
+                bestKey = key;
+            }
+            ++total;
+        }
+    }
+    if (total <= 0 || bestKey < 0) return false;
+    // 桶内精确均值（比 5bit 量化准一档）
+    const int qr = (bestKey >> 10) & 31, qg = (bestKey >> 5) & 31,
+              qb = bestKey & 31;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t idx = size_t(y) * w + x;
+            if (!excl.empty() && excl[idx]) continue;
+            RGBA c;
+            if (!img.GetPixel(x, y, c)) continue;
+            if ((c.r >> shift) != qr || (c.g >> shift) != qg ||
+                (c.b >> shift) != qb)
+                continue;
+            sr += c.r;
+            sg += c.g;
+            sb += c.b;
+            ++sn;
+        }
+    }
+    if (sn <= 0) return false;
+    out.r = static_cast<uint16_t>(sr / sn);
+    out.g = static_cast<uint16_t>(sg / sn);
+    out.b = static_cast<uint16_t>(sb / sn);
+    out.a = 0;
+    frac = double(bestN) / double(total);
+    return true;
+}
+
+inline bool NearColor(const ImageBuffer& img, int x, int y, const RGBA& c,
+                      int tol) {
+    RGBA p;
+    if (!img.GetPixel(x, y, p)) return false;
+    const int d = std::max(std::abs(int(p.r) - int(c.r)),
+                           std::max(std::abs(int(p.g) - int(c.g)),
+                                    std::abs(int(p.b) - int(c.b))));
+    return d <= tol;
+}
+
+struct Rect {
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+    bool Valid() const { return w > 0 && h > 0; }
+};
+
+// 逐级剥离均匀底色，取与 docW:docH 长宽比最吻合的矩形。
+// 真实快照的层次（实测）：黑未用区 → 灰视口 → 白纸+内容；前两级剥掉后
+// 剩下的包围盒就是画布矩形。长宽比校验是这里唯一的判据 —— 画布尺寸精确
+// 已知时它极强（内容包围盒的长宽比几乎不可能碰巧吻合）。
+bool FindCanvasRect(const ImageBuffer& view, int docW, int docH, Rect& out,
+                    std::string& diag, std::string* note) {
+    const int vw = view.Width(), vh = view.Height();
+    const double targetAR = double(docW) / double(docH);
+    std::vector<uint8_t> excl(size_t(vw) * vh, 0);
+    struct Cand { Rect r; double arErr; };
+    std::vector<Cand> cands;
+    std::string trace;
+    for (int level = 0; level < 3; ++level) {
+        RGBA modal;
+        double frac = 0.0;
+        if (!ModalColorFast(view, excl, modal, frac)) break;
+        const int shift = (view.Format() == PixelFormat::RGBA16) ? 11 : 3;
+        (void)shift;
+        const int tol = 6;
+        for (int y = 0; y < vh; ++y) {
+            for (int x = 0; x < vw; ++x) {
+                const size_t idx = size_t(y) * vw + x;
+                if (excl[idx]) continue;
+                if (NearColor(view, x, y, modal, tol)) excl[idx] = 1;
+            }
+        }
+        int x0 = vw, y0 = vh, x1 = -1, y1 = -1;
+        for (int y = 0; y < vh; ++y) {
+            for (int x = 0; x < vw; ++x) {
+                if (excl[size_t(y) * vw + x]) continue;
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+            }
+        }
+        if (x1 < x0 || y1 < y0) break;
+        Rect r{x0, y0, x1 - x0 + 1, y1 - y0 + 1};
+        if (r.w < 32 || r.h < 32) break;
+        const bool isWholeView = (r.w >= vw - 1 && r.h >= vh - 1);
+        if (!isWholeView) {
+            const double arErr = std::fabs(double(r.w) / double(r.h) - targetAR) /
+                                 targetAR;
+            if (note)
+                trace += " L" + std::to_string(level) + "=" +
+                         std::to_string(r.w) + "x" + std::to_string(r.h) +
+                         "(ar" + std::to_string(int(arErr * 1000)) + "‰)";
+            if (arErr <= 0.02) cands.push_back(Cand{r, arErr});
+        }
+        if (frac > 0.85) break;
+    }
+    if (note) *note = trace;
+    if (cands.empty()) {
+        diag = "canvas rect not found (view " + std::to_string(vw) + "x" +
+               std::to_string(vh) + ", doc " + std::to_string(docW) + "x" +
+               std::to_string(docH) + trace +
+               "; 请把视图缩放到能看见整块画布后再抓)";
+        return false;
+    }
+    const Cand* best = &cands[0];
+    for (const Cand& c : cands) {
+        // 长宽比优先；同精度取面积大者（画布 > 内部同色块）
+        if (c.arErr < best->arErr - 1e-6) best = &c;
+        else if (std::fabs(c.arErr - best->arErr) <= 1e-6 &&
+                 c.r.w * c.r.h > best->r.w * best->r.h)
+            best = &c;
+    }
+    out = best->r;
+    return true;
+}
+
+// 面积平均缩放（预乘 alpha）：把剪贴板模板缩到"视图尺度"，与快照里
+// 被 SAI2 缩放渲染过的样子可比。最近邻会让边缘锯齿对不上，误差更大。
+ImageBuffer ScaleArea(const ImageBuffer& src, int dw, int dh) {
+    ImageBuffer out(std::max(1, dw), std::max(1, dh), PixelFormat::RGBA8);
+    const int sw = src.Width(), sh = src.Height();
+    for (int y = 0; y < out.Height(); ++y) {
+        const int sy0 = int(int64_t(y) * sh / out.Height());
+        const int sy1 = std::max(sy0 + 1, int(int64_t(y + 1) * sh / out.Height()));
+        for (int x = 0; x < out.Width(); ++x) {
+            const int sx0 = int(int64_t(x) * sw / out.Width());
+            const int sx1 = std::max(sx0 + 1, int(int64_t(x + 1) * sw / out.Width()));
+            long long r = 0, g = 0, b = 0, wa = 0, n = 0;
+            for (int yy = sy0; yy < sy1; ++yy) {
+                for (int xx = sx0; xx < sx1; ++xx) {
+                    RGBA c;
+                    if (!src.GetPixel(xx, yy, c)) continue;
+                    r += int64_t(c.r) * c.a;
+                    g += int64_t(c.g) * c.a;
+                    b += int64_t(c.b) * c.a;
+                    wa += c.a;
+                    ++n;
+                }
+            }
+            RGBA o;
+            if (wa > 0) {
+                o.r = static_cast<uint16_t>(r / wa);
+                o.g = static_cast<uint16_t>(g / wa);
+                o.b = static_cast<uint16_t>(b / wa);
+            }
+            o.a = n ? static_cast<uint16_t>(wa / n) : 0;
+            out.SetPixel(x, y, o);
+        }
+    }
+    return out;
+}
+
+// 整数倍盒式降采样。
+// keepAlpha=false：只取 RGB 平均、alpha 恒 255 —— 用于**视图**（视图 DIB 的
+//   alpha 通道是垃圾值，实测，绝不能参与比较）。
+// keepAlpha=true：alpha 取平均覆盖率、RGB 取 alpha 加权平均 —— 用于**模板**。
+//   ★ 这里踩过坑：模板一开始也按 alpha 恒 255 处理，于是降采样后整块 bbox
+//   都被当成"不透明"，采样点落进透明区、颜色是红与黑的混合 → 代价函数
+//   整个失真（实测真实定位点 d=0.2 变成 13，最优解跑到别处）。
+ImageBuffer BoxDownRgb(const ImageBuffer& src, int step, bool keepAlpha = false) {
+    if (step <= 1) return src.Clone();
+    const int dw = std::max(1, src.Width() / step);
+    const int dh = std::max(1, src.Height() / step);
+    ImageBuffer out(dw, dh, PixelFormat::RGBA8);
+    std::vector<long long> acc(size_t(dw) * dh * 3, 0);
+    std::vector<long long> accA(size_t(dw) * dh, 0);
+    std::vector<int> cnt(size_t(dw) * dh, 0);
+    const bool src8 = src.Format() == PixelFormat::RGBA8;
+    for (int y = 0; y < src.Height(); ++y) {
+        const int dy = y / step;
+        if (dy >= dh) break;
+        for (int x = 0; x < src.Width(); ++x) {
+            const int dx = x / step;
+            if (dx >= dw) continue;
+            RGBA c;
+            if (src8) {
+                const uint8_t* p =
+                    src.Data() + src.Stride() * size_t(y) + size_t(x) * 4;
+                c.r = p[0]; c.g = p[1]; c.b = p[2]; c.a = p[3];
+            } else if (!src.GetPixel(x, y, c)) {
+                continue;
+            }
+            const size_t i = (size_t(dy) * dw + dx) * 3;
+            const long long wgt = keepAlpha ? c.a : 255;
+            acc[i] += int64_t(c.r) * wgt;
+            acc[i + 1] += int64_t(c.g) * wgt;
+            acc[i + 2] += int64_t(c.b) * wgt;
+            accA[size_t(dy) * dw + dx] += c.a;
+            ++cnt[size_t(dy) * dw + dx];
+        }
+    }
+    for (int y = 0; y < dh; ++y) {
+        for (int x = 0; x < dw; ++x) {
+            const size_t i = size_t(y) * dw + x;
+            const int n = cnt[i];
+            RGBA o;
+            if (n > 0) {
+                const long long wsum = keepAlpha ? accA[i] : int64_t(n) * 255;
+                if (wsum > 0) {
+                    o.r = static_cast<uint16_t>(acc[i * 3] / wsum);
+                    o.g = static_cast<uint16_t>(acc[i * 3 + 1] / wsum);
+                    o.b = static_cast<uint16_t>(acc[i * 3 + 2] / wsum);
+                }
+                o.a = keepAlpha ? static_cast<uint16_t>(accA[i] / n) : 255;
+            }
+            out.SetPixel(x, y, o);
+        }
+    }
+    return out;
+}
+
+// 可分离最大值膨胀（半径 r，方形核）：用来取"轮廓外环"。
+void DilateMax(const std::vector<uint8_t>& src, int w, int h, int r,
+               std::vector<uint8_t>& dst) {
+    if (r <= 0) { dst = src; return; }
+    std::vector<uint8_t> tmp(src.size(), 0);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            uint8_t m = 0;
+            const int xa = std::max(0, x - r), xb = std::min(w - 1, x + r);
+            for (int xx = xa; xx <= xb; ++xx) {
+                const uint8_t v = src[size_t(y) * w + xx];
+                if (v > m) m = v;
+            }
+            tmp[size_t(y) * w + x] = m;
+        }
+    }
+    dst.assign(src.size(), 0);
+    for (int y = 0; y < h; ++y) {
+        const int ya = std::max(0, y - r), yb = std::min(h - 1, y + r);
+        for (int x = 0; x < w; ++x) {
+            uint8_t m = 0;
+            for (int yy = ya; yy <= yb; ++yy) {
+                const uint8_t v = tmp[size_t(yy) * w + x];
+                if (v > m) m = v;
+            }
+            dst[size_t(y) * w + x] = m;
+        }
+    }
+}
+
+// 评分用的采样集
+struct Samples {
+    std::vector<int> ox, oy;       // 不透明样本（视图尺度相对坐标）
+    std::vector<uint8_t> oc;       // 每样本 3 字节 RGB
+    std::vector<int> hx, hy;       // 轮廓外环样本
+    std::vector<uint8_t> pal;      // 内容调色板（每色 3 字节）
+    int palN = 0;
+    size_t opaqueTotal = 0;
+};
+
+bool BuildSamples(const ImageBuffer& tpl, Samples& out, int opaqueCap,
+                  int haloCap, int ringIn, int ringOut) {
+    const int w = tpl.Width(), h = tpl.Height();
+    if (w < 2 || h < 2) return false;
+    const size_t n = size_t(w) * h;
+    std::vector<uint8_t> opaque(n, 0);
+    std::vector<int> allX, allY;
+    allX.reserve(n / 4);
+    allY.reserve(n / 4);
+    // 调色板：5bit 分桶
+    struct Pal { int key = -1; long long cnt = 0; long long r = 0, g = 0, b = 0; };
+    std::vector<Pal> pals;
+    pals.reserve(4096);
+    std::unordered_map<int, size_t> palIndex;
+    palIndex.reserve(4096);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            RGBA c;
+            if (!tpl.GetPixel(x, y, c)) continue;
+            if (c.a < 200) continue;
+            const size_t i = size_t(y) * w + x;
+            opaque[i] = 1;
+            allX.push_back(x);
+            allY.push_back(y);
+            const int key = ((c.r >> 3) << 10) | ((c.g >> 3) << 5) | (c.b >> 3);
+            auto it = palIndex.find(key);
+            if (it == palIndex.end()) {
+                palIndex[key] = pals.size();
+                Pal p;
+                p.key = key;
+                p.cnt = 1;
+                p.r = c.r;
+                p.g = c.g;
+                p.b = c.b;
+                pals.push_back(p);
+            } else {
+                Pal& p = pals[it->second];
+                ++p.cnt;
+                p.r += c.r;
+                p.g += c.g;
+                p.b += c.b;
+            }
+        }
+    }
+    out.opaqueTotal = allX.size();
+    if (allX.empty()) return false;
+    // 取最频繁的若干色当"内容色"（用于判渗色）
+    std::vector<size_t> order(pals.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return pals[a].cnt > pals[b].cnt;
+    });
+    out.palN = int(std::min<size_t>(order.size(), 12));
+    out.pal.clear();
+    for (int i = 0; i < out.palN; ++i) {
+        const Pal& p = pals[order[size_t(i)]];
+        out.pal.push_back(static_cast<uint8_t>(p.r / p.cnt));
+        out.pal.push_back(static_cast<uint8_t>(p.g / p.cnt));
+        out.pal.push_back(static_cast<uint8_t>(p.b / p.cnt));
+    }
+    // 不透明样本：等距抽样（覆盖整个轮廓，不要全挤在一边）
+    const size_t stride = std::max<size_t>(
+        1, allX.size() / std::max<size_t>(1, static_cast<size_t>(opaqueCap)));
+    out.ox.clear();
+    out.oy.clear();
+    out.oc.clear();
+    for (size_t i = 0; i < allX.size(); i += stride) {
+        const int x = allX[i], y = allY[i];
+        RGBA c;
+        if (!tpl.GetPixel(x, y, c)) continue;
+        out.ox.push_back(x);
+        out.oy.push_back(y);
+        out.oc.push_back(static_cast<uint8_t>(c.r));
+        out.oc.push_back(static_cast<uint8_t>(c.g));
+        out.oc.push_back(static_cast<uint8_t>(c.b));
+    }
+    // 轮廓外环：dilate(opaque, ringOut) 减去 dilate(opaque, ringIn)
+    if (haloCap <= 0 || ringOut <= 0) return !out.ox.empty();
+    std::vector<uint8_t> inner, outer;
+    DilateMax(opaque, w, h, ringIn, inner);
+    DilateMax(opaque, w, h, ringOut, outer);
+    std::vector<int> rX, rY;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t i = size_t(y) * w + x;
+            if (inner[i] || !outer[i]) continue;
+            rX.push_back(x);
+            rY.push_back(y);
+        }
+    }
+    if (rX.empty()) {
+        // 外环被 bbox 切断（内容贴边）：退回"所有透明像素"
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                if (!opaque[size_t(y) * w + x]) { rX.push_back(x); rY.push_back(y); }
+    }
+    const size_t hs = std::max<size_t>(
+        1, rX.size() / std::max<size_t>(1, static_cast<size_t>(haloCap)));
+    out.hx.clear();
+    out.hy.clear();
+    for (size_t i = 0; i < rX.size(); i += hs) {
+        out.hx.push_back(rX[i]);
+        out.hy.push_back(rY[i]);
+    }
+    return !out.ox.empty();
+}
+
+// 单点评分：cost = 颜色误差 + haloW * 渗色比例
+double ScoreAt(const ImageBuffer& v, const Samples& sm, int px, int py,
+               double haloW, double& outD, double& outHalo) {
+    const int W = v.Width(), H = v.Height();
+    const bool v8 = v.Format() == PixelFormat::RGBA8;
+    const uint8_t* base = v.Data();
+    const size_t st = v.Stride();
+    long long sum = 0;
+    size_t n = 0;
+    for (size_t i = 0; i < sm.ox.size(); ++i) {
+        const int x = px + sm.ox[i], y = py + sm.oy[i];
+        if (x < 0 || y < 0 || x >= W || y >= H) {
+            sum += 255 * 3;
+            ++n;
+            continue;
+        }
+        int r, g, b;
+        if (v8) {
+            const uint8_t* p = base + st * size_t(y) + size_t(x) * 4;
+            r = p[0]; g = p[1]; b = p[2];
+        } else {
+            RGBA c;
+            if (!v.GetPixel(x, y, c)) continue;
+            r = c.r >> 8; g = c.g >> 8; b = c.b >> 8;
+        }
+        const uint8_t* t = &sm.oc[i * 3];
+        sum += std::abs(r - t[0]) + std::abs(g - t[1]) + std::abs(b - t[2]);
+        ++n;
+    }
+    const double d = n ? double(sum) / (3.0 * double(n)) : 1e9;
+    double halo = 0.0;
+    if (haloW > 0.0 && !sm.hx.empty() && sm.palN > 0) {
+        long long hit = 0;
+        long long m = 0;
+        for (size_t i = 0; i < sm.hx.size(); ++i) {
+            const int x = px + sm.hx[i], y = py + sm.hy[i];
+            if (x < 0 || y < 0 || x >= W || y >= H) continue;
+            int r, g, b;
+            if (v8) {
+                const uint8_t* p = base + st * size_t(y) + size_t(x) * 4;
+                r = p[0]; g = p[1]; b = p[2];
+            } else {
+                RGBA c;
+                if (!v.GetPixel(x, y, c)) continue;
+                r = c.r >> 8; g = c.g >> 8; b = c.b >> 8;
+            }
+            int best = 1 << 30;
+            for (int k = 0; k < sm.palN; ++k) {
+                const int dd = std::max(std::abs(r - sm.pal[size_t(k) * 3]),
+                                        std::max(std::abs(g - sm.pal[size_t(k) * 3 + 1]),
+                                                 std::abs(b - sm.pal[size_t(k) * 3 + 2])));
+                if (dd < best) best = dd;
+            }
+            if (best <= 34) ++hit;
+            ++m;
+        }
+        halo = m ? double(hit) / double(m) : 0.0;
+    }
+    outD = d;
+    outHalo = halo;
+    return d + haloW * halo;
+}
+
+} // namespace canloc
+
+// ===========================================================================
+// 定位主流程（v2）。返回 true 时 out.cw/ch = 精确画布尺寸，x0/y0 = 内容偏移。
+// ===========================================================================
+bool LocateCanvasCtxExact(const ImageBuffer& viewIn, const ImageBuffer& tmplIn,
+                          CanvasCtxResult& out, std::string& diag, int docW,
+                          int docH) {
+    if (!viewIn.IsValid() || viewIn.Width() < 64 || viewIn.Height() < 64) {
+        diag = "bad snapshot size";
+        return false;
+    }
+    if (!tmplIn.IsValid() || tmplIn.Width() < 8 || tmplIn.Height() < 8) {
+        diag = "template too small";
+        return false;
+    }
+    if (docW < 16 || docH < 16) {
+        diag = "bad doc size";
+        return false;
+    }
+    // 统一到 RGBA8（视图 DIB 的 alpha 是垃圾值，这里只用 RGB）
+    const ImageBuffer view =
+        (viewIn.Format() == PixelFormat::RGBA8) ? viewIn : ImageBuffer::Convert(viewIn, PixelFormat::RGBA8);
+    const ImageBuffer tmpl =
+        (tmplIn.Format() == PixelFormat::RGBA8) ? tmplIn : ImageBuffer::Convert(tmplIn, PixelFormat::RGBA8);
+
+    // ---- ① 画布矩形 + 尺度 -------------------------------------------------
+    std::string trace;
+    canloc::Rect rect;
+    if (!canloc::FindCanvasRect(view, docW, docH, rect, diag, &trace)) return false;
+    const double sW = double(rect.w) / double(docW);
+    const double sH = double(rect.h) / double(docH);
+    const double sAvg = 0.5 * (sW + sH);
+    if (sAvg <= 0.01) {
+        diag = "bad scale";
+        return false;
+    }
+    if (std::fabs(sW - sH) / sAvg > 0.02) {
+        diag = "canvas rect / doc aspect mismatch: rect " + std::to_string(rect.w) +
+               "x" + std::to_string(rect.h) + " doc " + std::to_string(docW) + "x" +
+               std::to_string(docH) + trace;
+        return false;
+    }
+    // ---- ② 模板缩到视图尺度 -----------------------------------------------
+    const int tw = tmpl.Width(), th = tmpl.Height();
+    if (tw > docW + 2 || th > docH + 2) {
+        diag = "clipboard image " + std::to_string(tw) + "x" + std::to_string(th) +
+               " is larger than canvas " + std::to_string(docW) + "x" +
+               std::to_string(docH) + " (抓到的不是本层内容?)";
+        return false;
+    }
+    const int tsw = std::max(4, static_cast<int>(std::lround(tw * sAvg)));
+    const int tsh = std::max(4, static_cast<int>(std::lround(th * sAvg)));
+    if (tsw > rect.w + 3 || tsh > rect.h + 3) {
+        diag = "template scaled " + std::to_string(tsw) + "x" + std::to_string(tsh) +
+               " larger than canvas rect " + std::to_string(rect.w) + "x" +
+               std::to_string(rect.h);
+        return false;
+    }
+    const ImageBuffer tS = canloc::ScaleArea(tmpl, tsw, tsh);
+
+    // 搜索窗口：模板必须完整落在画布矩形内（这一条以前完全没有，才让
+    // offset(442,498)+宽 700+ 的越界结果被当成成功）。
+    const int maxPx = rect.x0 + rect.w - tsw;
+    const int maxPy = rect.y0 + rect.h - tsh;
+    if (maxPx < rect.x0 || maxPy < rect.y0) {
+        diag = "no room for content in canvas rect";
+        return false;
+    }
+
+    const double kHaloW = 30.0;   // 渗色权重（实测 25~40 之间稳定）
+    struct Cand { double cost; int x; int y; double d; double halo; };
+
+    // ---- ③a 粗搜：视图降 8 倍，全画布矩形范围 -----------------------------
+    const int D1 = 8;
+    const ImageBuffer v8 = canloc::BoxDownRgb(view, D1);
+    const ImageBuffer t8 = canloc::BoxDownRgb(tS, D1, true);
+    canloc::Samples sm8;
+    if (!canloc::BuildSamples(t8, sm8, 240, 200, 1, 3)) {
+        diag = "no opaque samples";
+        return false;
+    }
+    const int cw8 = v8.Width(), ch8 = v8.Height();
+    const int px0 = std::max(0, (rect.x0 + D1 - 1) / D1);
+    const int py0 = std::max(0, (rect.y0 + D1 - 1) / D1);
+    const int px1 = std::min(cw8 - t8.Width(), maxPx / D1);
+    const int py1 = std::min(ch8 - t8.Height(), maxPy / D1);
+    if (px1 < px0 || py1 < py0) {
+        diag = "coarse window empty";
+        return false;
+    }
+    const int cw8len = px1 - px0 + 1, ch8len = py1 - py0 + 1;
+    std::vector<float> cost8(size_t(cw8len) * ch8len, 0.0f);
+    for (int y = 0; y < ch8len; ++y) {
+        for (int x = 0; x < cw8len; ++x) {
+            double d = 0, halo = 0;
+            cost8[size_t(y) * cw8len + x] = static_cast<float>(
+                canloc::ScoreAt(v8, sm8, (px0 + x), (py0 + y), kHaloW, d, halo));
+        }
+    }
+    // 取 top-K 局部极小，拿去做精修。
+    // ★ 抑制半径不能大：以前用 min(模板)/3（≈15 个 ds8 格 = 120 视图像素），
+    //   会把**另一个真实极小点**一起抹掉 —— 文档里有两个同色同形内容时，
+    //   第二个候选根本进不了候选集，歧义判据永远不触发 → 静默选中错的那个。
+    //   这里只要保证不重复收集同一极小点附近的格子即可，精修窗口自己会扩散。
+    const int K = 10;
+    const int minSep = std::max(2, std::min(4, std::min(t8.Width(), t8.Height()) / 6));
+    std::vector<Cand> coarse;
+    std::vector<float> work = cost8;
+    for (int k = 0; k < K; ++k) {
+        float bestC = 1e9f;
+        int bi = -1;
+        for (size_t i = 0; i < work.size(); ++i)
+            if (work[i] < bestC) { bestC = work[i]; bi = int(i); }
+        if (bi < 0 || bestC > 1e8f) break;
+        const int bx = bi % cw8len, by = bi / cw8len;
+        coarse.push_back(Cand{double(bestC), px0 + bx, py0 + by, 0.0, 0.0});
+        const int ya = std::max(0, by - minSep), yb = std::min(ch8len - 1, by + minSep);
+        const int xa = std::max(0, bx - minSep), xb = std::min(cw8len - 1, bx + minSep);
+        for (int y = ya; y <= yb; ++y)
+            for (int x = xa; x <= xb; ++x) work[size_t(y) * cw8len + x] = 1e9f;
+    }
+    if (coarse.empty()) {
+        diag = "coarse search empty";
+        return false;
+    }
+
+    // ---- ③b 精修：2 倍降采样，±40 视图像素窗口 ---------------------------
+    // 窗口还必须**夹在画布矩形内**：内容不可能跑到画布外，放开就会被拉到
+    // 越界位置（实测 isolated 用例给出 x0=-53）。
+    const int D2 = 2;
+    const ImageBuffer v2 = canloc::BoxDownRgb(view, D2);
+    const ImageBuffer t2 = canloc::BoxDownRgb(tS, D2, true);
+    canloc::Samples sm2;
+    if (!canloc::BuildSamples(t2, sm2, 500, 300, 1, 3)) {
+        diag = "no opaque samples (2x)";
+        return false;
+    }
+    const int span2 = 40 / D2;
+    const int lo2x = std::max(0, (rect.x0 + D2 - 1) / D2);
+    const int lo2y = std::max(0, (rect.y0 + D2 - 1) / D2);
+    const int hi2x = std::min(v2.Width() - t2.Width(), maxPx / D2);
+    const int hi2y = std::min(v2.Height() - t2.Height(), maxPy / D2);
+    std::vector<Cand> refined;
+    for (const Cand& c : coarse) {
+        const int cx = c.x * D1 / D2, cy = c.y * D1 / D2;
+        Cand best{1e9, -1, -1, 0, 0};
+        for (int y = std::max(lo2y, cy - span2);
+             y <= std::min(hi2y, cy + span2); ++y) {
+            for (int x = std::max(lo2x, cx - span2);
+                 x <= std::min(hi2x, cx + span2); ++x) {
+                double d = 0, halo = 0;
+                const double cost = canloc::ScoreAt(v2, sm2, x, y, kHaloW, d, halo);
+                if (cost < best.cost) best = Cand{cost, x, y, d, halo};
+            }
+        }
+        if (best.x >= 0) refined.push_back(best);
+    }
+    if (refined.empty()) {
+        diag = "refine failed";
+        return false;
+    }
+    std::sort(refined.begin(), refined.end(),
+              [](const Cand& a, const Cand& b) { return a.cost < b.cost; });
+    // ★ 去重：不同粗候选的 ±40 窗口常常收敛到同一个极小点。如果不去重，
+    //   "前两名"就是同一个位置，歧义判据（两个**不同**位置同样吻合）永远
+    //   不触发 —— 用户文档里有两个同色同形的心形时就会静默选中其中一个。
+    {
+        std::vector<Cand> uniq;
+        for (const Cand& c : refined) {
+            bool dup = false;
+            for (const Cand& u : uniq) {
+                if (std::abs(u.x - c.x) <= 1 && std::abs(u.y - c.y) <= 1) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) uniq.push_back(c);
+        }
+        refined.swap(uniq);
+    }
+
+    // ---- ③c 全分辨率：取前两个候选做 ±5 精修 + 抛物线亚像素 ----------------
+    canloc::Samples smF;
+    if (!canloc::BuildSamples(tS, smF, 900, 600, 2, 8)) {
+        diag = "no opaque samples (full)";
+        return false;
+    }
+    std::vector<Cand> finals;
+    double subX = 0.0, subY = 0.0;
+    const int loFx = rect.x0, loFy = rect.y0;
+    for (size_t i = 0; i < std::min<size_t>(2, refined.size()); ++i) {
+        const int cx = refined[i].x * D2, cy = refined[i].y * D2;
+        Cand best{1e9, -1, -1, 0, 0};
+        for (int y = std::max(loFy, cy - 5); y <= std::min(maxPy, cy + 5); ++y) {
+            for (int x = std::max(loFx, cx - 5); x <= std::min(maxPx, cx + 5); ++x) {
+                double d = 0, halo = 0;
+                const double cost = canloc::ScoreAt(view, smF, x, y, kHaloW, d, halo);
+                if (cost < best.cost) best = Cand{cost, x, y, d, halo};
+            }
+        }
+        if (best.x < 0) continue;
+        // 抛物线亚像素：三者取最小点两侧的代价拟合顶点（低缩放时 1 视图像素
+        // 相当于 2~3 画布像素，值得做）
+        if (finals.empty()) {
+            double d0 = 0, h0 = 0;
+            const double cm = canloc::ScoreAt(view, smF, best.x - 1, best.y, kHaloW, d0, h0);
+            const double cp = canloc::ScoreAt(view, smF, best.x + 1, best.y, kHaloW, d0, h0);
+            const double den = cm - 2.0 * best.cost + cp;
+            subX = (std::fabs(den) > 1e-6) ? 0.5 * (cm - cp) / den : 0.0;
+            subX = std::max(-0.5, std::min(0.5, subX));
+            const double dm = canloc::ScoreAt(view, smF, best.x, best.y - 1, kHaloW, d0, h0);
+            const double dp = canloc::ScoreAt(view, smF, best.x, best.y + 1, kHaloW, d0, h0);
+            const double den2 = dm - 2.0 * best.cost + dp;
+            subY = (std::fabs(den2) > 1e-6) ? 0.5 * (dm - dp) / den2 : 0.0;
+            subY = std::max(-0.5, std::min(0.5, subY));
+        }
+        finals.push_back(best);
+    }
+    if (finals.empty()) {
+        diag = "full-res search failed";
+        return false;
+    }
+    std::sort(finals.begin(), finals.end(),
+              [](const Cand& a, const Cand& b) { return a.cost < b.cost; });
+    const Cand& win = finals[0];
+
+    // ---- ④ 校验 -----------------------------------------------------------
+    if (win.d > 30.0) {
+        diag = "content not found in canvas view: colour mismatch " +
+               std::to_string(win.d) + "(该层可能被上方图层遮挡/混合 → 把此层临时置顶或隐藏其它层后重抓)";
+        return false;
+    }
+    const int sep = std::max(12, std::min(tsw, tsh) / 6);
+    for (size_t i = 1; i < finals.size(); ++i) {
+        const Cand& alt = finals[i];
+        if (std::abs(alt.x - win.x) <= sep && std::abs(alt.y - win.y) <= sep) continue;
+        if (alt.cost <= win.cost * 1.25 + 2.0) {
+            diag = "ambiguous position: cost " + std::to_string(win.cost) + " at (" +
+                   std::to_string(win.x) + "," + std::to_string(win.y) + ") vs " +
+                   std::to_string(alt.cost) + " at (" + std::to_string(alt.x) + "," +
+                   std::to_string(alt.y) + ")(该层内容在合成图里不唯一/被遮挡)";
+            return false;
+        }
+    }
+    const double vx = double(win.x) + subX - double(rect.x0);
+    const double vy = double(win.y) + subY - double(rect.y0);
+    int x0 = static_cast<int>(std::lround(vx / sAvg));
+    int y0 = static_cast<int>(std::lround(vy / sAvg));
+    // 落在画布内（±2px 容差，再夹住）
+    if (x0 < -2 || y0 < -2 || x0 + tw > docW + 2 || y0 + th > docH + 2) {
+        diag = "content outside canvas: off(" + std::to_string(x0) + "," +
+               std::to_string(y0) + ") size " + std::to_string(tw) + "x" +
+               std::to_string(th) + " canvas " + std::to_string(docW) + "x" +
+               std::to_string(docH);
+        return false;
+    }
+    x0 = std::max(0, std::min(docW - tw, x0));
+    y0 = std::max(0, std::min(docH - th, y0));
+    if (x0 <= 2) x0 = 0;
+    if (y0 <= 2) y0 = 0;
+    if (x0 + tw >= docW - 2) x0 = docW - tw;
+    if (y0 + th >= docH - 2) y0 = docH - th;
+
+    out.cw = docW;
+    out.ch = docH;
+    out.x0 = x0;
+    out.y0 = y0;
+    out.score = win.cost;
+    out.ok = true;
+    diag = "v2 s=" + std::to_string(sAvg) + " cost=" + std::to_string(win.cost) +
+           " d=" + std::to_string(win.d) + " halo=" + std::to_string(win.halo) +
+           " rect=" + std::to_string(rect.x0) + "," + std::to_string(rect.y0) + " " +
+           std::to_string(rect.w) + "x" + std::to_string(rect.h) + trace;
+    return true;
+}
+
+// 分派：已知精确画布尺寸 → v2；否则退回旧的多尺度算法。
+bool LocateCanvasCtx(const ImageBuffer& view, const ImageBuffer& tmpl,
+                     CanvasCtxResult& out, std::string& diag, int docW,
+                     int docH) {
+    if (docW > 0 && docH > 0)
+        return LocateCanvasCtxExact(view, tmpl, out, diag, docW, docH);
+    return LocateCanvasCtxLegacy(view, tmpl, out, diag, docW, docH);
+}
+
+// ===========================================================================
+// 画布定位 v2 的合成回归用例（见 CanvasLocateTest.h）
+// 全部在内存里造图，不碰 SAI2 / 剪贴板 / 文件，可无人值守反复跑。
+// ===========================================================================
+namespace {
+
+// 圆盘层（alpha=0 外部）：用来造"同色不同大小、部分重叠"的退化场景 ——
+// 这正是用户文档里两个心形的形态（纯色、轮廓简单、互相重叠）。
+void DrawDisc(ImageBuffer& img, int cx, int cy, int r, const RGBA& col) {
+    for (int y = std::max(0, cy - r); y <= std::min(img.Height() - 1, cy + r); ++y) {
+        for (int x = std::max(0, cx - r); x <= std::min(img.Width() - 1, cx + r); ++x) {
+            const int dx = x - cx, dy = y - cy;
+            if (dx * dx + dy * dy > r * r) continue;
+            img.SetPixel(x, y, col);
+        }
+    }
+}
+
+void DrawRect(ImageBuffer& img, int x0, int y0, int x1, int y1, const RGBA& col) {
+    img.FillRect(x0, y0, x1 - x0, y1 - y0, col);
+}
+
+// 把 1:1 画布渲染成"SAI2 视口快照"：灰视口 + 黑未用区 + 缩放后的画布。
+// 每个视图像素做 2x2 超采样，避免锯齿让匹配变成拼运气。
+ImageBuffer RenderViewport(const ImageBuffer& canvas, double s, int vw, int vh) {
+    ImageBuffer view(vw, vh, PixelFormat::RGBA8);
+    view.Clear(RGBA{0, 0, 0, 255});
+    const int pw = static_cast<int>(std::lround(canvas.Width() * s));
+    const int ph = static_cast<int>(std::lround(canvas.Height() * s));
+    const int x0 = (vw - pw) / 2, y0 = (vh - ph) / 2;
+    DrawRect(view, x0, y0, x0 + pw, y0 + ph, RGBA{255, 255, 255, 255});
+    for (int y = 0; y < vh; ++y) {
+        for (int x = 0; x < vw; ++x) {
+            int r = 0, g = 0, b = 0;
+            int n = 0;
+            bool anyCanvas = false;
+            for (int sy = 0; sy < 2; ++sy) {
+                for (int sx = 0; sx < 2; ++sx) {
+                    const double fx = (x + 0.25 + 0.5 * sx - x0) / s;
+                    const double fy = (y + 0.25 + 0.5 * sy - y0) / s;
+                    ++n;
+                    if (fx < 0 || fy < 0 || fx >= canvas.Width() || fy >= canvas.Height()) {
+                        r += 0; g += 0; b += 0;
+                        continue;
+                    }
+                    anyCanvas = true;
+                    RGBA c;
+                    if (canvas.GetPixel(static_cast<int>(fx), static_cast<int>(fy), c)) {
+                        r += c.r; g += c.g; b += c.b;
+                    }
+                }
+            }
+            (void)anyCanvas;
+            RGBA o;
+            o.r = static_cast<uint16_t>(r / std::max(1, n));
+            o.g = static_cast<uint16_t>(g / std::max(1, n));
+            o.b = static_cast<uint16_t>(b / std::max(1, n));
+            o.a = 255;
+            view.SetPixel(x, y, o);
+        }
+    }
+    return view;
+}
+
+// 把画布裁剪成"剪贴板图像"（SAI2 的 Ctrl+C 只给不透明包围盒）
+ImageBuffer CropOpaque(const ImageBuffer& canvas, int& ox, int& oy) {
+    int x0 = canvas.Width(), y0 = canvas.Height(), x1 = -1, y1 = -1;
+    for (int y = 0; y < canvas.Height(); ++y) {
+        for (int x = 0; x < canvas.Width(); ++x) {
+            RGBA c;
+            if (!canvas.GetPixel(x, y, c)) continue;
+            if (c.a < 8) continue;
+            if (x < x0) x0 = x;
+            if (x > x1) x1 = x;
+            if (y < y0) y0 = y;
+            if (y > y1) y1 = y;
+        }
+    }
+    ox = 0; oy = 0;
+    if (x1 < x0 || y1 < y0) return ImageBuffer();
+    ox = x0; oy = y0;
+    ImageBuffer out(x1 - x0 + 1, y1 - y0 + 1, PixelFormat::RGBA8);
+    out.Clear(RGBA{0, 0, 0, 0});
+    for (int y = y0; y <= y1; ++y)
+        for (int x = x0; x <= x1; ++x) {
+            RGBA c;
+            if (canvas.GetPixel(x, y, c)) out.SetPixel(x - x0, y - y0, c);
+        }
+    return out;
+}
+
+} // namespace
+
+std::vector<std::string> RunCanvasLocateTestsImpl(int& failures) {
+    std::vector<std::string> lines;
+    failures = 0;
+    auto report = [&](bool ok, const std::string& what, const std::string& detail) {
+        if (!ok) ++failures;
+        lines.push_back(std::string(ok ? "PASS  " : "FAIL  ") + what + "   " + detail);
+    };
+    const int DOC_W = 760, DOC_H = 1100;   // 竖幅，和用户文档同形
+    const double S = 0.62;
+    const RGBA PAPER{255, 255, 255, 255};
+    const RGBA RED{155, 0, 0, 255};
+
+    // 统一造一个"纸 + 其它层内容"的画布，再把目标层单独留出来做模板。
+    auto makeCanvas = [&](const ImageBuffer& other, const ImageBuffer& target,
+                          ImageBuffer& composed, ImageBuffer& targetOnly) {
+        composed.Create(DOC_W, DOC_H, PixelFormat::RGBA8);
+        composed.Clear(PAPER);
+        // 合成：纸 ← other ← target
+        for (int y = 0; y < DOC_H; ++y)
+            for (int x = 0; x < DOC_W; ++x) {
+                RGBA base;
+                composed.GetPixel(x, y, base);
+                RGBA c;
+                if (other.GetPixel(x, y, c) && c.a > 8) base = c;
+                if (target.GetPixel(x, y, c) && c.a > 8) base = c;
+                composed.SetPixel(x, y, base);
+            }
+        targetOnly = target.Clone();
+    };
+    auto newLayer = [&]() {
+        ImageBuffer l(DOC_W, DOC_H, PixelFormat::RGBA8);
+        l.Clear(RGBA{0, 0, 0, 0});
+        return l;
+    };
+
+    // ---- 用例 1：两个同色不同大小的圆盘部分重叠（用户的"两个心形"形态）----
+    {
+        ImageBuffer other = newLayer();
+        DrawDisc(other, 300, 700, 190, RED);
+        ImageBuffer target = newLayer();
+        DrawDisc(target, 430, 830, 150, RED);
+        ImageBuffer composed, targetOnly;
+        makeCanvas(other, target, composed, targetOnly);
+        int tox = 0, toy = 0;
+        ImageBuffer tmpl = CropOpaque(targetOnly, tox, toy);
+        ImageBuffer view = RenderViewport(composed, S, 1520, 980);
+        CanvasCtxResult ctx;
+        std::string diag;
+        const bool ok = LocateCanvasCtx(view, tmpl, ctx, diag, DOC_W, DOC_H);
+        const int dx = ok ? std::abs(ctx.x0 - tox) : 9999;
+        const int dy = ok ? std::abs(ctx.y0 - toy) : 9999;
+        report(ok && dx <= 3 && dy <= 3, "同色双圆盘（部分重叠）命中真值",
+               ok ? ("off=(" + std::to_string(ctx.x0) + "," + std::to_string(ctx.y0) +
+                     ") 真值=(" + std::to_string(tox) + "," + std::to_string(toy) +
+                     ") 画布=" + std::to_string(ctx.cw) + "x" + std::to_string(ctx.ch))
+                  : ("定位失败: " + diag));
+    }
+
+    // ---- 用例 2：两个同色**同大小**圆盘 → 必须判 ambiguous 并拒绝 ----
+    {
+        ImageBuffer other = newLayer();
+        DrawDisc(other, 260, 640, 170, RED);
+        ImageBuffer target = newLayer();
+        DrawDisc(target, 420, 800, 170, RED);
+        ImageBuffer composed, targetOnly;
+        makeCanvas(other, target, composed, targetOnly);
+        int tox = 0, toy = 0;
+        ImageBuffer tmpl = CropOpaque(targetOnly, tox, toy);
+        ImageBuffer view = RenderViewport(composed, S, 1520, 980);
+        CanvasCtxResult ctx;
+        std::string diag;
+        const bool ok = LocateCanvasCtx(view, tmpl, ctx, diag, DOC_W, DOC_H);
+        const bool rejected = !ok && diag.find("ambiguous") != std::string::npos;
+        report(rejected, "同色同形双圆盘 → 判为歧义并拒绝",
+               ok ? ("竟然给出了位置 (" + std::to_string(ctx.x0) + "," +
+                     std::to_string(ctx.y0) + ")")
+                  : ("拒绝理由: " + diag));
+    }
+
+    // ---- 用例 3：孤立内容（画布上只有它）----
+    {
+        ImageBuffer other = newLayer();
+        ImageBuffer target = newLayer();
+        DrawDisc(target, 120, 240, 130, RED);
+        ImageBuffer composed, targetOnly;
+        makeCanvas(other, target, composed, targetOnly);
+        int tox = 0, toy = 0;
+        ImageBuffer tmpl = CropOpaque(targetOnly, tox, toy);
+        ImageBuffer view = RenderViewport(composed, S, 1520, 980);
+        CanvasCtxResult ctx;
+        std::string diag;
+        const bool ok = LocateCanvasCtx(view, tmpl, ctx, diag, DOC_W, DOC_H);
+        const int dx = ok ? std::abs(ctx.x0 - tox) : 9999;
+        const int dy = ok ? std::abs(ctx.y0 - toy) : 9999;
+        report(ok && dx <= 3 && dy <= 3, "孤立内容命中真值",
+               ok ? ("off=(" + std::to_string(ctx.x0) + "," + std::to_string(ctx.y0) +
+                     ") 真值=(" + std::to_string(tox) + "," + std::to_string(toy) + ")")
+                  : ("定位失败: " + diag));
+    }
+
+    // ---- 用例 4：目标层被上层不透明块完全遮住 → 必须失败 ----
+    {
+        ImageBuffer target = newLayer();
+        DrawDisc(target, 380, 600, 150, RED);
+        ImageBuffer above = newLayer();
+        DrawRect(above, 180, 380, 640, 860, RGBA{20, 140, 60, 255});
+        // 注意合成顺序：绿色块必须在红盘**上面**（完全盖住），这才是"被遮挡"。
+        // 一开始写成 makeCanvas(above, target) 把绿块放在下面，测的其实是
+        // "内容可见"，用例本身是错的 —— 断言失败的那种用例也要先怀疑用例。
+        ImageBuffer composed(DOC_W, DOC_H, PixelFormat::RGBA8);
+        composed.Clear(PAPER);
+        for (int y = 0; y < DOC_H; ++y) {
+            for (int x = 0; x < DOC_W; ++x) {
+                RGBA base;
+                composed.GetPixel(x, y, base);
+                RGBA c;
+                if (target.GetPixel(x, y, c) && c.a > 8) base = c;
+                if (above.GetPixel(x, y, c) && c.a > 8) base = c;
+                composed.SetPixel(x, y, base);
+            }
+        }
+        const ImageBuffer& targetOnly = target;
+        int tox = 0, toy = 0;
+        ImageBuffer tmpl = CropOpaque(targetOnly, tox, toy);
+        ImageBuffer view = RenderViewport(composed, S, 1520, 980);
+        CanvasCtxResult ctx;
+        std::string diag;
+        const bool ok = LocateCanvasCtx(view, tmpl, ctx, diag, DOC_W, DOC_H);
+        report(!ok, "被上层完全遮挡 → 拒绝（不猜位置）",
+               ok ? ("竟然给出了位置 (" + std::to_string(ctx.x0) + "," +
+                     std::to_string(ctx.y0) + ")")
+                  : ("拒绝理由: " + diag));
+    }
+
+    // ---- 用例 5：贴画布边缘（内容顶到左上角）----
+    {
+        ImageBuffer other = newLayer();
+        ImageBuffer target = newLayer();
+        DrawDisc(target, 140, 140, 140, RED);
+        ImageBuffer composed, targetOnly;
+        makeCanvas(other, target, composed, targetOnly);
+        int tox = 0, toy = 0;
+        ImageBuffer tmpl = CropOpaque(targetOnly, tox, toy);
+        ImageBuffer view = RenderViewport(composed, S, 1520, 980);
+        CanvasCtxResult ctx;
+        std::string diag;
+        const bool ok = LocateCanvasCtx(view, tmpl, ctx, diag, DOC_W, DOC_H);
+        const int dx = ok ? std::abs(ctx.x0 - tox) : 9999;
+        const int dy = ok ? std::abs(ctx.y0 - toy) : 9999;
+        report(ok && dx <= 3 && dy <= 3, "贴左缘内容命中真值",
+               ok ? ("off=(" + std::to_string(ctx.x0) + "," + std::to_string(ctx.y0) +
+                     ") 真值=(" + std::to_string(tox) + "," + std::to_string(toy) + ")")
+                  : ("定位失败: " + diag));
+    }
+    return lines;
+}
+
+
 // 后台线程的阶段推进
 void RunCaptureJob() {
     CaptureJob& j = g_cap;
@@ -2188,18 +3260,18 @@ void RunCaptureJob() {
         CanvasCtxResult ctx;
         std::string diag;
         if (AcquireCanvasContext(ctx, diag)) {
-            st.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0);
+            st.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0,
+                                    ctx.srcW, ctx.srcH);
         } else {
             st.core->SetCanvasContext(false, 0, 0, 0, 0);
-            st.core->Log("canvas ctx: locate failed (" + diag +
-                         " [若该层被上方图层遮挡/与其它层混合，匹配无法成立：请把此层临时置顶或隐藏其它层后重抓] " +
-                         "), fallback to plain paste");
-            // 定位失败 → 不补边 → 粘贴必然错位。必须明确告诉用户，
-            // 否则现象只是"粘回去偏了"，看不出是哪一步没生效。
+            st.core->Log("canvas ctx: locate failed (" + diag + "), no auto-paste on apply");
+            // 定位失败 → 不补边 → 窗口里只是包围盒，且**应用时不会自动回贴**。
+            // 必须明确告诉用户，否则现象只是"粘回去偏了"或"点了没反应"，
+            // 看不出是哪一步没生效。
             if (j.message.empty())
                 j.message = L"⚠ 画布定位失败（" +
                             std::wstring(diag.begin(), diag.end()) +
-                            L"）→ 本次粘贴会错位，请把该提示反馈给开发者";
+                            L"）→ 窗口里只是图层包围盒；应用时不会自动回贴";
         }
     } else if (j.grabbed && !ctxArmed) {
         // 没有画布上下文 = 不会补边 = 粘贴必然错位。
@@ -2209,8 +3281,9 @@ void RunCaptureJob() {
                                  : !st.pasteInPlace
                                        ? L"未勾选「精确回贴（补边对齐）」"
                                        : L"画布快照 arm 失败";
-        j.message = std::wstring(L"⚠ 无法精确回贴：") + why +
-                    L" → 本次粘贴会错位";
+        j.message = std::wstring(L"⚠ 无法精确定位画布：") + why +
+                    L" → 窗口里看到的只是图层包围盒（不是整幅画布），"
+                    L"应用时不会自动回贴（避免贴歪）";
         st.core->Log("WARN 无法精确回贴（ctx 未获取）: " +
                      std::string(!st.agentOnline ? "agent 未连接"
                                  : !st.pasteInPlace ? "未勾选精确回贴"
@@ -2225,8 +3298,12 @@ void RunCaptureJob() {
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// 公共 API
+// 画布定位回归用例的对外入口（实现放在上面的匿名命名空间里，只在本 TU 可见；
+// 这里只做一层转发，让 SelfTest.cpp 也能跑同一组用例）。
+std::vector<std::string> RunCanvasLocateTests(int& failures) {
+    return RunCanvasLocateTestsImpl(failures);
+}
+
 // ---------------------------------------------------------------------------
 HWND FindSai2Window() {
     const DWORD pid = FindProcessIdByName(L"sai2.exe");
@@ -2542,29 +3619,43 @@ void DoApplyFlow(UiWindow& win) {
     //
     // 所以这里不依赖"上下文恰好还在"：缺了就现测一次（与「液化」按钮同一套
     // 定位：agent 画布快照 + 模板匹配 + .sai2 精确尺寸）。
-    if (s.core->HasImage() && !s.core->HasCanvasContext()) {
+    std::string ctxDiag;
+    bool aligned = s.core->HasCanvasContext();
+    if (s.core->HasImage() && !aligned) {
         CanvasCtxResult ctx;
-        std::string diag;
-        if (AcquireCanvasContext(ctx, diag) && ctx.ok) {
-            s.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0);
-        } else {
-            s.flash = U8("没有画布尺寸，粘贴会错位：" + diag);
+        if (AcquireCanvasContext(ctx, ctxDiag) && ctx.ok) {
+            s.core->SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0,
+                                     ctx.srcW, ctx.srcH);
+            aligned = true;
         }
     }
     const BridgeCore::ApplyResult r = s.core->ApplyToClipboard();
     if (r.clipboardWritten) {
         s.selfWriteTick = GetTickCount64();
         (void)win;
-        if (s.autoPaste) {
+        // ★ 定位不成功时**不回贴**。
+        //   以前的回退是"普通粘贴"：图不是画布尺寸，SAI2 把它贴到画布左上角
+        //   → 整层内容偏到左上、还要用户自己 Ctrl+Z 收拾。用户反馈的"应用剪贴板
+        //   粘回去会错位"就是这个回退造成的。现在改成明确拒绝 + 说明怎么修，
+        //   结果仍留在剪贴板里（想手动贴可以贴，但会落在左上角）。
+        if (s.autoPaste && s.pasteInPlace && !aligned) {
+            s.flash = U8(
+                "已写入剪贴板，但没能定位画布（" + ctxDiag +
+                "）→ 为避免贴歪，这次没有自动粘贴。"
+                "请把该层临时置顶（或隐藏其它图层）后重新抓取；"
+                "若画布被视图裁掉，先把视图缩放到能看见整块画布。");
+        } else if (s.autoPaste) {
             AutoPasteToSai2();
             // 1.19 起所有粘贴路径都是新建图层（Ctrl+V）：勾了「合并回原
             // 图层」就发 F（向下转写）把效果并入原图层。
             if (s.mergeBack) ScheduleMergeAfterPaste(s.mainHwnd);
+            s.flash.clear();
+        } else {
+            s.flash.clear();
         }
-        s.flash.clear();
         // 多选了多层 → 主层已由上面处理完，其余层逐层补做（后台线程）。
         // 放在这里而不是抓取阶段：只有"应用"才知道用户最终定下的形变。
-        if (s.selLayers.size() > 1) {
+        if (s.selLayers.size() > 1 && aligned) {
             const HWND h = win.hwnd;
             if (g_cap.busy.exchange(true)) return;
             std::thread([h]() {
@@ -3577,7 +4668,7 @@ int RunMultiLayerTest(const std::string& pa, const std::string& pb, int cw,
     }
     core.SetCurrentEffect(idx, BridgeCore::kWinLiquify);
     core.SetImage(A, "layerA");
-    core.SetCanvasContext(true, cw, ch, ax, ay);
+    core.SetCanvasContext(true, cw, ch, ax, ay, A.Width(), A.Height());
 
     // 在基准层上刷一笔 → 建立置换场。
     // 用 twirl（旋转场）：它是**非均匀**的，如果偏移算错，重叠区立刻对不上；
@@ -3682,8 +4773,12 @@ int RunDocTest() {
 
 // 不碰 agent、不碰剪贴板、不改 SAI2 —— 用已经落盘的两张图确定性复现匹配，
 // 便于对照 Python 原型定位尺度偏差。
-// --match-test <snapshot.bmp> <template.bmp>：离线复跑画布上下文定位。
-int RunMatchTest(const std::string& snapPath, const std::string& tmplPath) {
+// --match-test <snapshot.bmp> <template.bmp> [docW docH]：离线复跑画布上下文定位。
+// 给了 docW/docH 就走 v2 确定性定位（与产品里读 .sai2 头部之后的路径完全一致），
+// 不给就走旧的多尺度算法。这条测试缝是唯一能在没有 SAI2 的情况下复现落位偏差
+// 的手段 —— 真机链路两个进程抢同一个管道，问题不可稳定复现。
+int RunMatchTest(const std::string& snapPath, const std::string& tmplPath,
+                 int docW, int docH) {
     AttachParentConsole();
     g_ctxDebugCurve = true;
     std::printf("build: %s\n", BuildStamp().c_str());
@@ -3699,9 +4794,13 @@ int RunMatchTest(const std::string& snapPath, const std::string& tmplPath) {
     }
     std::printf("快照 %dx%d   模板 %dx%d\n", view.Width(), view.Height(),
                 tmpl.Width(), tmpl.Height());
+    if (docW > 0 && docH > 0)
+        std::printf("按精确画布尺寸 %dx%d 走 v2 定位\n", docW, docH);
+    else
+        std::printf("未给画布尺寸 → 走旧的多尺度算法\n");
     CanvasCtxResult ctx;
     std::string diag;
-    if (LocateCanvasCtx(view, tmpl, ctx, diag)) {
+    if (LocateCanvasCtx(view, tmpl, ctx, diag, docW, docH)) {
         std::printf("OK   画布=%dx%d  内容偏移=(%d,%d)  %s\n", ctx.cw, ctx.ch,
                     ctx.x0, ctx.y0, diag.c_str());
         return 0;
@@ -3750,8 +4849,9 @@ int RunPadClipboard(const std::string& snapPath, const std::string& tmplPath,
         std::printf("FAIL 启动核心: %s\n", err.c_str());
         return 2;
     }
+    const int tmplW = tmpl.Width(), tmplH = tmpl.Height();
     core.SetImage(std::move(tmpl), "pad-clipboard");
-    core.SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0);
+    core.SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0, tmplW, tmplH);
     const bool ok = core.WriteAppliedToClipboard(err);
     core.Shutdown();
     if (!ok) {
@@ -3804,12 +4904,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     std::string outDir = ExeDir() + "\\selftest-out";
     std::string dumpPath;
     bool ctxTest = false;
+    bool locateTest = false;
     bool docTest = false;
     std::string mlA, mlB, mlOut;
     std::string clipPadIn, clipPadCw, clipPadCh, clipPadX, clipPadY;
     std::string mlCW, mlCH, mlAx, mlAy, mlBx, mlBy;
     bool versionOnly = false;
-    std::string matchSnap, matchTmpl;
+    std::string matchSnap, matchTmpl, matchDocW, matchDocH;
     bool padClipboard = false;
     bool selfTest = false;
     bool findTools = false; // 只报告"注入器/agent 找到在哪"，不真的注入
@@ -3882,6 +4983,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             next(clipPadX); next(clipPadY);
         }
         else if (a == L"--ctx-test") ctxTest = true;
+        else if (a == L"--locate-test") locateTest = true;
         else if (a == L"--doc-test") docTest = true;
         else if (a == L"--ml-sel") {
             // 测试钩子：预设图层多选（如 "0,1"），供无人值守验证"一起液化"
@@ -3907,6 +5009,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         else if (a == L"--match-test") {
             next(matchSnap);
             next(matchTmpl);
+            // 可选：画布精确尺寸 / 期望偏移（离线回归用）
+            next(matchDocW);
+            next(matchDocH);
         }
         else if (a == L"--pad-clipboard") {
             next(matchSnap);
@@ -4015,10 +5120,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
                                  pluginsDir, logDir);
     if (docTest) return RunDocTest();
     if (ctxTest) return RunCanvasCtxTest();
+    // --locate-test：画布定位 v2 的合成回归（不碰 SAI2 / 剪贴板 / 文件）
+    if (locateTest) {
+        AttachParentConsole();
+        std::printf("build: %s\n", BuildStamp().c_str());
+        int fails = 0;
+        const std::vector<std::string> lines = RunCanvasLocateTests(fails);
+        for (const std::string& l : lines) std::printf("%s\n", l.c_str());
+        std::printf("画布定位回归: %d 项失败\n", fails);
+        return fails;
+    }
     if (!matchSnap.empty() && !matchTmpl.empty())
-        return padClipboard ? RunPadClipboard(matchSnap, matchTmpl, pluginsDir,
-                                              logDir)
-                            : RunMatchTest(matchSnap, matchTmpl);
+        return padClipboard
+                   ? RunPadClipboard(matchSnap, matchTmpl, pluginsDir, logDir)
+                   : RunMatchTest(matchSnap, matchTmpl,
+                                  std::atoi(matchDocW.c_str()),
+                                  std::atoi(matchDocH.c_str()));
 
     AppState& s = S();
     s.core = std::make_unique<BridgeCore>(pluginsDir, logDir);

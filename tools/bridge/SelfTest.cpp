@@ -6,6 +6,7 @@
 
 #include "BmpIO.h"
 #include "BridgeCore.h"
+#include "CanvasLocateTest.h"
 #include "ClipboardImage.h"
 
 #include <algorithm>
@@ -381,6 +382,30 @@ int RunSelfTest(const std::string& outDir, const std::string& pluginsDir,
             core.SetChain(false);
             break;
         }
+    }
+
+    rep.Add("");
+
+    // ---------------- 6. 画布定位（精确回贴的成败全在这一段）----------------
+    // 用户反馈的三条现象（抓到的图不是画布尺寸 / 窗口里位置与原层不一致 /
+    // 回贴错位）都来自这里。用纯内存合成图固定判据：纯色重叠、歧义、遮挡、
+    // 贴边五种情形必须分别"命中真值"或"明确拒绝"。
+    rep.Add("--- 6. 画布定位（合成回归）---");
+    {
+        int locFails = 0;
+        const std::vector<std::string> lines =
+            ui::RunCanvasLocateTests(locFails);
+        for (const std::string& l : lines) {
+            if (l.rfind("PASS", 0) == 0) {
+                ++rep.passes;
+                rep.Add(l);
+            } else {
+                ++rep.failures;
+                rep.Add(l);
+            }
+        }
+        if (lines.empty()) rep.Skip("画布定位回归", "用例集为空");
+        (void)locFails;
     }
 
     rep.Add("");

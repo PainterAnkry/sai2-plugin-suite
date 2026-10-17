@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # ============================================================================
 # build-zig.sh - 使用 zig c++（clang 21, MinGW ABI）构建整个工程
 # 用途：本机无 CMake/MSVC 时的验证构建；正式发布仍推荐 CMake
@@ -18,7 +18,7 @@ export ZIG_GLOBAL_CACHE_DIR="$BUILD/zig-cache"
 
 # 版本资源：每个随包二进制都带 VERSIONINFO（无版本信息的裸二进制
 # 最容易被杀软启发式引擎误报）。模板见 resources/version.rc.in。
-VER="1.19.0"
+VER="1.23.0"
 RES="$BUILD/res"
 mkdir -p "$RES"
 # make_res <描述> <内部名> <原始文件名> <VFT_APP|VFT_DLL> <输出.res>
