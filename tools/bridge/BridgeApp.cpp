@@ -4987,8 +4987,19 @@ int RunPadClipboard(const std::string& snapPath, const std::string& tmplPath,
         return 2;
     }
     const int tmplW = tmpl.Width(), tmplH = tmpl.Height();
+    ImageBuffer tmplCopy = tmpl.Clone();
     core.SetImage(std::move(tmpl), "pad-clipboard");
     core.SetCanvasContext(true, ctx.cw, ctx.ch, ctx.x0, ctx.y0, tmplW, tmplH);
+    // ★ 回归：抓取流程的真实顺序是 SetCanvasContext → SetImage（先定位，再把
+    //   刚抓到的图交给核心）。以前 SetImage 用 std::move 之后的空图做尺寸校验，
+    //   恒失败 → 刚定位好的偏移立刻作废 → 面板永远"⚠ 无画布尺寸"。
+    //   这里显式复现该顺序：再塞一张**同尺寸**的图，上下文必须还在。
+    core.SetImage(std::move(tmplCopy), "pad-clipboard-again");
+    if (!core.HasCanvasContext()) {
+        core.Shutdown();
+        std::printf("FAIL 同尺寸换图后画布上下文被丢弃（SetImage 的尺寸校验回归）\n");
+        return 1;
+    }
     const bool ok = core.WriteAppliedToClipboard(err);
     core.Shutdown();
     if (!ok) {
