@@ -2247,6 +2247,11 @@ struct Rect {
 // 真实快照的层次（实测）：黑未用区 → 灰视口 → 白纸+内容；前两级剥掉后
 // 剩下的包围盒就是画布矩形。长宽比校验是这里唯一的判据 —— 画布尺寸精确
 // 已知时它极强（内容包围盒的长宽比几乎不可能碰巧吻合）。
+//
+// ★ 每一级要剥的是**当前包围盒边框上的颜色**（不是全图模态色）。
+//   差别很实际：文档大片留白时（纸面面积 > 视口边距），全图模态色会变成
+//   **纸色**，一剥就把纸和内容一起剥掉，只剩内容包围盒 → 长宽比对不上 →
+//   整条定位失败。按边框剥则永远是"先剥视口、再剥纸"，与两者面积比例无关。
 bool FindCanvasRect(const ImageBuffer& view, int docW, int docH, Rect& out,
                     std::string& diag, std::string* note) {
     const int vw = view.Width(), vh = view.Height();
@@ -2255,18 +2260,61 @@ bool FindCanvasRect(const ImageBuffer& view, int docW, int docH, Rect& out,
     struct Cand { Rect r; double arErr; };
     std::vector<Cand> cands;
     std::string trace;
+    Rect cur{0, 0, vw, vh};
     for (int level = 0; level < 3; ++level) {
-        RGBA modal;
-        double frac = 0.0;
-        if (!ModalColorFast(view, excl, modal, frac)) break;
-        const int shift = (view.Format() == PixelFormat::RGBA16) ? 11 : 3;
-        (void)shift;
+        // ---- 当前包围盒 2px 边框上的模态色（只统计还没被排除的像素）----
+        const int R = 2;
+        std::vector<int> ringX, ringY;   // 边框像素（去重不必：重复计数不影响模态）
+        for (int y = cur.y0; y < cur.y0 + cur.h && y < vh; ++y) {
+            for (int d = 0; d < R; ++d) {
+                ringX.push_back(cur.x0 + d);
+                ringY.push_back(y);
+                ringX.push_back(cur.x0 + cur.w - 1 - d);
+                ringY.push_back(y);
+            }
+        }
+        for (int x = cur.x0; x < cur.x0 + cur.w && x < vw; ++x) {
+            for (int d = 0; d < R; ++d) {
+                ringX.push_back(x);
+                ringY.push_back(cur.y0 + d);
+                ringX.push_back(x);
+                ringY.push_back(cur.y0 + cur.h - 1 - d);
+            }
+        }
+        long long hist[32 * 32 * 32] = {0};
+        int bestKey = -1;
+        long long bestN = 0;
+        std::vector<uint32_t> keys(ringX.size(), 0xFFFFFFFFu);
+        long long used = 0;
+        for (size_t i = 0; i < ringX.size(); ++i) {
+            const int x = ringX[i], y = ringY[i];
+            if (x < 0 || y < 0 || x >= vw || y >= vh) continue;
+            if (excl[size_t(y) * vw + x]) continue;
+            RGBA c;
+            if (!view.GetPixel(x, y, c)) continue;
+            const int key = ((c.r >> 3) << 10) | ((c.g >> 3) << 5) | (c.b >> 3);
+            keys[i] = static_cast<uint32_t>(key);
+            if (++hist[key] > bestN) { bestN = hist[key]; bestKey = key; }
+            ++used;
+        }
+        if (used <= 0 || bestKey < 0) break;
+        long long rr = 0, gg = 0, bb = 0, sn = 0;
+        for (size_t i = 0; i < ringX.size(); ++i) {
+            if (keys[i] != static_cast<uint32_t>(bestKey)) continue;
+            RGBA c;
+            if (!view.GetPixel(ringX[i], ringY[i], c)) continue;
+            rr += c.r; gg += c.g; bb += c.b; ++sn;
+        }
+        RGBA ring;
+        ring.r = sn ? static_cast<uint16_t>(rr / sn) : uint16_t((bestKey >> 10) & 31) << 3;
+        ring.g = sn ? static_cast<uint16_t>(gg / sn) : uint16_t((bestKey >> 5) & 31) << 3;
+        ring.b = sn ? static_cast<uint16_t>(bb / sn) : uint16_t(bestKey & 31) << 3;
         const int tol = 6;
         for (int y = 0; y < vh; ++y) {
             for (int x = 0; x < vw; ++x) {
                 const size_t idx = size_t(y) * vw + x;
                 if (excl[idx]) continue;
-                if (NearColor(view, x, y, modal, tol)) excl[idx] = 1;
+                if (NearColor(view, x, y, ring, tol)) excl[idx] = 1;
             }
         }
         int x0 = vw, y0 = vh, x1 = -1, y1 = -1;
@@ -2282,6 +2330,7 @@ bool FindCanvasRect(const ImageBuffer& view, int docW, int docH, Rect& out,
         if (x1 < x0 || y1 < y0) break;
         Rect r{x0, y0, x1 - x0 + 1, y1 - y0 + 1};
         if (r.w < 32 || r.h < 32) break;
+        cur = r;
         const bool isWholeView = (r.w >= vw - 1 && r.h >= vh - 1);
         if (!isWholeView) {
             const double arErr = std::fabs(double(r.w) / double(r.h) - targetAR) /
@@ -2292,7 +2341,6 @@ bool FindCanvasRect(const ImageBuffer& view, int docW, int docH, Rect& out,
                          "(ar" + std::to_string(int(arErr * 1000)) + "‰)";
             if (arErr <= 0.02) cands.push_back(Cand{r, arErr});
         }
-        if (frac > 0.85) break;
     }
     if (note) *note = trace;
     if (cands.empty()) {
@@ -3148,6 +3196,31 @@ std::vector<std::string> RunCanvasLocateTestsImpl(int& failures) {
         const int dx = ok ? std::abs(ctx.x0 - tox) : 9999;
         const int dy = ok ? std::abs(ctx.y0 - toy) : 9999;
         report(ok && dx <= 3 && dy <= 3, "贴左缘内容命中真值",
+               ok ? ("off=(" + std::to_string(ctx.x0) + "," + std::to_string(ctx.y0) +
+                     ") 真值=(" + std::to_string(tox) + "," + std::to_string(toy) + ")")
+                  : ("定位失败: " + diag));
+    }
+    // ---- 用例 6：画布几乎占满视图（纸面面积 > 视口边距）----
+    // 这一条专门守"逐级剥离要按**边框颜色**、不能按全图模态色"：按全图模态色时
+    // 大片留白的文档会把纸色当成底色剥掉，只剩内容包围盒 → 长宽比对不上 →
+    // 定位整体失败（用户侧表现就是"有时候补边、有时候不补"）。
+    {
+        ImageBuffer other = newLayer();
+        DrawDisc(other, 260, 640, 150, RED);
+        ImageBuffer target = newLayer();
+        DrawDisc(target, 470, 700, 170, RED);
+        ImageBuffer composed, targetOnly;
+        makeCanvas(other, target, composed, targetOnly);
+        int tox = 0, toy = 0;
+        ImageBuffer tmpl = CropOpaque(targetOnly, tox, toy);
+        // 视图刚好包住画布：边距只有 15/26 px
+        ImageBuffer view = RenderViewport(composed, S, 500, 720);
+        CanvasCtxResult ctx;
+        std::string diag;
+        const bool ok = LocateCanvasCtx(view, tmpl, ctx, diag, DOC_W, DOC_H);
+        const int dx = ok ? std::abs(ctx.x0 - tox) : 9999;
+        const int dy = ok ? std::abs(ctx.y0 - toy) : 9999;
+        report(ok && dx <= 3 && dy <= 3, "画布几乎占满视图（纸面为主）命中真值",
                ok ? ("off=(" + std::to_string(ctx.x0) + "," + std::to_string(ctx.y0) +
                      ") 真值=(" + std::to_string(tox) + "," + std::to_string(toy) + ")")
                   : ("定位失败: " + diag));
