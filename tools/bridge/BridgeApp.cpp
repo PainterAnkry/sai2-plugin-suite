@@ -2192,6 +2192,7 @@ void RunCaptureJob() {
         } else {
             st.core->SetCanvasContext(false, 0, 0, 0, 0);
             st.core->Log("canvas ctx: locate failed (" + diag +
+                         " [若该层被上方图层遮挡/与其它层混合，匹配无法成立：请把此层临时置顶或隐藏其它层后重抓] " +
                          "), fallback to plain paste");
             // 定位失败 → 不补边 → 粘贴必然错位。必须明确告诉用户，
             // 否则现象只是"粘回去偏了"，看不出是哪一步没生效。
