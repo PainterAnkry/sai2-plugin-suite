@@ -584,6 +584,14 @@ void OpenToolWindow(int winIdx) {
         &win);
     if (!h) return;
     win.hwnd = h;
+    // 每次拿到新图都回到"适配"（整幅可见）。
+    // 为什么：窗口一直被复用时 zoom/pan 会留着上一张图的取值 —— 用户改过画布
+    // 大小（或换了图层）之后，旧 zoom 在新图上只显示一部分，看起来就像"这几个
+    // 窗口没跟着改"。实测用户反馈"滤镜正常、模糊/液化还是显示不全"就是这个：
+    // 滤镜窗口被关掉重开过（关窗时本来就会复位），其它窗口一直开着。
+    win.zoom = 0.0;
+    win.panX = 0.0;
+    win.panY = 0.0;
     EnableRoundedWindow(h); // Win11 圆角窗口（旧系统静默跳过）
     RestoreWindowPlacement(h, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left,
                            rc.bottom - rc.top);
