@@ -1599,17 +1599,22 @@ bool AcquireCanvasContext(CanvasCtxResult& out, std::string& diag) {
                     RGBA c;
                     if (view.GetPixel(x, y, c)) cr.SetPixel(x - x0, y - y0, c);
                 }
-            const bool ok = LocateCanvasCtxLegacy(cr, tmpl, out, diag, docW, docH);
-            if (ok) {
-                out.x0 += x0;   // 偏移换算回原快照坐标
-                out.y0 += y0;
-            }
-            return ok;
+            // ★ 必须走 LocateCanvasCtx（分派器），不能直接调 Legacy：
+            //   改名拆函数时这两处被顺手改成了 Legacy，于是**生产路径永远走
+            //   旧算法** —— 新写的 v2 只在 --match-test 里生效，真机上一次都
+            //   没跑过。这是"改了却没效果"最典型的形态：测试通过、产品没变。
+            //
+            // ★ 也**不能**再把裁剪原点加回 out.x0/y0：x0/y0 是"内容在画布内的
+            //   偏移"，而裁剪原点只是视图坐标系里的平移 —— 两者的差（内容相对
+            //   纸的偏移）与裁剪无关。以前那句 `out.x0 += x0` 把裁剪原点当成了
+            //   画布偏移的一部分（实测多加了 (272,128)，正好等于黑边宽度），
+            //   于是 v2 明明算出 (0,0)，返回给产品的却是 (272,128)。
+            return LocateCanvasCtx(cr, tmpl, out, diag, docW, docH);
         }
     }
     (void)cropX;
     (void)cropY;
-    return LocateCanvasCtxLegacy(view, tmpl, out, diag, docW, docH);
+    return LocateCanvasCtx(view, tmpl, out, diag, docW, docH);
 }
 
 // 定位"画布上下文"：纯数学部分，输入只有两张 RGBA8 图 ——
