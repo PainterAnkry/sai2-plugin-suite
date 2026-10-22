@@ -208,6 +208,9 @@ struct AppState {
     bool agentPushed = false;  // 效果清单已推给注入代理
     bool mergePending = false;
     ULONGLONG selfWriteTick = 0;
+    // 注入因权限级别被拒（SAI2 管理员运行 / 面板未提权）时为 true：
+    // 面板据此显示"需要管理员权限"的指引和一键提权重启按钮。
+    bool needAdmin = false;
 
     // 注入代理（图层识别）
     sai2bridge::AgentLayers layers;
@@ -436,10 +439,16 @@ LayerAgg AggregateLayers(const std::vector<sai2bridge::AgentLayerRow>& rows);
 // 图层面板所在的那个捕获分组
 const sai2bridge::AgentLayerGroup* PanelGroup();
 
-void RefreshLayers();
+// 刷新图层列表。budgetMs：agent 管道连接重试预算（毫秒），0 = 按当前
+// 已知状态自动选择（在线 3000ms 兜住服务端重建管道名的窗口 / 离线 200ms
+// 快速失败）。**离线时绝不能再拿 3s 预算**：定时器每 2.5s 调一次本函数，
+// UI 线程会被 Connect 堵满 3 秒 → 面板"切过去就卡死"（用户实录）。
+void RefreshLayers(DWORD budgetMs = 0);
 std::vector<std::wstring> LayerNames();
 void DoInjectAsync(HWND hwnd);
 void DoSelectLayer(int rowIdx);
+// 以管理员身份重启本面板（UAC 提权）。旧实例退出、新实例带 --takeover 接管。
+void RelaunchElevated();
 
 // ---- 图层多选（Ctrl+点切换 / Shift+点范围）--------------------------------
 // 面板是选中集的权威，再用真实点击（含 Ctrl+点）把它同步给 SAI2 ——

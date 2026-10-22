@@ -123,6 +123,7 @@ enum LayerBtnId { LBTN_INJECT = 0, LBTN_REFRESH, LBTN_GRABSEL, LBTN_COUNT };
 enum {
     CMD_LAYER_ROW = 1000,   // +i  点击图层行
     CMD_LAYER_BTN = 2000,   // +i  图层操作按钮
+    CMD_ELEVATE = 2100,     //      以管理员身份重启面板（提权重启）
     CMD_WATCH = 910,        // 监听剪贴板
     CMD_AUTOLAYER = 911,    // 点图层行时在 SAI2 选中
     CMD_MERGE = 912,        // 合并回原层
@@ -271,8 +272,10 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
         TextC(dc, L"SAI2 图层（注入代理）", head, C_DIM, s.fSmall,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         RECT hint = {head.left + Scale(190), head.top, head.right, head.bottom};
-        TextC(dc, s.agentOnline ? L"已连接" : L"未连接 —— 点「连接注入」", hint,
-              s.agentOnline ? C_OK : C_WARN, s.fSmall,
+        TextC(dc, s.agentOnline ? L"已连接"
+                   : (s.needAdmin ? L"未连接 —— 需要管理员权限（见下）"
+                                  : L"未连接 —— 点「连接注入」"),
+              hint, s.agentOnline ? C_OK : C_WARN, s.fSmall,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         RECT box = lay.layerList;
@@ -294,9 +297,36 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
         if (!s.agentOnline) {
             RECT hr = {box.left + Scale(10), box.top + Scale(8),
                        box.right - Scale(10), box.bottom - Scale(6)};
-            TextC(dc, L"未连接注入代理。\n点「连接注入」（SAI2 需已运行），之后"
-                      L"这里会列出图层；点行即在 SAI2 里选中该层。",
-                  hr, C_WARN, s.fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            if (s.needAdmin) {
+                // 权限级别不匹配（SAI2 管理员 / 面板没有）：说清"为什么无图像"
+                // 和两条解决路径，并给一个一键提权重启按钮。
+                TextC(dc, L"检测到 SAI2 以管理员身份运行，而本面板没有 ——"
+                          L" 注入会被系统拒绝，所以没有图像、也读不到图层。\n"
+                          L"点下方「管理员重启」（会弹 UAC，选“是”）；"
+                          L"或右键 启动插件面板.bat → 以管理员身份运行，"
+                          L"然后重新打开一幅画。",
+                      hr, C_WARN, s.fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
+                const int btnW = Scale(120);
+                RECT br = {box.left + Scale(10),
+                           std::max(box.top + Scale(84),
+                                    box.bottom - Scale(34)),
+                           box.left + Scale(10) + btnW,
+                           box.bottom - Scale(8)};
+                const bool hot = UiHover(win, br);
+                RoundBox(dc, br, hot ? C_ACCENT2 : C_PANEL,
+                         hot ? C_ACCENT : C_ACCENT, Scale(6));
+                TextC(dc, L"管理员重启", br, RGB(255, 255, 255), s.fBody,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                UiHit hb;
+                hb.rc = br;
+                hb.kind = HK_CMD;
+                hb.index = CMD_ELEVATE;
+                win.hits.push_back(hb);
+            } else {
+                TextC(dc, L"未连接注入代理。\n点「连接注入」（SAI2 需已运行），之后"
+                          L"这里会列出图层；点行即在 SAI2 里选中该层。",
+                      hr, C_WARN, s.fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            }
         } else if (total == 0) {
             RECT hr = {box.left + Scale(10), box.top + Scale(8),
                        box.right - Scale(10), box.bottom - Scale(6)};
@@ -568,6 +598,42 @@ DWORD FindProcessIdByName(const wchar_t* exeName) {
     return pid;
 }
 
+// ---------------------------------------------------------------------------
+// UAC 完整性级别检测（提权不匹配）
+//
+// 注入需要 OpenProcess(完整访问权限)。**SAI2 以管理员运行而本面板没有**时，
+// OpenProcess 以 ERROR_ACCESS_DENIED(5) 失败 —— 同用户、仅完整性级别不同
+// （用户实录：v1.27 下载后按说明加了白名单，SAI2 管理员启动，面板普通双击
+// 启动 → 注入失败 Win32 5 → 面板无图像、还卡死）。
+//
+// 工具快照枚举不受完整性级别影响，所以"枚举得到 sai2.exe 的 pid、
+// 但 OpenProcess(PROCESS_QUERY_INFORMATION) 拒绝访问"基本可以断定就是
+// 级别差。反过来面板自己已提权时不存在这个问题（低级别进程随便开）。
+// ---------------------------------------------------------------------------
+bool SelfIsElevated() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION elev{};
+    DWORD n = 0;
+    const bool elevated =
+        GetTokenInformation(tok, TokenElevation, &elev, sizeof(elev), &n) &&
+        elev.TokenIsElevated != 0;
+    CloseHandle(tok);
+    return elevated;
+}
+
+bool Sai2RunsElevated() {
+    if (SelfIsElevated()) return false; // 自己就是管理员：不存在级别差
+    const DWORD pid = FindProcessIdByName(L"sai2.exe");
+    if (!pid) return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (h) {
+        CloseHandle(h);
+        return false; // 打得开 → 没提权
+    }
+    return GetLastError() == ERROR_ACCESS_DENIED;
+}
+
 struct EnumCtx {
     DWORD pid = 0;
     HWND found = nullptr;
@@ -723,7 +789,9 @@ void HeartbeatLoop() {
     while (!g_hbStop.load(std::memory_order_relaxed)) {
         if (S().agentOnline) {
             long long pid = 0;
-            sai2bridge::AgentPing(pid); // 结果不重要，让 agent 知道桥还活着
+            // 1s 预算：这是后台线程，赌不起也无须赌 —— agent 真的掉线时
+            // RefreshLayers 会把 agentOnline 置 false，心跳自然停。
+            sai2bridge::AgentPing(pid, 1000);
         }
         for (int i = 0; i < 10 && !g_hbStop.load(std::memory_order_relaxed);
              ++i)
@@ -4188,12 +4256,21 @@ void UpdateAgentScale(const sai2bridge::AgentLayerGroup& grp) {
     s.agentScaleY = std::min(4.0, std::max(0.5, ph / double(ar.bottom - ar.top)));
 }
 
-void RefreshLayers() {
+void RefreshLayers(DWORD budgetMs) {
     AppState& s = S();
     // uitest 模式：不查代理，保留注入的模拟图层（供界面探针截图覆盖滚动条路径）
     if (g_uiTestSeconds > 0) return;
+    // agent 管道连接预算（毫秒）—— 按"agent 是否可能在线"分流：
+    //   · 在线 → 3000：服务端每服务完一个客户端就 DisconnectNamedPipe →
+    //     重建管道名，存在名字短暂不存在的窗口，需要重试兜底。
+    //   · 已确认离线 → 200：管道名根本不存在，Connect 只会空转满整个预算。
+    //     历史上这里无条件用 3s，而定时器每 2.5s 调一次本函数 —— agent
+    //     不在线时 UI 线程每次被堵整整 3 秒，面板表现为"切过去就卡死、
+    //     点哪都没反应，重启依旧"（用户实录：注入失败后面板无响应）。
+    //   · 注入后首刷等"agent 可能刚建管道"的场景由调用方显式传预算。
+    if (budgetMs == 0) budgetMs = s.agentOnline ? 3000 : 200;
     sai2bridge::AgentLayers l;
-    if (sai2bridge::QueryLayers(l)) {
+    if (sai2bridge::QueryLayers(l, nullptr, budgetMs)) {
         const bool wasOnline = s.agentOnline;
         s.layers = std::move(l);
         s.agentOnline = true;
@@ -4499,6 +4576,20 @@ void DoInjectAsync(HWND hwnd) {
         InvalidateAll();
         return;
     }
+
+    // 提权不匹配预检：SAI2 管理员运行而面板没有时，注入器的 OpenProcess
+    // 必然以 Win32 5 失败。先给明确指引（附一键提权重启），别让用户对着
+    // "拒绝访问" 四个字猜，更别再走一遍 25 秒的注入器等待。
+    if (Sai2RunsElevated()) {
+        s.needAdmin = true;
+        s.flash = L"SAI2 正以管理员身份运行，而本面板没有 —— 注入会被系统拒绝。"
+                  L"请点「管理员重启」（或右键 启动插件面板.bat → 以管理员身份运行）";
+        S().core->Log("injector: SKIP 权限级别不匹配（SAI2 已提权 / 面板未提权），"
+                      "注入必然 OpenProcess 拒绝访问");
+        InvalidateAll();
+        return;
+    }
+
     S().core->Log("injector: 使用 " + Wide2Utf8(paths.injector));
 
     const std::wstring injector = paths.injector;
@@ -4553,8 +4644,51 @@ void DoInjectAsync(HWND hwnd) {
             CloseHandle(readEnd);
         }
         S().core->Log("injector: " + out);
-        PostMessageW(hwnd, WM_APP + 2, 0, 0);
+        // "拒绝访问/Win32 5" = 权限级别不匹配（或极少数杀软拦进程访问）。
+        // 通过消息把结论带回 UI 线程（wp=1），由窗口过程置 needAdmin 并
+        // 给出提权重启指引 —— 后台线程不直接碰 AppState。
+        const bool denied = out.find("Win32 5") != std::string::npos ||
+                            out.find("拒绝访问") != std::string::npos ||
+                            out.find("Access is denied") != std::string::npos;
+        PostMessageW(hwnd, WM_APP + 2, denied ? 1 : 0, 0);
     }).detach();
+}
+
+// ---------------------------------------------------------------------------
+// 以管理员身份重启面板（UAC 提权）
+//
+// 场景：SAI2 是管理员运行的（很多用户为了兼容性/汉化版会这么做），而面板
+// 普通启动 → 注入被拒（Win32 5）→ 无图像。点「管理员重启」：
+//   1. 用 runas 拉起一个带 --takeover 的提权副本（弹 UAC，用户点是）
+//   2. 本实例立刻退出；提权副本会等本实例窗口消失后接管（见 wWinMain）
+// 这样用户不用手动去找 bat 右键。
+// ---------------------------------------------------------------------------
+void RelaunchElevated() {
+    wchar_t self[MAX_PATH] = {0};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    const std::wstring dir = DirOf(std::wstring(self));
+    S().core->Log("elevate: relaunch as administrator (--takeover)");
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = self;
+    sei.lpParameters = L"--takeover";
+    sei.lpDirectory = dir.c_str();
+    sei.nShow = SW_SHOW;
+    if (!ShellExecuteExW(&sei)) {
+        const DWORD e = GetLastError();
+        S().flash = (e == ERROR_CANCELLED)
+                        ? L"已取消提权。请右键 启动插件面板.bat → 以管理员身份运行"
+                        : L"提权失败，请手动右键 启动插件面板.bat → 以管理员身份运行";
+        InvalidateAll();
+        return;
+    }
+    if (sei.hProcess) CloseHandle(sei.hProcess);
+    // 提权副本已在启动中（带 --takeover，会等本实例窗口消失）。这里直接
+    // 退出进程：日志是行缓冲，之前的 Log 已落盘；插件/管道的清理对
+    // "马上要被同目录新实例接管"没有意义。
+    ExitProcess(0);
 }
 
 void ScheduleMergeAfterPaste(HWND hwnd) {
@@ -4833,8 +4967,17 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_APP + 2:
-        RefreshLayers();
-        InvalidateAll();
+        // wp==1：注入器报告"拒绝访问"——基本就是 SAI2 管理员运行而面板
+        // 没有提权（完整性级别差）。给出明确指引 + 一键提权重启入口。
+        if (wp == 1) {
+            s.needAdmin = true;
+            s.flash = L"注入被系统拒绝（Win32 5）：SAI2 多半正以管理员身份"
+                      L"运行。请点「管理员重启」（或右键 启动插件面板.bat"
+                      L" → 以管理员身份运行）";
+        }
+        // 注入刚结束：agent 可能刚把管道建出来，给 800ms 预算（在线时
+        // 第一次 CreateFileW 就成功，等于零等待；没注入上则快速失败）。
+        RefreshLayers(800);
         return 0;
 
     case WM_CAPTURE_DONE:
@@ -4925,7 +5068,10 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (h.kind == HK_CMD) {
-                RunCmd(win, h.index);
+                if (h.index == CMD_ELEVATE)
+                    RelaunchElevated(); // 提权重启（成功时本进程直接退出）
+                else
+                    RunCmd(win, h.index);
                 return 0;
             }
             if (h.kind == HK_PREVIEW) {
@@ -4939,7 +5085,11 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_TIMER:
         if (wp == 1) {
-            if (!g_uiTestSeconds) RefreshLayers();
+            // 已确认"权限级别不匹配"时不再轮询：注入必然失败，agent 不可能
+            // 在 SAI2 里跑起来，每 2.5s 一次连接尝试纯属白烧 UI 线程。
+            // 用户按提示提权重启后会换一个新进程，状态自然重来。
+            if (!g_uiTestSeconds && !(s.needAdmin && !s.agentOnline))
+                RefreshLayers();
             InvalidateAll();
         } else if (wp == 2) {
             if (!s.agentOnline) {
@@ -5474,10 +5624,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // 用 FreeConsole 而不是 ShowWindow(SW_HIDE)：Win11 默认终端是
     // Windows Terminal 时控制台窗口归 WT 所有，SW_HIDE 藏不住（非管理员
     // 启动必现黑窗口）；FreeConsole 对 conhost / WT 都有效。
-    // 带 CLI 参数（--selftest/--uitest/--demo…）时保留控制台，供测试捕获输出。
-    if (argc <= 1) {
-        FreeConsole();
-    }
+    // 带 CLI 参数（--selftest/--uitest/--demo…）时保留控制台，供测试捕获输出；
+    // --takeover（提权重启副本）也是 GUI 启动，同样要摆脱控制台。
+    // 注意：判断在参数解析之后做（见下面 takeover 赋值处）。
+    const bool guiLaunchNoArgs = argc <= 1;
 
     std::string pluginsDir = ExeDir() + "\\plugins";
     std::string logDir = ExeDir() + "\\logs";
@@ -5495,6 +5645,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     bool padClipboard = false;
     bool selfTest = false;
     bool findTools = false; // 只报告"注入器/agent 找到在哪"，不真的注入
+    // --takeover：由「管理员重启」拉起的提权副本专用。此时旧实例正在退出，
+    // 不做"激活旧窗口后退出"的单实例逻辑，改为等旧窗口消失后直接接管。
+    bool takeover = false;
     int uiTestSeconds = 0; // >0: 打开全部功能窗口，跑几秒后自动退出（UI 冒烟测试）
     int demoSeconds = 0;   // >0: 功能演示模式（自动编排 + 逐帧导出 BMP 到 outDir）
     bool brushBench = false; // 笔刷流畅度自检（真实消息队列灌拖动 + 屏抓统计刷新）
@@ -5604,9 +5757,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             next(matchTmpl);
             padClipboard = true;
         }
+        else if (a == L"--takeover") takeover = true;
     }
     if (argv) LocalFree(argv);
     g_uiTestSeconds = uiTestSeconds;
+
+    // 无参数启动 / 提权重启副本：脱离宿主控制台（原因见上）。
+    if (guiLaunchNoArgs || takeover) {
+        FreeConsole();
+    }
 
     // 只报告注入器/agent 找在哪（不入界面、不注入），用于排查"找不到
     // sai2_injector.exe"这类问题：卡片会被解压成几层目录时特别有用。
@@ -5724,6 +5883,33 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
                    : RunMatchTest(matchSnap, matchTmpl,
                                   std::atoi(matchDocW.c_str()),
                                   std::atoi(matchDocH.c_str()));
+
+    // ---- 单实例 + 提权重启接管 -------------------------------------------
+    // 用户会反复双击 启动插件面板.bat（卡了就再点一次）。多个实例并存时：
+    // 热键互相抢占（日志里 Ctrl+Alt+A/Z/R err=1409）、剪贴板监听翻倍、
+    // 每实例各有一组定时器在跑 —— 卡顿叠加，越用越卡。
+    //   · 普通重复启动 → 把已有面板带到前台并退出自己
+    //   · --takeover（旧实例刚用 runas 拉起的提权副本）→ 等旧窗口消失后
+    //     直接建自己的窗口（旧实例正在 ExitProcess，激活它没有意义）
+    // 测试模式（uitest/demo/brushbench/sai2demo）不设防：无人值守要能
+    // 在面板已开着的时候单独跑。
+    const bool testMode = uiTestSeconds > 0 || demoSeconds > 0 || brushBench ||
+                          sai2DemoSeconds > 0;
+    if (!takeover && !testMode) {
+        if (HWND existing = FindWindowW(kWndClass, nullptr)) {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+            FLASHWINFO fw{sizeof(fw), existing,
+                          FLASHW_ALL | FLASHW_TIMERNOFG, 3, 0};
+            FlashWindowEx(&fw);
+            return 0; // 已有面板在运行：激活它，不新开
+        }
+    } else if (takeover) {
+        for (int i = 0; i < 40; ++i) { // 最多等 2s 让旧实例退干净
+            if (!FindWindowW(kWndClass, nullptr)) break;
+            Sleep(50);
+        }
+    }
 
     AppState& s = S();
     s.core = std::make_unique<BridgeCore>(pluginsDir, logDir);

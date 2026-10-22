@@ -199,10 +199,13 @@ inline bool ParseLayers(const std::string& json, AgentLayers& out) {
 }
 
 // 查询图层（连接 → 命令 → 解析）
-inline bool QueryLayers(AgentLayers& out, const wchar_t* pipeName = nullptr) {
+// budgetMs：连接重试预算。0 = 默认（3000ms）。**agent 已确认不在线时
+// 调用方应传小预算**（如 200ms），否则每次调用都会把调用线程堵满预算时长。
+inline bool QueryLayers(AgentLayers& out, const wchar_t* pipeName = nullptr,
+                        DWORD budgetMs = 0) {
     std::string resp;
     if (!sai2agent::AgentClient::Query("{\"cmd\":\"layers\"}", resp,
-                                       pipeName)) {
+                                       pipeName, budgetMs)) {
         out.ok = false;
         return false;
     }
@@ -210,9 +213,11 @@ inline bool QueryLayers(AgentLayers& out, const wchar_t* pipeName = nullptr) {
 }
 
 // ping agent；成功时 info 形如 "pid=1234"
-inline bool AgentPing(long long& pid) {
+inline bool AgentPing(long long& pid, DWORD budgetMs = 0) {
     std::string resp;
-    if (!sai2agent::AgentClient::Query("{\"cmd\":\"ping\"}", resp)) return false;
+    if (!sai2agent::AgentClient::Query("{\"cmd\":\"ping\"}", resp, nullptr,
+                                       budgetMs))
+        return false;
     if (resp.find("\"ok\":true") == std::string::npos) return false;
     sai2agent::JsonFindInt(resp, "pid", pid);
     return true;

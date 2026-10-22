@@ -124,10 +124,14 @@ public:
     }
 
     // 便捷封装：连接 → 发命令 → 断开
+    // budgetMs：本次连接的重试预算（毫秒）。0 = 用 DefaultConnectTimeout()。
+    // 调用方**必须**按"agent 是否可能在线"传预算：服务端不在线时管道名
+    // 不存在，Connect 会空转满整个预算 —— UI 线程上调 Q 一次就等于把
+    // 界面卡死预算等长的时间（详见 BridgeApp.cpp RefreshLayers 的注释）。
     static bool Query(const std::string& cmd, std::string& response,
-                      const wchar_t* pipeName = nullptr) {
+                      const wchar_t* pipeName = nullptr, DWORD budgetMs = 0) {
         AgentClient c;
-        if (!c.Connect(pipeName)) return false;
+        if (!c.Connect(pipeName, budgetMs)) return false;
         return c.Send(cmd, response);
     }
 
