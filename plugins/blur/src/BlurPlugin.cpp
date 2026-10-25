@@ -114,13 +114,28 @@ private:
         if (kind == "box")         p.kind = blur::BlurKind::Box;
         else if (kind == "motion") p.kind = blur::BlurKind::Motion;
         else if (kind == "radial") p.kind = blur::BlurKind::Radial;
+        else if (kind == "surface") p.kind = blur::BlurKind::Surface;
+        else if (kind == "smart")  p.kind = blur::BlurKind::Smart;
+        else if (kind == "lens")   p.kind = blur::BlurKind::Lens;
+        else if (kind == "average") p.kind = blur::BlurKind::Average;
         else                       p.kind = blur::BlurKind::Gaussian;
 
         p.radius   = GetParamFloat(host, "blur.radius", p.radius);
         p.angleDeg = GetParamFloat(host, "blur.angle", p.angleDeg);
         p.distance = GetParamFloat(host, "blur.distance", p.distance);
         p.amount   = GetParamFloat(host, "blur.amount", p.amount);
+        p.threshold = GetParamFloat(host, "blur.threshold", p.threshold);
+        p.highlight = GetParamFloat(host, "blur.highlight", p.highlight);
+        p.method   = GetParamInt(host, "blur.method", p.method);
+        p.quality  = GetParamInt(host, "blur.quality", p.quality);
+        p.mode     = GetParamInt(host, "blur.mode", p.mode);
         p.samples  = GetParamInt(host, "blur.samples", p.samples);
+
+        // 品质（草图/好/最好）在采样型滤镜里决定采样数
+        if (kind == "motion" || kind == "radial")
+            p.samples = blur::SamplesForQuality(p.quality, 8, 16, 32);
+        if (kind == "smart")
+            p.samples = blur::SamplesForQuality(p.quality, 8, 16, 32);
 
         // 防御非法值（面板范围之外的手工调用）
         if (p.radius < 0.0f) p.radius = 0.0f;
@@ -129,6 +144,12 @@ private:
         if (p.amount > 1.0f) p.amount = 1.0f;
         if (p.samples < 2) p.samples = 2;
         if (p.samples > 64) p.samples = 64;
+        if (p.quality < 0) p.quality = 0;
+        if (p.quality > 2) p.quality = 2;
+        if (p.mode < 0) p.mode = 0;
+        if (p.mode > 2) p.mode = 2;
+        if (p.method < 0) p.method = 0;
+        if (p.method > 1) p.method = 1;
         return p;
     }
 
@@ -138,6 +159,10 @@ private:
             case blur::BlurKind::Box:      return "box";
             case blur::BlurKind::Motion:   return "motion";
             case blur::BlurKind::Radial:   return "radial";
+            case blur::BlurKind::Surface:  return "surface";
+            case blur::BlurKind::Smart:    return "smart";
+            case blur::BlurKind::Lens:     return "lens";
+            case blur::BlurKind::Average:  return "average";
         }
         return "?";
     }

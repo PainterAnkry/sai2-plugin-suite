@@ -23,7 +23,7 @@ ICON="$ROOT/resources/sai2_suite.ico"
 if command -v cygpath >/dev/null 2>&1; then ICON="$(cygpath -m "$ROOT/resources/sai2_suite.ico")"; fi
 # 版本资源：每个随包二进制都带 VERSIONINFO（无版本信息的裸二进制
 # 最容易被杀软启发式引擎误报）。模板见 resources/version.rc.in。
-VER="1.28.0"
+VER="1.29.0"
 VER4="${VER//./,},0"          # 1.23.0 -> 1,23,0,0（VERSIONINFO 要逗号分隔四段）
 RES="$BUILD/res"
 mkdir -p "$RES"

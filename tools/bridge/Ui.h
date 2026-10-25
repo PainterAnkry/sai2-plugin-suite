@@ -14,6 +14,7 @@
 #include "BridgeCore.h"
 
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,37 @@ extern COLORREF C_WARN;
 extern COLORREF C_OK;
 extern COLORREF C_CANVAS;
 
+// ---- 语义色（不要在窗口代码里再写 RGB 字面量） ---------------------------
+extern COLORREF C_INPUT;        // 输入框 / 数值底框
+extern COLORREF C_INPUT_LINE;   // 输入框描边（默认态）；聚焦态用 C_ACCENT
+extern COLORREF C_TOOLTIP_BG;   // 悬浮提示（反色，两个主题下都是深底浅字）
+extern COLORREF C_TOOLTIP_TEXT;
+extern COLORREF C_INVERSE_BG;   // 主按钮：反色填充
+extern COLORREF C_INVERSE_TEXT;
+extern COLORREF C_CURVE_GRID;   // 曲线网格底
+extern COLORREF C_HIST;         // 直方图柱
+extern COLORREF C_CH_R;         // 曲线通道色（红/绿/蓝）
+extern COLORREF C_CH_G;
+extern COLORREF C_CH_B;
+// 铺在 C_ACCENT 实心块上的文字/图标色。深色主题的强调色是浅蓝，白字对比度
+// 只有 3:1 左右，必须用深色前景；浅色主题强调色近黑，反过来用白字。
+extern COLORREF C_ON_ACCENT;
+// 滑杆已填充段：深色主题用压过的强调色，浅色主题用中性深灰 ——
+// 浅色主题的强调色是近黑，整条滑杆铺黑太重，像进度条。
+extern COLORREF C_SLIDER_FILL;
+
+// ---- 圆角（设备像素，已按 DPI 缩放） -------------------------------------
+// 只有三档：小控件 / 按钮与分段 / 面板。不要再出现 7、10 这种随手值。
+int RadiusSm(); // 6  —— 数值底框、缩略图高亮、提示气泡
+int RadiusMd(); // 8  —— 按钮、分段控件、滑杆底槽
+int RadiusLg(); // 12 —— 面板、工具栏、画布外框
+
+// ---- 间距（4 的倍数） ----------------------------------------------------
+// Sp(1)=4 Sp(2)=8 Sp(3)=12 Sp(4)=16 Sp(5)=24 Sp(6)=32
+int Sp(int step);
+// 画布底部信息条高度（图像区不会再画到这里，保证状态文字有稳定底色）
+int CanvasFooterH();
+
 // ---------------------------------------------------------------------------
 // 主题
 // ---------------------------------------------------------------------------
@@ -64,10 +96,21 @@ ThemeMode ThemeSetting();              // 用户设置（未初始化时 = 跟�
 void CycleTheme(HWND hwnd);            // 循环切换：跟随系统 → 浅色 → 深色
 const wchar_t* ThemeLabel();           // 当前设置文字（按钮用）
 bool ThemeIsDark();                    // 当前生效的是深色吗
+// 强制主题（0 跟随 / 1 浅色 / 2 深色）：只影响本次进程，不写注册表。
+// 供无人值守截图核对两个主题，避免为了验收去改用户的设置。
+void ForceTheme(int mode);
 
 // 圆角矩形（填充+描边），radius 为设备像素
 void RoundBox(HDC dc, const RECT& rc, COLORREF fill, COLORREF border,
               int radius);
+// 颜色线性混合：t=0 → a，t=1 → b。GDI 没有 alpha，悬浮/选中态用预混色实现，
+// 这样一层"8% 白"叠在任意表面上都不会变成脏灰。
+COLORREF MixColor(COLORREF a, COLORREF b, double t);
+// 面板内的分组小标题（PS 的"画笔工具选项"那种）：返回下一行的 y。
+int DrawSectionLabel(HDC dc, const RECT& box, int y, const std::wstring& text);
+// PS 风格的滑杆：track + 圆头 + 已填充段。返回滑杆所占的 rect（供命中用）。
+RECT DrawSliderTrack(HDC dc, const RECT& box, int y, double t, bool hot);
+
 // Win11+ 顶层窗口圆角（旧系统静默跳过）
 void EnableRoundedWindow(HWND hwnd);
 
@@ -91,6 +134,11 @@ enum HitKind {
     HK_TOOL,      // index = 该分组内的效果下标
     HK_CMD,       // index = 命令枚举（见 CmdId）
     HK_THUMB,     // 滤镜缩略图：index = 效果下标
+    HK_COMBO,     // 下拉框本体：index = 参数序号（点 = 展开/收起）
+    HK_COMBOITEM, // 下拉项：index = 参数序号，sub = 选项序号
+    HK_TOGGLE,    // 开关：index = 参数序号
+    HK_CAT,       // 滤镜库分类行：index = 分类序号（-1 = 全部）
+    HK_CURVE,     // 曲线控制点：index = 点序号（-1 = 曲线区域空白处）
     HK_CLOSE
 };
 
@@ -111,7 +159,14 @@ struct UiHit {
     RECT track{}; // 滑杆轨道
     int kind = HK_NONE;
     int index = -1;
+    int sub = -1; // 下拉项序号 / 分类序号
 };
+
+// 参数数值框的槽位上限（每个功能窗口各自拥有这么多 EDIT 子控件）。
+// 只有滑杆参数占框，下拉/开关不占。曲线效果现在正好用满 8 个 —— 也就是
+// 零余量：任何效果再加一个滑杆参数，第 9 个会**静默地没有输入框**。
+// SelfTest 里有一条断言盯着这件事（超过就 FAIL，而不是等人眼发现）。
+constexpr int kMaxParamEdits = 8;
 
 // ---------------------------------------------------------------------------
 // 单个功能窗口的运行时状态
@@ -139,10 +194,38 @@ struct UiWindow {
     // 液化窗口抓手工具（UI 层状态）：激活时左键拖动 = 平移画布而非涂抹。
     // 临时平移：任何功能窗口按住空格 + 左键拖、或中键拖（见 UiWindow.cpp）。
     bool handTool = false;
+    // 液化窗口放大镜工具：左键点 = 放大、Alt+左键 = 缩小（PS 的缩放工具）
+    bool zoomTool = false;
 
     // 液化涂抹
     bool dragStroke = false;
     POINT strokeLast{};
+    // 液化笔刷指示圈的**设备坐标包围盒**（DrawCanvas 每帧记录）。
+    // 鼠标悬停时只失效"旧圈 ∪ 新圈"这一小块，不必整幅画布重绘 —— 否则
+    // 125Hz 的 mousemove 每次都把整张图 StretchDIBits 一遍，CPU 一直烧着。
+    RECT brushBox{};
+    bool brushBoxValid = false;
+    // 屏幕上**真正画出来**的那个圈（圆心 + 半径，设备坐标）。
+    // 残留轨迹的根因就在这里：以前用"上一次的重绘区域"当作"圈上次画在哪"，
+    // 但重绘被节流丢掉时，圈其实是在新光标处被裁剪着画出来的（只露出与失效
+    // 区域相交的一小段弧），那个位置从来没被记下来，于是永远擦不掉。
+    // 现在以"实际绘制的几何"为唯一依据计算失效区域。
+    POINT brushPaint{};
+    int brushPaintR = 0;
+    bool brushPaintValid = false;
+    // 下拉框展开状态（参数序号，-1 = 收起）与锚点矩形
+    int comboOpen = -1;
+    RECT comboAnchor{};
+    // 曲线编辑：拖动的控制点序号（-1 = 没在拖）
+    int dragCurvePoint = -1;
+    // 滤镜库折叠树：已展开的分类名（PS 里分类是可折叠的组，可以同时展开多个）
+    std::set<std::string> filterOpen;
+    // 默认展开只做一次：收起全部分类后不能又被"自动展开"顶回来
+    bool filterOpenInit = false;
+    // 上次绘制时左栏的树形内容总高（滚轮/命中用它夹取偏移）
+    int filterContentH = 0;
+    int filterViewH = 0;
+    ULONGLONG hoverTick = 0;  // 悬停重绘节流（~33Hz）
     // 累积已进置换场、等一个显示帧渲染（kRenderMsg 驱动）
     bool strokeDirty = false;
     // 已经投递了一条渲染请求（避免拖动时把消息队列灌满渲染请求）
@@ -161,8 +244,12 @@ struct UiWindow {
     bool dragList = false;
     RECT scrollTrack{};
 
-    // 参数数值输入框（PS 风格）
-    HWND hEdits[4] = {};
+    // 参数数值输入框（PS 风格）。8 个是因为滤镜库里有 7 个参数的滤镜
+    // （粗糙蜡笔/底纹效果），以前只有 4 个 → 后三个参数根本没有输入框，
+    // 只能拖滑杆（用户反馈"只能拖动、不能输入"）。
+    // editParam[i] 记录第 i 个框对应哪个参数（下拉/开关参数不占框）。
+    HWND hEdits[kMaxParamEdits] = {};
+    int editParam[kMaxParamEdits] = {-1, -1, -1, -1, -1, -1, -1, -1};
     int editCount = 0;
 
     // 缩略图选择（滤镜窗口）
@@ -225,8 +312,13 @@ struct AppState {
     int selAnchor = -1;   // Shift 范围选择的锚点行
     std::vector<std::wstring> layerNames;
     std::vector<int> layerScreenY;
+    // 每行**图层名文字**的屏幕 X（agent 报的绘制原点）。点行选中要用它算
+    // 安全落点：面板最左是眼睛图标 / 缩略图，按面板左边距写死偏移会点到
+    // 「显示/隐藏」上（用户反馈"选中图层容易自动点到隐藏按钮"）。
+    std::vector<int> layerScreenX;
     std::vector<std::wstring> layerAttrs;
     long long panelLeft = 0;
+    long long panelRight = 0;
     int layersScroll = 0;
     // Agent 屏幕坐标 → 物理屏幕坐标的比例（默认 1:1）。
     // SAI2 若非 DPI 感知（或显示器缩放 ≠100%），agent 在 SAI2 内部取到的
@@ -238,6 +330,9 @@ struct AppState {
     // 字体
     HFONT fTitle = nullptr, fBody = nullptr, fSmall = nullptr, fBold = nullptr;
     HBRUSH bgBrush = nullptr;
+    // 数值输入框底刷（EDIT 是子窗口，WM_CTLCOLOREDIT 必须返回一个真刷子；
+    // 以前用函数内 static 缓存，切主题后会一直用旧颜色 —— 这里跟主题一起重建）
+    HBRUSH editBrush = nullptr;
 
     std::wstring flash;
 };
@@ -275,7 +370,10 @@ void TextC(HDC dc, const std::wstring& s, RECT rc, COLORREF col, HFONT f,
 int RectW(const RECT& r);
 int RectH(const RECT& r);
 bool InRect(const RECT& r, int x, int y);
-int Scale(int v); // DPI 缩放
+// DPI 缩放。SAI2_UI_SCALE / ui::SetUiScale 可强制倍率（测试 150% 布局用，
+// 必须在建第一个窗口/字体之前调用）。
+void SetUiScale(double mult);
+int Scale(int v);
 void InitFonts();
 
 // 画布视图：把图像等比映射到 win.canvas 内（信箱式留边，不拉伸变形）。
@@ -304,17 +402,34 @@ void DrawCanvas(HDC dc, UiWindow& win, bool allowStroke, bool zoomButtons = true
 // 否则窗口自己的 Msg 收不到滚轮 → 左栏不能下拉）
 bool FilterWheelScroll(UiWindow& win, WPARAM wp, LPARAM lp);
 
-// 画一段参数面板（标签 + 滑杆 + 数值），返回下一行的 y。
-// 数值框由 SyncParamEdits 负责摆放。
+// 画一段参数面板（标签 + 控件），返回下一行的 y。
+// Slider：标签 + 数值框 + 滑杆；Choice：标签 + 下拉框；Toggle：标签 + 开关。
+// 数值框由 SyncParamEdits 负责摆放（下拉/开关不用子窗口）。
 int DrawParamRow(HDC dc, UiWindow& win, const RECT& box, int y,
                  const UiParam& p, float value, int paramIndex);
+
+// 下拉框展开后的浮层：**必须在窗口绘制最后调用**（否则会被后面的面板盖住）。
+// 点击落在 HK_COMBOITEM 上时由 HandleComboClick 改值并收起。
+void DrawComboPopup(HDC dc, UiWindow& win, const RECT& panel);
+bool HandleComboClick(UiWindow& win, const UiHit& h); // 返回 true = 已处理
+void CloseCombo(UiWindow& win);
+// 参数值改成 val（含显示倍率换算/夹紧），并刷新预览
+void SetParamDisplayValue(UiWindow& win, int index, float displayVal);
 
 // 数值输入框：创建（窗口 WM_CREATE 时调用一次）、跟随布局、回写
 void CreateParamEdits(UiWindow& win);
 void SyncParamEdits(UiWindow& win, const std::vector<int>& rowY,
                     const RECT& box);
-void UpdateParamEdits(UiWindow& win);
+// forceSlot >= 0：强制刷新这一格（刚提交完的框，即使它正持有焦点也要
+// 写成钳制后的真实值，否则框里会留着越界的原样输入）
+void UpdateParamEdits(UiWindow& win, int forceSlot = -1);
+// 解析数值框文本（"30%" "-12.5°" "abc" "-" "1.2.3" ...）。
+// 返回 false = 非法，调用方应回滚显示、不改参数。纯函数，自检直接测它。
+bool ParseParamText(const wchar_t* text, float* out);
 void CommitParamEdit(UiWindow& win, int index);
+// 数值框的"提交/取消/微调"（Enter / Esc / 上下键 / 滚轮）。
+// 这些键在 EDIT 自己的窗口过程里就被吃掉，窗口过程收不到 —— 见 ParamEditProc。
+void NudgeParamEdit(UiWindow& win, int index, int dir, float mult);
 
 // 分类按钮条（模糊/滤镜/调整/液化 四选一，点 = 换窗口）
 void DrawCategoryStrip(HDC dc, UiWindow& win, const RECT& strip,
@@ -379,13 +494,17 @@ struct UiLayout {
 UiLayout ComputeLayout(const RECT& client, int panelW);
 
 // 画窗口骨架（标题 + 状态行 + 分组按钮条 + 组内效果条 + 命令条）
+// showEffects = false 时不画"组内效果条"（液化窗口：工具改到左侧图标列，
+// 顶部那排文字按钮就是用户要求去掉的"文字选项"）。
 void DrawWindowChrome(HDC dc, UiWindow& win, const UiLayout& L,
                       const std::wstring& title, const std::wstring& subtitle,
-                      const std::vector<int>& effects);
+                      const std::vector<int>& effects,
+                      bool showEffects = true);
 
-// 参数面板背景 + 标题
+// 参数面板背景 + 标题（sub = 标题行右端的小字，hint = 底部脚注说明）
 void DrawPanelFrame(HDC dc, const UiLayout& L, const std::wstring& title,
-                    const std::wstring& hint);
+                    const std::wstring& hint,
+                    const std::wstring& sub = std::wstring());
 
 // 功能窗口的注册规格（窗口类 / 标题 / 默认尺寸 / 绘制与点击回调）
 struct ToolWindowSpec {
@@ -433,11 +552,21 @@ struct LayerAgg {
     std::vector<std::wstring> names;
     std::vector<std::wstring> attrs;
     std::vector<int> screenY;
+    // 每行图层名文字的屏幕 X（眼睛图标与缩略图的右侧）。点行选中用它当落点。
+    std::vector<int> screenX;
 };
-// 把注入代理捕获的文字行聚合为图层条目（名字 + 混合模式/不透明度 + 屏幕 y）
+// 把注入代理捕获的文字行聚合为图层条目（名字 + 混合模式/不透明度 + 屏幕 y/x）
 LayerAgg AggregateLayers(const std::vector<sai2bridge::AgentLayerRow>& rows);
 // 图层面板所在的那个捕获分组
 const sai2bridge::AgentLayerGroup* PanelGroup();
+
+// 点图层行的**逻辑 X**（agent 坐标系，还没做 DPI 换算）。
+//
+// 为什么不是"面板左边距 + 固定值"：SAI2 图层面板每行最左边是「显示/隐藏」
+// 的眼睛图标，再往右才是缩略图和图层名。写死偏移一旦落进眼睛图标，
+// 点一下就**把图层藏了** —— 用户反馈的"选中图层容易自动点到隐藏按钮"。
+// textX = agent 报的该行图层名文字起点（0 = 没有坐标）。
+int LayerRowClickX(long long panelLeft, long long panelRight, int textX);
 
 // 刷新图层列表。budgetMs：agent 管道连接重试预算（毫秒），0 = 按当前
 // 已知状态自动选择（在线 3000ms 兜住服务端重建管道名的窗口 / 离线 200ms

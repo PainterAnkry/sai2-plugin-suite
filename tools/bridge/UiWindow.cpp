@@ -36,6 +36,10 @@ namespace {
 // （渲染堵住输入队列 → 画面不刷新 → 松手/切换后才补画出来）。
 const UINT kRenderMsg = WM_APP + 40;
 
+// 笔画"按住不动"的持续施力定时器（见 WM_TIMER / BridgeCore::StrokeHold）。
+// 55ms ≈ 18Hz：比显示帧略快，肉眼是连续的；再快就只是在给渲染队列添堵。
+const UINT_PTR kHoldTimer = 7;
+
 // 渲染完立刻把这一帧贴到屏幕上（只 Invalidate 会排队等系统施舍 WM_PAINT）
 void RepaintNow(HWND hwnd) {
     RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
@@ -89,20 +93,29 @@ void WindowPaint(UiWindow& win, HDC dc, const RECT& rc) {
     const ToolWindowSpec* sp = &Specs()[win.id];
     win.hits.clear();
     if (sp->draw) sp->draw(dc, win, rc);
+    // 下拉框浮层必须最后画：它在面板之上，画在参数行之前会被后面的面板
+    // 底色整块盖掉（点开就消失）。
+    DrawComboPopup(dc, win, rc);
 }
 
 bool WindowHit(UiWindow& win, const UiHit& h) {
-    // 公共：分类按钮（HK_TOOL 且 index < 0）
-    if (h.kind == HK_TOOL && h.index < 0) {
+    // 公共：分类按钮（HK_TOOL 且 index = -1..-4）
+    if (h.kind == HK_TOOL && h.index <= -1 && h.index >= -4) {
         const int idx = -h.index; // 1..4
-        if (idx >= 1 && idx < BridgeCore::kWinCount) {
-            if (idx == win.id) return true;
-            RequestToolWindow(win.hwnd, idx, true);
-            return true;
-        }
+        if (idx == win.id) return true;
+        RequestToolWindow(win.hwnd, idx, true);
         return true;
     }
     if (HandleZoomHit(win, h)) {
+        InvalidateRect(win.hwnd, nullptr, FALSE);
+        return true;
+    }
+    // 顺序很重要：窗口自己的处理器先跑。以前 HK_CMD 一律先走 RunCmd，于是
+    // 窗口私有的 900/901 命令（液化「重建模式」、曲线「复位通道」）点了没有
+    // 任何反应 —— 它们被当成未知 CmdId 悄悄丢掉了。窗口处理器只认自己的私有
+    // index，认不出就返回 false，再落到通用命令表上。
+    const ToolWindowSpec* sp = &Specs()[win.id];
+    if (sp->hit && sp->hit(win, h)) {
         InvalidateRect(win.hwnd, nullptr, FALSE);
         return true;
     }
@@ -110,13 +123,42 @@ bool WindowHit(UiWindow& win, const UiHit& h) {
         RunCmd(win, h.index);
         return true;
     }
-    const ToolWindowSpec* sp = &Specs()[win.id];
-    if (sp->hit && sp->hit(win, h)) {
-        InvalidateRect(win.hwnd, nullptr, FALSE);
-        return true;
-    }
     InvalidateRect(win.hwnd, nullptr, FALSE);
     return true;
+}
+
+// 笔刷圈跟随鼠标：把"屏幕上那个圈现在的位置"和"新位置"的并集失效掉。
+//
+// 踩过的坑（用户截图里一圈散落的细弧线）：
+//   1.0 用"上一次重绘区域 brushBox"当作圈的位置，并且对 mousemove 做了 30ms
+//   节流。被节流丢掉的那些移动没有失效任何区域，而下一次重绘（涂抹渲染用的
+//   RedrawWindow 是整窗失效）会把圈画在**当前**光标处，brushBox 也跟着跳到
+//   那里 —— 于是"上一帧真正画出来的那条弧"再也没人负责擦除。
+//   现在：只以 DrawCanvas 里真正发出去的几何（brushPaint + brushPaintR）为准，
+//   并且不再节流。多次失效会被系统合并成一个更新区域，成本与一次小重绘相当，
+//   而"位置对上"是正确性的前提。
+void FollowBrush(UiWindow& win, HWND hwnd, POINT prev, int mx, int my) {
+    (void)prev;
+    BridgeCore& core = *S().core;
+    const int ci = core.CurrentEffect();
+    const auto& fx = core.Effects();
+    if (ci < 0 || ci >= static_cast<int>(fx.size())) return;
+    if (!fx[static_cast<size_t>(ci)].stroke) return;
+    if (!win.brushPaintValid) {
+        // 还不知道圈多大（刚进画布 / 刚切到液化工具）：整块刷新一次，
+        // 这一次重绘会在 DrawCanvas 里记下真实几何。
+        InvalidateRect(hwnd, &win.canvas, FALSE);
+        return;
+    }
+    const int r = std::max(1, win.brushPaintR);
+    RECT a = {win.brushPaint.x - r, win.brushPaint.y - r,
+              win.brushPaint.x + r, win.brushPaint.y + r};
+    RECT b = {mx - r, my - r, mx + r, my + r};
+    RECT u;
+    UnionRect(&u, &a, &b);
+    InflateRect(&u, 1, 1);
+    // 光标跑到参数栏/按钮区时，圈不再绘制：也要把它擦掉
+    InvalidateRect(hwnd, &u, FALSE);
 }
 
 LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -144,17 +186,16 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLOREDIT: {
         HDC dc = reinterpret_cast<HDC>(wp);
         SetTextColor(dc, C_TEXT);
-        SetBkColor(dc, ThemeIsDark() ? RGB(26, 27, 29) : RGB(255, 255, 255));
-        static HBRUSH editBgDark = CreateSolidBrush(RGB(26, 27, 29));
-        static HBRUSH editBgLight = CreateSolidBrush(RGB(255, 255, 255));
-        return reinterpret_cast<LRESULT>(ThemeIsDark() ? editBgDark
-                                                       : editBgLight);
+        SetBkColor(dc, C_INPUT);
+        AppState& s = S();
+        if (!s.editBrush) s.editBrush = CreateSolidBrush(C_INPUT);
+        return reinterpret_cast<LRESULT>(s.editBrush);
     }
 
     case WM_COMMAND: {
         const int id = LOWORD(wp);
         const int notif = HIWORD(wp);
-        if (notif == EN_KILLFOCUS && id >= 100 && id < 104) {
+        if (notif == EN_KILLFOCUS && id >= 100 && id < 108) {
             CommitParamEdit(win, id - 100);
             win.bgraDirty = true;
         }
@@ -166,8 +207,49 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, 3);
             win.thumbsBuilding = false;
             InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (wp == kHoldTimer) {
+            // 按住不动时持续施力 —— 这只是**兜底**通道。
+            // 主通道是 WM_MOUSEMOVE（见下）：按住鼠标时系统一直在产生鼠标
+            // 消息，WM_TIMER 作为队列空闲才合成的低优先级消息会被饿死，
+            // 实测按住 1.4 秒收到 86 次鼠标消息、0 次定时器消息。
+            // 施力节奏由 core 里的时间节流统一裁决，两条通道重复调用无害。
+            if (!win.dragStroke) {
+                KillTimer(hwnd, kHoldTimer);
+                return 0;
+            }
+            if (s.core->StrokeHold(win.id)) {
+                win.strokeDirty = true;
+                if (!win.renderPosted) {
+                    win.renderPosted = true;
+                    PostMessageW(hwnd, kRenderMsg, 0, 0);
+                }
+            }
         }
         return 0;
+
+    // ---- 键盘 -------------------------------------------------------------
+    // 撤销快捷键对所有功能窗口生效（以前只有液化窗口的 WM_KEYDOWN 分支里有，
+    // 且焦点落在参数数值框时消息被 EDIT 吃掉 → 用户"Ctrl+Z 没反应"）。
+    case WM_KEYDOWN: {
+        const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ctrl && wp == 'Z') {
+            // 液化窗口：撤销上一笔（置换场回退）；其他窗口：撤销上一次应用。
+            // RunCmd(CMD_UNDO) 内部就是这个优先级，不用在这里再分叉。
+            RunCmd(win, CMD_UNDO);
+            return 0;
+        }
+        // 焦点在窗口上（还没进任何数值框）时按 Tab：直接把焦点送进第一个
+        // 可见的数值框，这样"点窗口 → Tab → 打字"是一条顺路。
+        if (wp == VK_TAB) {
+            for (int i = 0; i < kMaxParamEdits; ++i) {
+                if (win.editParam[i] < 0 || !win.hEdits[i]) continue;
+                if (!IsWindowVisible(win.hEdits[i])) continue;
+                SetFocus(win.hEdits[i]);
+                return 0;
+            }
+        }
+        break;
+    }
 
     // 拖动过程中的显示帧：渲染一次整图并立刻贴屏（见 kRenderMsg 注释）
     case kRenderMsg: {
@@ -181,6 +263,18 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (win.dragSlider >= 0 && win.sliderPending) {
             win.sliderPending = false;
             OnSliderDrag(win, win.sliderPendX);
+            // ★ 拖滑杆必须重算预览。以前这里只改参数值 + 重贴旧图，
+            //   于是拖动时画面纹丝不动，松手才"突然"变 —— 用户反馈的
+            //   「色相和饱和度调整无法及时预览」就是这个。
+            //   液化类（stroke）不重算：它的像素来自置换场，改笔刷参数
+            //   不该重放笔画；笔刷大小由画布上的圆圈即时反馈。
+            //   quick=true：拖动中先跑半分辨率（松手时 WM_LBUTTONUP 会补
+            //   一帧全分辨率），否则大画布重滤镜每帧几十毫秒，跟手感很差。
+            const auto& fx = s.core->Effects();
+            const int ci = WindowEffectIndex(win);
+            if (ci >= 0 && ci < static_cast<int>(fx.size()) &&
+                !fx[static_cast<size_t>(ci)].stroke)
+                s.core->ParamChanged(win.id, /*quick=*/true);
             win.bgraDirty = true;
             rendered = true;
         }
@@ -199,8 +293,23 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
         HGDIOBJ old = SelectObject(mem, bmp);
+        // 把 BeginPaint 给出的更新区域交给内存 DC：局部失效（比如笔刷圈移动的
+        // 那一小块）时，StretchDIBits 只画这一块，不会为了一个小圆把整张图
+        // 重新缩绘一遍。没有这行，"局部重绘"只是自欺欺人。
+        HRGN upd = CreateRectRgn(0, 0, 0, 0);
+        RECT ubox = {0, 0, 0, 0};
+        if (GetClipRgn(dc, upd) == 1) {
+            SelectClipRgn(mem, upd);
+            GetRgnBox(upd, &ubox);
+        }
+        DeleteObject(upd);
         WindowPaint(win, mem, rc);
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        if (ubox.right > ubox.left) {
+            BitBlt(dc, ubox.left, ubox.top, ubox.right - ubox.left,
+                   ubox.bottom - ubox.top, mem, ubox.left, ubox.top, SRCCOPY);
+        } else {
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        }
         SelectObject(mem, old);
         DeleteObject(bmp);
         DeleteDC(mem);
@@ -210,12 +319,51 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONDOWN: {
         const int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
-        for (const UiHit& h : win.hits) {
+        if (getenv("SAI2_UI_DEBUG")) {
+            std::string line = "ui click win=" + std::to_string(win.id) +
+                               " at " + std::to_string(mx) + "," +
+                               std::to_string(my) + " hits=" +
+                               std::to_string(win.hits.size());
+            for (const UiHit& h : win.hits) {
+                line += " k" + std::to_string(static_cast<int>(h.kind)) + "@" +
+                        std::to_string(h.rc.left) + "," +
+                        std::to_string(h.rc.top) + "-" +
+                        std::to_string(h.rc.right) + "," +
+                        std::to_string(h.rc.bottom);
+            }
+            s.core->Log(line);
+        }
+        // 下拉框展开时先让浮层吃点击：点在浮层外 = 收起（这次点击不再往下传，
+        // 否则用户想关掉浮层却顺便触发了下面的按钮）。
+        if (win.comboOpen >= 0) {
+            for (auto it = win.hits.rbegin(); it != win.hits.rend(); ++it) {
+                if (it->kind != HK_COMBOITEM || !InRect(it->rc, mx, my)) continue;
+                HandleComboClick(win, *it);
+                return 0;
+            }
+            CloseCombo(win);
+            return 0;
+        }
+        // 倒序命中：hits 按"绘制顺序"追加，后画的在上层（下拉浮层、笔刷圈）。
+        for (auto it = win.hits.rbegin(); it != win.hits.rend(); ++it) {
+            const UiHit& h = *it;
             if (!InRect(h.rc, mx, my)) continue;
+            if (h.kind == HK_COMBO || h.kind == HK_TOGGLE) {
+                HandleComboClick(win, h);
+                return 0;
+            }
             if (h.kind == HK_SLIDER) {
                 SetCapture(hwnd);
                 win.dragSlider = h.index;
                 OnSliderDrag(win, mx);
+                // 按下就立刻走一次"渲染 + 贴屏"：只 Invalidate 不会重算效果，
+                // 画面要等到松手才有反应（见 kRenderMsg 分支注释）。
+                win.sliderPendX = mx;
+                win.sliderPending = true;
+                if (!win.renderPosted) {
+                    win.renderPosted = true;
+                    PostMessageW(hwnd, kRenderMsg, 0, 0);
+                }
                 win.bgraDirty = true;
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -230,6 +378,18 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (h.kind == HK_PREVIEW) {
+                // 放大镜工具：点一下放大（Alt = 缩小），以光标为锚点
+                if (win.zoomTool && s.core->HasImage()) {
+                    CanvasView v;
+                    if (CanvasViewOf(win, v)) {
+                        const double cur = (win.zoom > 0.0) ? win.zoom : v.fit;
+                        const bool out =
+                            (GetKeyState(VK_MENU) & 0x8000) != 0;
+                        CanvasZoomAt(win, cur * (out ? 1.0 / 1.6 : 1.6), mx, my);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    return 0;
+                }
                 // 抓手模式（抓手工具 / 空格按住）：左键拖动 = 平移，不涂抹。
                 const bool spacePan = (GetKeyState(VK_SPACE) & 0x8000) != 0;
                 if ((win.handTool || spacePan) && s.core->HasImage()) {
@@ -250,6 +410,8 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         win.dragStroke = true;
                         win.strokeLast = {mx, my};
                         win.strokeDirty = false;
+                        // 按住不动也要持续施力（膨胀/收缩/旋转/平滑）
+                        SetTimer(hwnd, kHoldTimer, 55, nullptr);
                         // 拖动期间的整图渲染由 kRenderMsg 驱动（见上）
                         if (!win.renderPosted) {
                             win.renderPosted = true;
@@ -269,7 +431,16 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSEMOVE: {
         const int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+        const POINT prevMouse = win.mouse;
+        const bool prevMouseValid = win.mouseValid;
         UiTrackMouse(win, hwnd, mx, my);
+        FollowBrush(win, hwnd, prevMouseValid ? prevMouse : POINT{mx, my}, mx, my);
+        // 曲线控制点拖动：交给窗口自己的消息钩子（它知道曲线几何）
+        if (win.dragCurvePoint >= 0) {
+            const ToolWindowSpec* sp = &Specs()[win.id];
+            if (sp->msg) sp->msg(win, msg, wp, lp);
+            return 0;
+        }
         if (win.dragZoom) {
             OnZoomSliderDrag(win, mx);
             win.bgraDirty = true;
@@ -299,12 +470,19 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             float nx = 0, ny = 0;
             if (CanvasPointToNorm(win, mx, my, nx, ny)) {
                 // 每个采样点都累积进置换场（这条很便宜）；整图渲染由 kRenderMsg 驱动
-                s.core->StrokeMove(nx, ny, win.id);
+                bool dabbed = s.core->StrokeMove(nx, ny, win.id);
                 win.strokeLast = {mx, my};
-                win.strokeDirty = true;
-                if (!win.renderPosted) {
-                    win.renderPosted = true;
-                    PostMessageW(hwnd, kRenderMsg, 0, 0);
+                // 笔不动（或抖动幅度小于一个像素）时，靠这里继续施力：
+                // 按住鼠标期间 WM_MOUSEMOVE 是**不断**到来的（手不动也有），
+                // 而 WM_TIMER 在这种洪流下会被饿死 —— 所以"持续施力"必须挂在
+                // 鼠标消息上，定时器只做兜底。是否真的施力由 core 按时间节流。
+                if (s.core->StrokeHold(win.id)) dabbed = true;
+                if (dabbed) {
+                    win.strokeDirty = true;
+                    if (!win.renderPosted) {
+                        win.renderPosted = true;
+                        PostMessageW(hwnd, kRenderMsg, 0, 0);
+                    }
                 }
             }
         }
@@ -313,6 +491,11 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONUP:
         if (win.dragZoom) win.dragZoom = false;
+        if (win.dragCurvePoint >= 0) {
+            win.dragCurvePoint = -1;
+            const ToolWindowSpec* sp = &Specs()[win.id];
+            if (sp->msg) sp->msg(win, msg, wp, lp);
+        }
         if (win.dragSlider >= 0) {
             win.dragSlider = -1;
             win.sliderPending = false;
@@ -323,6 +506,7 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             win.dragStroke = false;
             win.strokeDirty = false;
             win.bgraDirty = true;
+            KillTimer(hwnd, kHoldTimer);
             s.core->StrokeEnd(win.id);
             // 收笔：按最终置换场渲染一帧（最后一个采样点已经累积过了）
             s.core->StrokeRender(win.id);
@@ -410,6 +594,14 @@ LRESULT CALLBACK ToolWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSELEAVE:
+        if (win.brushPaintValid) {
+            const int r = std::max(1, win.brushPaintR) + 2;
+            RECT rr = {win.brushPaint.x - r, win.brushPaint.y - r,
+                       win.brushPaint.x + r, win.brushPaint.y + r};
+            win.brushPaintValid = false;
+            win.brushBoxValid = false;
+            InvalidateRect(hwnd, &rr, FALSE);
+        }
         UiMouseLeave(win, hwnd);
         return 0;
 
@@ -572,7 +764,20 @@ void OpenToolWindow(int winIdx) {
     const ToolWindowSpec& sp = Specs()[idx];
     if (!s.core->HasWindow(idx)) s.core->OpenWindow(idx);
     win.id = idx;
-    win.effectIndex = s.core->CurrentEffect();
+    // 初始效果：沿用"当前效果"，但它必须属于本窗口的分组 —— 否则模糊窗口
+    // 会去显示液化窗口刚选中的工具（参数面板张冠李戴）。
+    {
+        const int cur = s.core->CurrentEffect();
+        const auto& fx = s.core->Effects();
+        const std::string grp = BridgeCore::kGroupNames[idx - 1];
+        if (cur >= 0 && cur < static_cast<int>(fx.size()) &&
+            fx[static_cast<size_t>(cur)].group == grp) {
+            win.effectIndex = cur;
+        } else {
+            const auto list = s.core->EffectsInGroup(grp.c_str());
+            if (!list.empty()) win.effectIndex = list.front();
+        }
+    }
 
     RECT rc = {0, 0, Scale(sp.w), Scale(sp.h)};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);

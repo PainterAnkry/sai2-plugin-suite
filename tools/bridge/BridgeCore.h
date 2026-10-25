@@ -58,6 +58,15 @@ public:
     static constexpr int kLiquifyPreviewPixels = 4 * 1024 * 1024; // 液化预览预算
     static constexpr int kThumbSourceDim = 192;      // 滤镜缩略图源图最长边
 
+    // 撤销栈：按**字节**而不是张数限制。
+    // 每张快照是全画布尺寸的 RGBA8 —— 5000x5000 约 100MB，8000x8000 约 256MB。
+    // 以前固定留 20 张，大画布上连点几次"应用"就是 2~5GB，撞 OOM 时表现为
+    // 莫名卡死/闪退，很难归因。现在总预算 512MB，且至少留 kHistoryMinDepth 张，
+    // 小图仍能留满 kHistoryMaxDepth 张（行为与旧版一致）。
+    static constexpr size_t kHistoryBudgetBytes = 512ull * 1024 * 1024;
+    static constexpr size_t kHistoryMaxDepth = 20;
+    static constexpr size_t kHistoryMinDepth = 3;
+
     BridgeCore(std::string pluginsDir, std::string logDir);
     ~BridgeCore();
 
@@ -82,8 +91,20 @@ public:
     // winIdx 缺省 = 主面板。
     std::vector<float> ParamValues(int winIdx = kWinMain) const;
     void SetParamValue(size_t index, float value, int winIdx = kWinMain);
-    // 参数变更后刷新该窗口预览（不触发全分辨率渲染）
-    void ParamChanged(int winIdx);
+    // 参数变更后刷新该窗口预览（不触发全分辨率渲染）。
+    // quick = 拖动中的显示帧：用 1/2 分辨率渲染再拉回原尺寸，像素质感略软，
+    // 松手时必须再调一次 quick=false 补全分辨率。
+    void ParamChanged(int winIdx, bool quick = false);
+
+    // 字符串参数（曲线控制点这类没法塞进 float 滑杆的数据）。
+    // 每次跑插件都会随 fixed 参数一起下发，值由界面维护。
+    void SetExtraParam(const std::string& key, const std::string& value) {
+        extraParams_[key] = value;
+    }
+    std::string ExtraParam(const std::string& key) const {
+        auto it = extraParams_.find(key);
+        return it == extraParams_.end() ? std::string() : it->second;
+    }
 
     // ---- 图像与状态 -----------------------------------------------------
     bool HasImage() const { return original_.IsValid(); }
@@ -128,9 +149,11 @@ public:
     // 按给定倍率跑一遍当前效果（scale >= 1 = 全分辨率）。
     // explicitBase 非空时用它当基准（提交路径必须显式传基准，避免用到
     // 某个还没建立会话的窗口基准）。
+    // quickDiv > 1：把预览基准再降 quickDiv 倍（只用于拖动中的显示帧，
+    // 结果由调用方拉回原尺寸；像素半径参数会按新的基准倍率缩放）。
     ImageBuffer RenderEffect(int winIdx, float scale, bool recordUndo = false,
                              const ImageBuffer* explicitBase = nullptr,
-                             const char* liqMode = nullptr);
+                             const char* liqMode = nullptr, int quickDiv = 1);
 
     // 全分辨率应用当前效果并写回剪贴板
     struct ApplyResult {
@@ -212,7 +235,22 @@ public:
     // 所以可以每个鼠标采样点都调；要看到画面得另外调 StrokeRender（按显示帧率）。
     // 默认窗口 = 液化窗口；自检/无界面调用可直接省略 winIdx。
     void StrokeBegin(float nx, float ny, int winIdx = kWinLiquify);
-    void StrokeMove(float nx, float ny, int winIdx = kWinLiquify);
+    // 返回 true = 这一步真的落了一笔（调用方据此决定要不要重绘）
+    bool StrokeMove(float nx, float ny, int winIdx = kWinLiquify);
+    // "按住不动"的持续施力：膨胀/收缩/旋转/平滑/重建在**鼠标静止**时也要
+    // 继续叠加（PS 的液化就是这样，按住不放会持续吹胀）。
+    //
+    // 1.29 之前这里靠一个 55ms 的 WM_TIMER 驱动 —— 那是错的：WM_TIMER 是
+    // 队列里没有更优先消息时才由系统合成的低优先级消息，而按住鼠标期间
+    // 鼠标移动消息是持续灌进来的（即使手不动，系统也会因光标抖动/重定位
+    // 不断产生 WM_MOUSEMOVE）。实测按住 1.4 秒：WM_MOUSEMOVE 86 次，
+    // WM_TIMER **0 次** —— 所以"必须移动鼠标才会膨胀"不是偶发，是必然。
+    // 现在改成**事件驱动 + 时间节流**：鼠标移动、定时器两条路都可以调，
+    // 由距上次落笔的时间（kHoldIntervalMs）决定这一帧要不要施力，
+    // 与事件频率完全解耦。方向恒为 0（这些工具只用笔刷中心）。
+    // 向前变形不适用（它靠位移方向施力），调用即为空操作。
+    // 返回 true = 这一帧真的施力了。
+    bool StrokeHold(int winIdx = kWinLiquify);
     // 只渲染当前置换场（不再应用新的一笔）→ 生成这一显示帧的画面
     void StrokeRender(int winIdx = kWinLiquify);
     void StrokeEnd(int winIdx = kWinLiquify);
@@ -297,6 +335,7 @@ private:
     // 到"该窗口选中的效果"（见 EnsureParamsForWindow）。
     mutable std::vector<float> paramValues_;
     mutable std::map<std::string, std::vector<float>> effectParams_;
+    std::map<std::string, std::string> extraParams_; // 字符串参数（曲线等）
 
     ImageBuffer original_;
     ImageBuffer applied_;
@@ -321,6 +360,14 @@ private:
     float strokeDX_ = 0.0f, strokeDY_ = 0.0f;
     float pendingDirX_ = 0.0f, pendingDirY_ = 0.0f;
     bool pendingZeroDir_ = true;
+    // "按住不动"时每次叠加的力度折扣（见 StrokeHold）。插件里一次 bloat 就是
+    // strength*0.25 的位移量 —— 那是按"鼠标每个采样点一笔"标定的，静止按住
+    // 若原样叠加，1 秒 20 次就会直接炸开。折扣后约 0.3/秒，接近 PS 的手感。
+    float holdFactor_ = 1.0f;
+    // 上一次真正落笔的时刻（毫秒，steady_clock）。StrokeHold 用它做时间节流：
+    // 鼠标移动 125Hz+ 和定时器补点都会调进来，只有"距上次落笔 >= 间隔"才施力，
+    // 否则同一次按住会被两条路径重复叠加（膨胀会瞬间炸开）。
+    long long lastDabMs_ = 0;
     // 笔级撤销：下一帧液化渲染时告知插件「本笔开始（先快照）/ 回退一笔」
     bool strokeBeginPending_ = false;
     bool liquifyUndoPending_ = false;

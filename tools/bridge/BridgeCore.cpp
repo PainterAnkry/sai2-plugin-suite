@@ -19,7 +19,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
@@ -30,6 +32,10 @@
 namespace sai2 {
 namespace bridge {
 
+// 双线性放大（定义在 Downscale 旁边；ParamChanged 的拖动帧要用到，
+// 所以这里先声明一下）
+ImageBuffer UpsampleLinear(const ImageBuffer& src, int dw, int dh);
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -37,6 +43,22 @@ using Clock = std::chrono::steady_clock;
 double MsSince(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
+
+// 单调毫秒（绝对值无所谓，只用来算间隔）
+long long NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               Clock::now().time_since_epoch())
+        .count();
+}
+
+// "按住不动持续施力"的两个手感常数。
+//   间隔 40ms ≈ 25 次/秒：比显示帧略慢，肉眼是连续的，又不会把渲染队列灌满。
+//   力度 0.06：插件里一次 bloat 的位移量是 strength*0.25，所以每秒累计
+//     25 × 0.25 × 0.06 ≈ 0.375 —— 按住 1 秒能看到明显的吹胀，但不会瞬间炸开；
+//     这个量级和 PS 的「按住不放」接近。
+//   （1.28 用的是 55ms + 0.08，但那条路根本没被触发过，见 BridgeCore.h 注释。）
+const int kHoldIntervalMs = 40;
+const float kHoldFactor = 0.06f;
 
 // 按最长边缩放
 int FitLongest(int w, int h, int longest) {
@@ -214,15 +236,42 @@ void BridgeCore::EnsureParamsForWindow(int winIdx) const {
     current_ = eidx;
 }
 
-void BridgeCore::ParamChanged(int winIdx) {
+void BridgeCore::ParamChanged(int winIdx, bool quick) {
     const int w = Norm(winIdx);
     UiPreview* wp = Win(w);
     if (w != kWinMain && !wp->open) return;
     // 滑块类参数不改变液化置换场，因此这里重跑一次渲染即可（不重放笔画）
-    wp->display = RenderEffect(w, wp->scale, false);
+    const auto t0 = Clock::now();
+    bool done = false;
+    if (quick && wp->src.IsValid()) {
+        // 拖动中的显示帧：半分辨率跑一遍，再双线性拉回原尺寸。
+        // 实测滤镜库 900px 从 57ms 降到 ~15ms 渲染 + ~5ms 拉回；
+        // 松手（WM_LBUTTONUP）会用 quick=false 再跑一帧真正的结果。
+        ImageBuffer small =
+            RenderEffect(w, wp->scale, false, nullptr, nullptr, 2);
+        if (small.IsValid()) {
+            if (small.Width() != wp->src.Width() ||
+                small.Height() != wp->src.Height()) {
+                wp->display =
+                    UpsampleLinear(small, wp->src.Width(), wp->src.Height());
+            } else {
+                wp->display = std::move(small);
+            }
+            done = wp->display.IsValid();
+        }
+    }
+    if (!done) wp->display = RenderEffect(w, wp->scale, false);
+    wp->ms = MsSince(t0);
     wp->commitScale = wp->scale;
     wp->showApplied = false;
     lastPreviewMs_ = wp->ms;
+    // 性能取证开关：设了 SAI2_BRIDGE_PROFILE，每次预览都往 logs/bridge.log
+    // 记一行（quick = 拖动中的半分辨率帧，full = 松手/离散操作的全帧）。
+    // 界面上的"预览 N ms"会被窄窗口省略号吃掉，跑回归时读日志更可靠。
+    if (std::getenv("SAI2_BRIDGE_PROFILE")) {
+        Log(std::string("preview w") + std::to_string(w) +
+            (quick ? " quick " : " full ") + std::to_string(wp->ms) + " ms");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +473,85 @@ void BridgeCore::RebuildPreviewSource(int winIdx) {
     }
 }
 
+// 双线性放大（拖动期"低分辨率预览"回贴用）。
+// 为什么必须拉回原尺寸：画布的适配倍率、缩放读数、平移边界全都是从
+// **显示图尺寸**算出来的（CanvasViewOf）。如果直接拿半尺寸的预览去画，
+// 适配显示会变成 200%（读数错），手动缩放过还会画成一半大小。
+// 拉回原尺寸后，几何与读数完全不变，只有画面在拖动过程中略软一点，
+// 松手立刻补一帧全分辨率（见 ParamChanged 的 quick 参数）。
+ImageBuffer UpsampleLinear(const ImageBuffer& src, int dw, int dh) {
+    if (!src.IsValid() || dw <= 0 || dh <= 0) return ImageBuffer();
+    const int sw = src.Width(), sh = src.Height();
+    if (sw <= 0 || sh <= 0) return ImageBuffer();
+    if (sw == dw && sh == dh) return src.Clone();
+
+    ImageBuffer out;
+    out.Create(dw, dh, src.Format());
+    const uint32_t bpc = src.BytesPerChannel();
+    const uint8_t* s = src.Data();
+    uint8_t* d = out.Data();
+    const size_t ss = src.Stride(), ds = out.Stride();
+
+    // 预计算每一列的源下标与权重（0..256），行同理
+    std::vector<int> x0(static_cast<size_t>(dw)), x1(static_cast<size_t>(dw));
+    std::vector<int> wx(static_cast<size_t>(dw));
+    for (int x = 0; x < dw; ++x) {
+        const double fx = (x + 0.5) * sw / dw - 0.5;
+        int i0 = static_cast<int>(std::floor(fx));
+        double t = fx - i0;
+        if (i0 < 0) { i0 = 0; t = 0.0; }
+        if (i0 >= sw - 1) { i0 = std::max(0, sw - 1); t = 0.0; }
+        x0[static_cast<size_t>(x)] = i0;
+        x1[static_cast<size_t>(x)] = std::min(sw - 1, i0 + 1);
+        wx[static_cast<size_t>(x)] = static_cast<int>(t * 256.0 + 0.5);
+    }
+
+    const auto rd = [bpc](const uint8_t* p) -> int {
+        // 16 位通道按小端取（与 ImageBuffer 的存储一致）
+        return bpc == 2 ? static_cast<int>(p[0] | (p[1] << 8))
+                        : static_cast<int>(p[0]);
+    };
+    const auto wr = [bpc](uint8_t* p, int v) {
+        if (bpc == 2) {
+            p[0] = static_cast<uint8_t>(v & 0xff);
+            p[1] = static_cast<uint8_t>((v >> 8) & 0xff);
+        } else {
+            p[0] = static_cast<uint8_t>(v);
+        }
+    };
+    const size_t px = static_cast<size_t>(4) * bpc;
+
+    for (int y = 0; y < dh; ++y) {
+        const double fy = (y + 0.5) * sh / dh - 0.5;
+        int j0 = static_cast<int>(std::floor(fy));
+        double ty = fy - j0;
+        if (j0 < 0) { j0 = 0; ty = 0.0; }
+        if (j0 >= sh - 1) { j0 = std::max(0, sh - 1); ty = 0.0; }
+        const int j1 = std::min(sh - 1, j0 + 1);
+        const int wy = static_cast<int>(ty * 256.0 + 0.5);
+        const uint8_t* r0 = s + static_cast<size_t>(j0) * ss;
+        const uint8_t* r1 = s + static_cast<size_t>(j1) * ss;
+        uint8_t* dr = d + static_cast<size_t>(y) * ds;
+        for (int x = 0; x < dw; ++x) {
+            const int wxx = wx[static_cast<size_t>(x)];
+            const uint8_t* pl0 = r0 + static_cast<size_t>(x0[static_cast<size_t>(x)]) * px;
+            const uint8_t* pr0 = r0 + static_cast<size_t>(x1[static_cast<size_t>(x)]) * px;
+            const uint8_t* pl1 = r1 + static_cast<size_t>(x0[static_cast<size_t>(x)]) * px;
+            const uint8_t* pr1 = r1 + static_cast<size_t>(x1[static_cast<size_t>(x)]) * px;
+            uint8_t* dp = dr + static_cast<size_t>(x) * px;
+            for (int c = 0; c < 4; ++c) {
+                const size_t co = static_cast<size_t>(c) * bpc;
+                const int a = rd(pl0 + co), b = rd(pr0 + co);
+                const int cc = rd(pl1 + co), dd = rd(pr1 + co);
+                const int t = (a * (256 - wxx) + b * wxx + 128) >> 8;
+                const int u = (cc * (256 - wxx) + dd * wxx + 128) >> 8;
+                wr(dp + co, (t * (256 - wy) + u * wy + 128) >> 8);
+            }
+        }
+    }
+    return out;
+}
+
 // 最近邻 + 邻域平均的简单降采样（预览足够，且不引入额外依赖）
 ImageBuffer BridgeCore::Downscale(const ImageBuffer& src, int maxDim) {
     if (!src.IsValid()) return ImageBuffer();
@@ -495,11 +623,18 @@ ImageBuffer BridgeCore::PreviewBase(int winIdx) {
 
 ImageBuffer BridgeCore::RenderEffect(int winIdx, float scale, bool recordUndo,
                                      const ImageBuffer* explicitBase,
-                                     const char* liqMode) {
+                                     const char* liqMode, int quickDiv) {
     const int wi = Norm(winIdx);
     UiPreview* w = Win(wi);
     const bool isTool = (wi != kWinMain);
-    const int eidx = (isTool && w->effectIndex >= 0) ? w->effectIndex : current_;
+    // 以谁为准：
+    //   * 窗口开着 → 以窗口选中的效果为准（用户看到的那个）；
+    //   * 窗口没开 → 必须用引擎的 current_。窗口没开时 w->effectIndex 还停在
+    //     窗口上次的取值（或组内第一个），照它渲染就是"点了方框模糊却出了
+    //     高斯模糊"——自检里 8 种模糊输出逐字节相同、47 个滤镜库滤镜一模一样，
+    //     根因就在这（e.fixed 里的 blur.kind / filter.id 一直是错的）。
+    const int eidx = (isTool && w->open && w->effectIndex >= 0) ? w->effectIndex
+                                                               : current_;
     if (!manager_ || !host_ || eidx < 0 ||
         eidx >= static_cast<int>(effects_.size()))
         return ImageBuffer();
@@ -523,7 +658,15 @@ ImageBuffer BridgeCore::RenderEffect(int winIdx, float scale, bool recordUndo,
     } else if (fullRes) {
         base = PreviewBase(wi);
     } else if (w->src.IsValid()) {
-        base = w->src.Clone();
+        // quickDiv > 1：拖动中的显示帧再降一档分辨率（像素量按平方下降）。
+        // 这里必须走 w->src 的副本而不能动 w->src 本身，否则松手后
+        // 全分辨率那一帧也会跟着变糊。
+        if (quickDiv > 1) {
+            const int longest = std::max(w->src.Width(), w->src.Height());
+            base = Downscale(w->src, std::max(1, longest / quickDiv));
+        } else {
+            base = w->src.Clone();
+        }
     } else {
         base = Downscale(PreviewBase(wi), kMainPreviewMaxDim);
     }
@@ -537,6 +680,7 @@ ImageBuffer BridgeCore::RenderEffect(int winIdx, float scale, bool recordUndo,
 
     host_->ClearParams();
     for (const auto& kv : e.fixed) host_->SetParam(kv.first, kv.second);
+    for (const auto& kv : extraParams_) host_->SetParam(kv.first, kv.second);
     for (size_t i = 0; i < e.params.size() && i < paramValues_.size(); ++i) {
         const UiParam& p = e.params[i];
         float v = paramValues_[i];
@@ -611,7 +755,30 @@ void BridgeCore::UpdatePreview(int winIdx, const char* liqMode) {
 
 void BridgeCore::PushAppliedHistory() {
     history_.push_back(applied_.IsValid() ? applied_.Clone() : ImageBuffer());
-    if (history_.size() > 20) history_.erase(history_.begin());
+    // 按字节预算淘汰（见 kHistoryBudgetBytes 的注释）。以前只按张数（20）限制，
+    // 大画布上 20 张全尺寸快照能吃到 GB 级内存。
+    const auto bytesOf = [](const ImageBuffer& img) -> size_t {
+        return img.IsValid() ? img.Stride() * static_cast<size_t>(img.Height())
+                             : 0;
+    };
+    size_t total = 0;
+    for (const auto& h : history_) total += bytesOf(h);
+    size_t dropped = 0;
+    while (history_.size() > kHistoryMinDepth && total > kHistoryBudgetBytes) {
+        total -= bytesOf(history_.front());
+        history_.erase(history_.begin());
+        ++dropped;
+    }
+    while (history_.size() > kHistoryMaxDepth) {
+        total -= bytesOf(history_.front());
+        history_.erase(history_.begin());
+        ++dropped;
+    }
+    if (dropped) {
+        Log("history trimmed: kept " + std::to_string(history_.size()) +
+            " / " + std::to_string(total / (1024 * 1024)) + " MB, dropped " +
+            std::to_string(dropped));
+    }
 }
 
 void BridgeCore::SetCanvasContext(bool has, int canvasW, int canvasH,
@@ -783,6 +950,7 @@ ImageBuffer BridgeCore::RenderLiquifyLayerToCanvas(
 
     host_->ClearParams();
     for (const auto& kv : e.fixed) host_->SetParam(kv.first, kv.second);
+    for (const auto& kv : extraParams_) host_->SetParam(kv.first, kv.second);
     host_->SetParam("liquify.session", sessionIds_[kWinLiquify]);
     host_->SetParam("liquify.source", sourceId);
     host_->SetParam("liquify.shiftX", shiftX);
@@ -985,14 +1153,17 @@ void BridgeCore::StrokeBegin(float nx, float ny, int winIdx) {
     pendingZeroDir_ = true;
     // 通知插件在应用本笔前快照置换场（供 Ctrl+Z 撤销上一笔）
     strokeBeginPending_ = true;
-    // 单击也算一笔（膨胀/收缩/旋转不需要拖动方向）：渲染首帧
+    // 单击也算一笔（膨胀/收缩/旋转不需要拖动方向）：渲染首帧。
+    // 首帧这一笔是全强度的（和 PS 按下即有一笔一致），记下时刻，
+    // 让紧随其后的 StrokeHold 从"下一次间隔"开始计。
     UpdatePreview(w);
+    lastDabMs_ = NowMs();
 }
 
-void BridgeCore::StrokeMove(float nx, float ny, int winIdx) {
-    if (!strokeActive_ || !HasImage()) return;
+bool BridgeCore::StrokeMove(float nx, float ny, int winIdx) {
+    if (!strokeActive_ || !HasImage()) return false;
     const int w = Norm(winIdx);
-    if (w != strokeWin_) return;
+    if (w != strokeWin_) return false;
 
     const float px = strokeX_, py = strokeY_;
     strokeX_ = std::min(1.0f, std::max(0.0f, nx));
@@ -1003,18 +1174,19 @@ void BridgeCore::StrokeMove(float nx, float ny, int winIdx) {
 
     const float len = std::sqrt(strokeDX_ * strokeDX_ + strokeDY_ * strokeDY_);
     const int eidx = Win(w)->effectIndex >= 0 ? Win(w)->effectIndex : current_;
-    if (eidx < 0 || eidx >= static_cast<int>(effects_.size())) return;
+    if (eidx < 0 || eidx >= static_cast<int>(effects_.size())) return false;
     const EffectDef& e = effects_[static_cast<size_t>(eidx)];
     const float radius = paramValues_.empty() ? 0.15f : paramValues_[0];
     const float minLen = std::max(
         1.0f, radius * std::min(original_.Width(), original_.Height()) * 0.02f);
     const std::string tool =
         e.fixed.empty() ? std::string("forward-warp") : e.fixed[0].second;
-    const bool forwardWarp = (tool == "forward-warp");
-    if (forwardWarp && len < minLen) return;
-    if (!forwardWarp && len < 0.5f) return; // 单击类工具：一次按下只算一笔
+    // 需要"拖动方向"的工具：向前变形 / 左推（左推用方向的垂线）
+    const bool dirTool = (tool == "forward-warp" || tool == "push");
+    if (dirTool && len < minLen) return false;
+    if (!dirTool && len < 0.5f) return false; // 单击类工具：位移交给 StrokeHold
 
-    if (forwardWarp) {
+    if (dirTool) {
         pendingDirX_ = strokeDX_;
         pendingDirY_ = strokeDY_;
         pendingZeroDir_ = false;
@@ -1030,11 +1202,47 @@ void BridgeCore::StrokeMove(float nx, float ny, int winIdx) {
     // 125Hz 灌进来，输入队列越积越多；WM_PAINT 又是低优先级消息被饿死，
     // 于是拖动期间画布根本不刷新（用户报的"画的时候没变化"）。
     StrokeAccumulate(w);
+    lastDabMs_ = NowMs();
     Win(w)->showApplied = false;
+    return true;
 }
 
-void BridgeCore::StrokeAccumulate(int winIdx) {
+bool BridgeCore::StrokeHold(int winIdx) {
+    if (!strokeActive_ || !HasImage()) return false;
     const int w = Norm(winIdx);
+    if (w != strokeWin_) return false;
+
+    // 时间节流：鼠标移动（125Hz+）和定时器补点都会调到这里，
+    // 只有"距上次真正落笔 >= kHoldIntervalMs"才施力 —— 否则两条路径
+    // 叠加会把膨胀瞬间吹炸；同时也保证施力速率与事件频率无关。
+    const long long now = NowMs();
+    if (now - lastDabMs_ < kHoldIntervalMs) return false;
+
+    const int eidx =
+        (w != kWinMain && Win(w)->effectIndex >= 0) ? Win(w)->effectIndex
+                                                    : current_;
+    if (eidx < 0 || eidx >= static_cast<int>(effects_.size())) return false;
+    const EffectDef& e = effects_[static_cast<size_t>(eidx)];
+    if (e.group != kGroupLiquify) return false;
+    const std::string tool =
+        e.fixed.empty() ? std::string("forward-warp") : e.fixed[0].second;
+    // 向前变形 / 左推只认位移方向：静止按住不该有任何变化（PS 同样如此）。
+    if (tool == "forward-warp" || tool == "push") return false;
+
+    // 笔刷中心不变、方向为 0 —— 正是 StrokeMove 里"步进过小直接 return"
+    // 的那条路，所以这里不能复用 StrokeMove，必须直接累积。
+    pendingDirX_ = 0.0f;
+    pendingDirY_ = 0.0f;
+    pendingZeroDir_ = true;
+    holdFactor_ = kHoldFactor;
+    StrokeAccumulate(w);
+    holdFactor_ = 1.0f;
+    lastDabMs_ = now;
+    Win(w)->showApplied = false;
+    return true;
+}
+
+void BridgeCore::StrokeAccumulate(int winIdx) {    const int w = Norm(winIdx);
     if (!started_ || !manager_ || !host_) return;
     UiPreview* wp = Win(w);
     const int eidx = (w != kWinMain && wp->effectIndex >= 0) ? wp->effectIndex
@@ -1046,9 +1254,14 @@ void BridgeCore::StrokeAccumulate(int winIdx) {
 
     host_->ClearParams();
     for (const auto& kv : e.fixed) host_->SetParam(kv.first, kv.second);
+    for (const auto& kv : extraParams_) host_->SetParam(kv.first, kv.second);
     for (size_t i = 0; i < e.params.size() && i < paramValues_.size(); ++i) {
         const UiParam& p = e.params[i];
-        const float v = paramValues_[i];
+        float v = paramValues_[i];
+        // 按住不动的持续施力：只削"每次叠加的力度/角度"，不改用户设定值
+        if (holdFactor_ != 1.0f &&
+            (p.key == "liquify.strength" || p.key == "liquify.angle"))
+            v *= holdFactor_;
         if (p.isInt)
             host_->SetParam(p.key, static_cast<int>(std::lround(v)));
         else
@@ -1152,6 +1365,7 @@ ImageBuffer BridgeCore::RenderEffectOn(int effectIndex, const ImageBuffer& src,
 
     host_->ClearParams();
     for (const auto& kv : e.fixed) host_->SetParam(kv.first, kv.second);
+    for (const auto& kv : extraParams_) host_->SetParam(kv.first, kv.second);
     for (size_t i = 0; i < e.params.size(); ++i) {
         const UiParam& p = e.params[i];
         float v = p.def;

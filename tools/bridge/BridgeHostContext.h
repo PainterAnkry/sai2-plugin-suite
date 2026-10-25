@@ -37,6 +37,14 @@ public:
     void SetParam(const std::string& key, const std::string& value);
     void SetParam(const std::string& key, float value);
     void SetParam(const std::string& key, int value);
+    // 显式给出 const char* 版本：只留上面三个重载时，传字符串字面量会走
+    // `const char* → bool → int` 这条**标准转换**（比转 std::string 的用户
+    // 自定义转换优先），于是 blur.kind / filter.id 这类字符串参数被悄悄写成
+    // 1 —— 插件拿到的 kind 是 "1"，全部退回默认算法。现在固定参数用的是
+    // std::string，但这个坑太容易再踩，直接把重载补齐。
+    void SetParam(const std::string& key, const char* value) {
+        SetParam(key, std::string(value ? value : ""));
+    }
     void ClearParams();
 
     // ---- 状态查询（桥 UI 使用） -----------------------------------------

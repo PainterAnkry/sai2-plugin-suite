@@ -94,14 +94,14 @@ bool TestBlur() {
     {
         ImageBuffer img(32, 32, PixelFormat::RGBA8);
         img.Clear(RGBA{100, 100, 100, 255});
-        RadialBlur(img, 16, 16, 0.5f, 12, nullptr);
+        RadialBlur(img, 16, 16, 0.5f, 0, 12, nullptr);
         RGBA c;
         CHECK(img.GetPixel(8, 8, c) && c.r == 100);
 
         ImageBuffer img2(32, 32, PixelFormat::RGBA8);
         img2.Clear(RGBA{});
         img2.SetPixel(24, 16, RGBA{255, 255, 255, 255}); // 中心右侧 8px
-        RadialBlur(img2, 16, 16, 2.0f, 12, nullptr);     // 加大旋转涂抹角
+        RadialBlur(img2, 16, 16, 2.0f, 0, 12, nullptr);     // 加大旋转涂抹角
         // 旋转涂抹后，原位置变暗，圆弧附近其他位置变亮
         CHECK(img2.GetPixel(24, 16, c) && c.r < 200);
         int bright = 0;

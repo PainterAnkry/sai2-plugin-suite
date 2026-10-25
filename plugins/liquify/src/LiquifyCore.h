@@ -146,6 +146,22 @@ public:
         });
     }
 
+    // 左推（Photoshop 的"左推工具"）：像素沿**垂直于拖动方向**的一侧推走。
+    // 约定与 PS 一致：往上拖 = 内容向左推、往右拖 = 内容向上推。
+    //   dest(p) = src(p + D)  → 要让内容向左移动，就得从右边取样 → D 朝 -x
+    //   拖动方向 (dx,dy) 的垂线取 (-dy, dx)：向上拖 (0,-1) → (1,0) = 向右取样
+    //   → 内容向左走 ✓
+    void PushLeft(float cx, float cy, float radius, float dirX, float dirY,
+                  float strength) {
+        const float len = std::sqrt(dirX * dirX + dirY * dirY);
+        if (len < 1e-4f) return;
+        const float px = -dirY / len;
+        const float py = dirX / len;
+        Stamp(cx, cy, radius, [&](int x, int y, float f) {
+            Add(x, y, px * strength * f, py * strength * f);
+        });
+    }
+
     void Twirl(float cx, float cy, float radius, float angleRad) {
         const float ca0 = std::cos(angleRad), sa0 = std::sin(angleRad);
         Stamp(cx, cy, radius, [&](int x, int y, float f) {

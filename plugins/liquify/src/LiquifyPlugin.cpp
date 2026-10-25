@@ -259,6 +259,12 @@ private:
             field_.Twirl(cx, cy, radius, -angleRad * strength);
         } else if (tool == "smooth") {
             field_.Smooth(2);
+        } else if (tool == "push") {
+            // 左推：沿拖动方向的**垂线**推。位移量刻意比向前变形小一个档
+            // （PS 的推工具是"把颜料抹到一边"，一笔下来是细腻的横向拖影；
+            //  用向前变形那档力度，几十个鼠标事件就会累积出几百像素的位移，
+            //  画面变成一圈圈同心波纹 —— 那不是推，是被拧了）。
+            field_.PushLeft(cx, cy, radius, dirX, dirY, strength * 1.2f);
         } else if (tool == "reconstruct") {
             field_.Reconstruct(cx, cy, radius,
                                std::min(1.0f, std::max(0.0f, strength)));

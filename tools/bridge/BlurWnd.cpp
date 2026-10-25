@@ -41,6 +41,10 @@ void DrawBlur(HDC dc, UiWindow& win, const RECT& client) {
     FillRect(dc, &client, s.bgBrush);
     const ImageBuffer& img = s.core->DisplayImage(BridgeCore::kWinBlur);
     const int ci = WindowEffectIndex(win);
+    if (getenv("SAI2_UI_DEBUG"))
+        s.core->Log("drawblur ci=" + std::to_string(ci) + " win.effectIndex=" +
+                    std::to_string(win.effectIndex) + " core.current=" +
+                    std::to_string(s.core->CurrentEffect()));
     const auto& E = s.core->Effects();
     wchar_t head[200], sub[240];
     GrabSubtitleHead(head, 200, img);

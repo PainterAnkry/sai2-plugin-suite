@@ -132,6 +132,8 @@ enum {
 
 int g_listScroll = 0;
 int g_uiTestSeconds = 0; // --uitest 模式：跳过图层看门狗，保留模拟图层供探针截图
+std::wstring g_uiEffectId; // --ui-effect=<id>：截图前预选的效果
+std::wstring g_themeArg;   // --theme=light|dark|follow：强制主题（不写注册表）
 
 // 图层列表滚动条：把鼠标 y 映射为滚动位置（拖动滑块时用）。返回是否已处理。
 bool ListScrollAt(UiWindow& win, int my) {
@@ -175,7 +177,7 @@ void DrawCheck(HDC dc, UiWindow& win, const RECT& rc, const std::wstring& text,
     RoundBox(dc, boxr, on ? C_ACCENT : (hover ? C_PANEL : C_PANEL2),
              on ? C_ACCENT : (hover ? C_ACCENT : C_LINE), Scale(3));
     if (on) {
-        TextC(dc, L"✓", boxr, RGB(255, 255, 255), s.fSmall,
+        TextC(dc, L"✓", boxr, C_ON_ACCENT, s.fSmall,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     RECT tr = {boxr.right + Scale(6), rc.top, rc.right, rc.bottom};
@@ -240,7 +242,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
                    Scale(32)};
         const bool hover = UiHover(win, tb);
         RoundBox(dc, tb, hover ? C_PANEL : C_PANEL2, hover ? C_ACCENT : C_LINE,
-                 Scale(6));
+                 RadiusSm());
         wchar_t buf[40];
         swprintf(buf, 40, L"主题：%s", ThemeLabel());
         TextC(dc, buf, tb, C_TEXT, s.fSmall,
@@ -314,8 +316,8 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
                            box.bottom - Scale(8)};
                 const bool hot = UiHover(win, br);
                 RoundBox(dc, br, hot ? C_ACCENT2 : C_PANEL,
-                         hot ? C_ACCENT : C_ACCENT, Scale(6));
-                TextC(dc, L"管理员重启", br, RGB(255, 255, 255), s.fBody,
+                         hot ? C_ACCENT : C_ACCENT, RadiusSm());
+                TextC(dc, L"管理员重启", br, C_ON_ACCENT, s.fBody,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 UiHit hb;
                 hb.rc = br;
@@ -361,7 +363,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
                         line += L"   (" + s.layerAttrs[i] + L")";
                     RECT tr = rr;
                     tr.left += Scale(10);
-                    TextC(dc, line, tr, sel ? RGB(255, 255, 255) : C_TEXT,
+                    TextC(dc, line, tr, sel ? C_ON_ACCENT : C_TEXT,
                           s.fSmall,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                     UiHit h;
@@ -376,7 +378,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
             DeleteObject(clip);
             if (maxScroll > 0) {
                 // 滚动条：轨道 + 圆角滑块（悬停/拖动时高亮），点轨道即跳转、拖动滚动
-                RoundBox(dc, barTrack, C_PANEL2, C_LINE, Scale(4));
+                RoundBox(dc, barTrack, C_PANEL2, C_LINE, RadiusSm());
                 const int trackH = RectH(barTrack);
                 const int thumbH =
                     std::max(Scale(18), std::min(trackH,
@@ -415,7 +417,7 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
                        strip.left + i * (bw + gap) + bw, strip.bottom};
             FillRectC(dc, br, primary[i] ? C_ACCENT2 : C_PANEL);
             FrameRectC(dc, br, primary[i] ? C_ACCENT : C_LINE);
-            TextC(dc, labels[i], br, primary[i] ? RGB(255, 255, 255) : C_TEXT,
+            TextC(dc, labels[i], br, C_TEXT,
                   s.fBody, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             UiHit h;
             h.rc = br;
@@ -473,9 +475,14 @@ void DrawMain(HDC dc, UiWindow& win, const RECT& client) {
               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         const auto& logs = core.LogLines();
-        const size_t maxLines = std::max<size_t>(
-            4, static_cast<size_t>(std::max(1, (RectH(box) - Scale(24)) / Scale(14))));
-        const size_t start = logs.size() > maxLines ? logs.size() - maxLines : 0;
+        // 日志最多占状态区的 6 行：以前是把整个框填满（窗口高一点就十几行），
+        // 视觉上像一块压在按钮区上的调试浮层，正常用户也看不懂这些行。
+        // 排障时用 SAI2_UI_LOG=1 解除限制，看全量。
+        const size_t room = static_cast<size_t>(
+            std::max(1, (RectH(box) - Scale(24)) / Scale(14)));
+        const size_t cap = std::getenv("SAI2_UI_LOG") ? room
+                                                      : std::min<size_t>(room, 6);
+        const size_t start = logs.size() > cap ? logs.size() - cap : 0;
         int y = box.top + Scale(22);
         const int lh = Scale(14);
         for (size_t i = start; i < logs.size(); ++i) {
@@ -768,6 +775,9 @@ struct CaptureJob {
     std::vector<int> selRows;
     int panelLeft = 0;
     int rowScreenY = 0;
+    // 该行图层名文字的屏幕 X（0 = 没有坐标，退回按面板左边距估算）
+    int rowScreenX = 0;
+    int panelRight = 0;
     DWORD clipSeq = 0;
     ULONGLONG t0 = 0;
     std::wstring message;
@@ -834,6 +844,23 @@ POINT AgentToScreen(double x, double y) {
     const double sy = std::min(4.0, std::max(0.5, st.agentScaleY));
     POINT p{static_cast<LONG>(x * sx + 0.5), static_cast<LONG>(y * sy + 0.5)};
     return p;
+}
+
+// 图层行的安全点击点（物理屏幕坐标）。
+//
+// 以前三处（同步选中 / 抓取前选行 / 一起液化换层）都写死 (panelLeft + 34,
+// screenY + 6)。SAI2 图层面板每行最左边是**显示/隐藏的眼睛图标**，再往右
+// 才是缩略图和图层名 —— 写死偏移一旦落进眼睛图标的可点区，点一下就
+// 把图层藏了（用户反馈"选中图层容易自动点到 SAI2 图层的隐藏按钮"）。
+// 面板宽度、DPI 缩放、行内缩进任何一项变化都会让固定偏移踩过去。
+//
+// 现在以 agent 报的**图层名文字起点** textX 为基准（名字列必然在眼睛右侧），
+// 并夹在面板右边界内；拿不到文字坐标时退回按面板宽度取中部。
+POINT LayerRowClickPoint(long long panelLeft, long long panelRight, int textX,
+                         int screenY) {
+    // X 的算法在 ui::LayerRowClickX（自检里有回归断言，见 SelfTest 第 7 节）
+    return AgentToScreen(LayerRowClickX(panelLeft, panelRight, textX),
+                         screenY + 6);
 }
 
 // SAI2 逻辑像素 → 物理像素的缩放（用于菜单栏偏移这类"从窗口边框量出来"
@@ -3679,7 +3706,8 @@ void RunCaptureJob() {
     if (j.row >= 0 && j.panelLeft > 0 && j.rowScreenY > 0) {
         ForceForeground(sai);
         Sleep(140);
-        const POINT p = AgentToScreen(j.panelLeft + 34, j.rowScreenY + 6);
+        const POINT p = LayerRowClickPoint(j.panelLeft, j.panelRight,
+                                           j.rowScreenX, j.rowScreenY);
         ClickAtScreenImpl(p.x, p.y);
         Sleep(260);
     } else {
@@ -4053,6 +4081,11 @@ void RequestToolWindow(HWND hwnd, int winIdx, bool needImage) {
             (s.selLayer >= 0 && s.selLayer < static_cast<int>(s.layerScreenY.size()))
                 ? s.layerScreenY[static_cast<size_t>(s.selLayer)]
                 : 0;
+        g_cap.rowScreenX =
+            (s.selLayer >= 0 && s.selLayer < static_cast<int>(s.layerScreenX.size()))
+                ? s.layerScreenX[static_cast<size_t>(s.selLayer)]
+                : 0;
+        g_cap.panelRight = static_cast<int>(s.panelRight);
         g_cap.wantWindow = idx;
         g_cap.busy = true;
         g_cap.hasJob = true;
@@ -4122,7 +4155,9 @@ void DoGrabWholeLayer(HWND hwnd) {
     if (s.agentOnline && !g_cap.busy.load()) {
         g_cap.row = -1;        // 不点图层行：直接抓当前激活图层整层
         g_cap.panelLeft = 0;
+        g_cap.panelRight = 0;
         g_cap.rowScreenY = 0;
+        g_cap.rowScreenX = 0;
         g_cap.wantWindow = -1; // 不自动打开功能窗口
         g_cap.busy = true;
         g_cap.hasJob = true;
@@ -4298,7 +4333,9 @@ void RefreshLayers(DWORD budgetMs) {
     }
             s.layerAttrs = agg.attrs;
             s.layerScreenY = agg.screenY;
+            s.layerScreenX = agg.screenX;
             s.panelLeft = grp->screenRect.left;
+            s.panelRight = grp->screenRect.right;
             UpdateAgentScale(*grp);
         }    } else {
         if (s.agentOnline) s.core->Log("注入代理失联（SAI2 可能已退出）");
@@ -4392,8 +4429,12 @@ void SyncSelectionToSai2() {
     for (size_t i = 0; i < s.selLayers.size(); ++i) {
         const int row = s.selLayers[i];
         if (row < 0 || row >= static_cast<int>(s.layerScreenY.size())) continue;
-        const POINT p = AgentToScreen(
-            s.panelLeft + 34, s.layerScreenY[static_cast<size_t>(row)] + 6);
+        const POINT p = LayerRowClickPoint(
+            s.panelLeft, s.panelRight,
+            (row < static_cast<int>(s.layerScreenX.size()))
+                ? s.layerScreenX[static_cast<size_t>(row)]
+                : 0,
+            s.layerScreenY[static_cast<size_t>(row)]);
         if (first) {
             ClickAtScreen(p.x, p.y);
             first = false;
@@ -4435,9 +4476,14 @@ void GrabSelectedLayer(HWND hwnd, int rowIdx, int wantWindow) {
         g_cap.selRows.push_back(v);
     }
     g_cap.panelLeft = static_cast<int>(s.panelLeft);
+    g_cap.panelRight = static_cast<int>(s.panelRight);
     g_cap.rowScreenY =
         (rowIdx >= 0 && rowIdx < static_cast<int>(s.layerScreenY.size()))
             ? s.layerScreenY[static_cast<size_t>(rowIdx)]
+            : 0;
+    g_cap.rowScreenX =
+        (rowIdx >= 0 && rowIdx < static_cast<int>(s.layerScreenX.size()))
+            ? s.layerScreenX[static_cast<size_t>(rowIdx)]
             : 0;
     g_cap.wantWindow = wantWindow;
     g_cap.busy = true;
@@ -4765,9 +4811,12 @@ void RunMultiLayerApply(HWND hwnd) {
             }
             if (s.panelLeft > 0 &&
                 row < static_cast<int>(s.layerScreenY.size())) {
-                const POINT p = AgentToScreen(
-                    s.panelLeft + 34,
-                    s.layerScreenY[static_cast<size_t>(row)] + 6);
+                const POINT p = LayerRowClickPoint(
+                    s.panelLeft, s.panelRight,
+                    (row < static_cast<int>(s.layerScreenX.size()))
+                        ? s.layerScreenX[static_cast<size_t>(row)]
+                        : 0,
+                    s.layerScreenY[static_cast<size_t>(row)]);
                 ClickAtScreen(p.x, p.y);
                 Sleep(260);
             }
@@ -4959,11 +5008,10 @@ LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLOREDIT: {
         HDC dc = reinterpret_cast<HDC>(wp);
         SetTextColor(dc, C_TEXT);
-        SetBkColor(dc, ThemeIsDark() ? RGB(26, 27, 29) : RGB(255, 255, 255));
-        static HBRUSH editBgDark = CreateSolidBrush(RGB(26, 27, 29));
-        static HBRUSH editBgLight = CreateSolidBrush(RGB(255, 255, 255));
-        return reinterpret_cast<LRESULT>(ThemeIsDark() ? editBgDark
-                                                       : editBgLight);
+        SetBkColor(dc, C_INPUT);
+        AppState& st = S();
+        if (!st.editBrush) st.editBrush = CreateSolidBrush(C_INPUT);
+        return reinterpret_cast<LRESULT>(st.editBrush);
     }
 
     case WM_APP + 2:
@@ -5618,6 +5666,24 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
+    // 界面缩放倍率覆盖（只影响 Scale()，不改系统 DPI）：
+    //   SAI2_UI_SCALE=1.5  或  --ui-scale=1.5
+    // 用途：在 100% 缩放的开发机上检查 125%/150% 下的布局 —— 有没有哪个
+    // 间距/坐标是写死像素、没走 Scale()，放大后就会重叠或裁切。
+    // 必须在建第一个窗口和字体之前设（字体尺寸是建好后缓存的）。
+    {
+        double sc = 0.0;
+        char envbuf[32] = {0};
+        if (GetEnvironmentVariableA("SAI2_UI_SCALE", envbuf, 32) > 0)
+            sc = atof(envbuf);
+        for (int i = 1; i < argc; ++i) {
+            const std::wstring a = argv[i] ? argv[i] : L"";
+            if (a.rfind(L"--ui-scale=", 0) == 0)
+                sc = _wtof(a.c_str() + 11);
+        }
+        if (sc > 0.25 && sc < 4.0) ui::SetUiScale(sc);
+    }
+
     // 正常双击/bat 启动（无 CLI 参数）时脱离宿主控制台窗口：
     // 面板后面挂一个黑色 cmd 既难看，它的 QuickEdit 选择模式还会捕获
     // 鼠标（点住一拖变成选中文字），干扰正常拖拽操作。
@@ -5669,6 +5735,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         };
         if (a == L"--selftest") selfTest = true;
         else if (a == L"--uitest") uiTestSeconds = 6;
+        // --uitest=N：延长界面冒烟时长。自动化脚本要往窗口里发真实鼠标/键盘
+        // 事件（长按施力、Ctrl+Z 之类），6 秒根本不够用。
+        else if (a.rfind(L"--uitest=", 0) == 0) {
+            const int v = _wtoi(a.c_str() + 9);
+            uiTestSeconds = (v > 0 && v <= 600) ? v : 6;
+        }
+        // --ui-effect=<效果 id>：无人值守截图时预选某个效果
+        // （例：--ui-effect=adjust.curves 直接看曲线面板）
+        else if (a.rfind(L"--ui-effect=", 0) == 0) g_uiEffectId = a.substr(12);
+        // --theme=light|dark|follow：验收截图用，强制本次进程的主题
+        else if (a.rfind(L"--theme=", 0) == 0) g_themeArg = a.substr(8);
         else if (a == L"--find-tools") findTools = true;
         else if (a == L"--demo") {
             demoSeconds = 30;
@@ -5922,6 +5999,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         return 1;
     }
     ApplyTheme(); // 主题（跟随系统/浅色/深色）必须在首帧前应用
+    // 记一行缩放信息：以后遇到"字太大/位置歪了"的问询，先确认它按什么
+    // 倍率在排（进程是 System DPI 感知，见 wWinMain 开头的 SetProcessDPIAware）。
+    {
+        char scbuf[64] = {0};
+        const int sdpi = ui::Scale(100);
+        std::snprintf(scbuf, sizeof(scbuf),
+                      "ui scale: Scale(100)=%d px（%d%%）", sdpi, sdpi);
+        s.core->Log(scbuf);
+    }
+    if (!g_themeArg.empty()) {
+        const int m = (g_themeArg == L"light") ? 1
+                      : (g_themeArg == L"dark") ? 2 : 0;
+        ui::ForceTheme(m);
+    }
 
     // 把构建时间戳写进日志：以后再出现"改了却没生效"，先看这一行就能判断
     // 跑的是不是新构建（曾踩过：面板进程启动时间早于修复时间）。
@@ -5986,20 +6077,41 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // UI 冒烟测试：把 4 个功能窗口全部打开（每个都完整绘制一遍布局），
     // 停留 uiTestSeconds 秒后自动退出。用于无人值守地验证窗口创建/绘制。
     else if (uiTestSeconds > 0) {
-        if (!s.core->HasImage()) {
-            // 没有剪贴板图像时造一张测试图，保证画布/笔刷/缩略图代码都跑一遍
-            ImageBuffer probe;
-            probe.Create(640, 480, PixelFormat::RGBA8);
-            for (int y = 0; y < probe.Height(); ++y)
-                for (int x = 0; x < probe.Width(); ++x) {
-                    RGBA c;
-                    c.r = static_cast<uint16_t>(x * 255 / probe.Width());
-                    c.g = static_cast<uint16_t>(y * 255 / probe.Height());
-                    c.b = static_cast<uint16_t>(((x / 16 + y / 16) % 2) ? 200 : 60);
-                    c.a = 255;
-                    probe.SetPixel(x, y, c);
+        {
+            // 没有剪贴板图像时造一张测试图，保证画布/笔刷/缩略图代码都跑一遍。
+            // 尺寸可用 SAI2_UITEST_IMAGE=WxH 覆盖 —— 性能回归必须用"大图"，
+            // 只有超过 kMainPreviewMaxDim(900) 时预览才会走降采样路径，
+            // 640x480 的图跑什么都快，测不出分级预览的差别。
+            int pw = 640, ph = 480;
+            bool forceProbe = false;
+            {
+                char sz[64] = {0};
+                if (GetEnvironmentVariableA("SAI2_UITEST_IMAGE", sz, 64) > 0) {
+                    int w2 = 0, h2 = 0;
+                    if (std::sscanf(sz, "%dx%d", &w2, &h2) == 2 &&
+                        w2 >= 16 && h2 >= 16 && w2 <= 8192 && h2 <= 8192) {
+                        pw = w2;
+                        ph = h2;
+                        // 显式指定尺寸 = 就是要用这张图，不要被剪贴板里的
+                        // 旧图（通常是上一次测试留下的 256x192）顶掉
+                        forceProbe = true;
+                    }
                 }
-            s.core->SetImage(std::move(probe), "uitest");
+            }
+            if (!s.core->HasImage() || forceProbe) {
+                ImageBuffer probe;
+                probe.Create(pw, ph, PixelFormat::RGBA8);
+                for (int y = 0; y < probe.Height(); ++y)
+                    for (int x = 0; x < probe.Width(); ++x) {
+                        RGBA c;
+                        c.r = static_cast<uint16_t>(x * 255 / probe.Width());
+                        c.g = static_cast<uint16_t>(y * 255 / probe.Height());
+                        c.b = static_cast<uint16_t>(((x / 16 + y / 16) % 2) ? 200 : 60);
+                        c.a = 255;
+                        probe.SetPixel(x, y, c);
+                    }
+                s.core->SetImage(std::move(probe), "uitest");
+            }
         }
         // 模拟一堆图层：覆盖图层列表滚动条（轨道+滑块）的绘制路径
         for (int i = 1; i <= 30; ++i)
@@ -6008,6 +6120,34 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         s.layerAttrs.assign(30, L"");
         s.agentOnline = true;
         for (int i = 1; i < BridgeCore::kWinCount; ++i) OpenToolWindow(i);
+        // 预选效果（截图脚本用）。必须在**开窗之后**：每个窗口首次绘制时会
+        // 调 ParamValues(win.id) 把引擎的"当前效果"对齐到自己那把 —— 提前设
+        // 会被随后绘制的其它窗口覆盖（实测设了曲线，截出来还是"反相"）。
+        if (!g_uiEffectId.empty()) {
+            char id[128] = {0};
+            WideCharToMultiByte(CP_UTF8, 0, g_uiEffectId.c_str(), -1, id, 128,
+                                nullptr, nullptr);
+            const int e = s.core->FindEffectById(id);
+            s.core->Log(std::string("uitest: ui-effect '") + id + "' -> " +
+                        (e >= 0 ? std::to_string(e) : "not found"));
+            if (e >= 0) {
+                const std::string grp =
+                    s.core->Effects()[static_cast<size_t>(e)].group;
+                for (int i = 1; i < BridgeCore::kWinCount; ++i) {
+                    if (grp != BridgeCore::kGroupNames[i - 1]) continue;
+                    s.toolWindows[i].effectIndex = e;
+                    s.core->SetCurrentEffect(e, i);
+                    // 必须立刻重画：窗口在 OpenToolWindow 时已经按默认效果画过
+                    // 一帧，只改 effectIndex 不会重绘 —— 截出来的图是新效果、
+                    // 但窗口的命中表还是旧效果的（自动化点击会点到不存在的控件）。
+                    if (s.toolWindows[i].hwnd) {
+                        InvalidateRect(s.toolWindows[i].hwnd, nullptr, FALSE);
+                        UpdateWindow(s.toolWindows[i].hwnd);
+                    }
+                    break;
+                }
+            }
+        }
         s.core->Log("uitest: all tool windows opened");
         // 用后台线程而不是 SetTimer：无人值守时更确定（定时器依赖窗口过程分发）
         std::thread([uiTestSeconds]() {

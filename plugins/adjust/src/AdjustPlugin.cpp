@@ -12,6 +12,8 @@
 //   adjust.inBlack    = 0..254（色阶输入黑场，8bit 口径）
 //   adjust.inWhite    = 1..255（色阶输入白场，8bit 口径）
 //   adjust.gamma      = 0.1..3（色阶中间调 gamma）
+//   adjust.kind = curves 时：
+//     adjust.curve.rgb / .r / .g / .b = "x:y,x:y,…"（0..255 输入:输出）
 // ============================================================================
 
 #include "AdjustKernels.h"
@@ -36,7 +38,7 @@ public:
         info.type = "image-effect";
         info.description =
             "PS-style adjustments: Invert / Grayscale / Brightness-Contrast / "
-            "Hue-Saturation / Levels.";
+            "Hue-Saturation / Levels / Curves.";
         return info;
     }
 
@@ -98,6 +100,23 @@ public:
                        ("levels in=[" + std::to_string(ib) + "," +
                         std::to_string(iw) + "] gamma=" + std::to_string(g))
                            .c_str());
+        } else if (kind == "curves") {
+            // 曲线：四张 LUT（R/G/B 各自 + RGB 合成），缺省即恒等
+            float lutR[256], lutG[256], lutB[256], lutRgb[256];
+            auto build = [&](const char* key, float lut[256]) {
+                const std::string csv = GetParamString(*host_, key, "");
+                const auto pts = adjust::ParseCurve(csv);
+                adjust::BuildCurveLut(pts, lut);
+            };
+            build("adjust.curve.r", lutR);
+            build("adjust.curve.g", lutG);
+            build("adjust.curve.b", lutB);
+            build("adjust.curve.rgb", lutRgb);
+            adjust::ApplyCurves(*canvas, sel, lutR, lutG, lutB, lutRgb,
+                                GetParamFloat(*host_, "adjust.inBlack", 0.0f),
+                                GetParamFloat(*host_, "adjust.inWhite", 255.0f),
+                                GetParamFloat(*host_, "adjust.gamma", 1.0f));
+            host_->Log(LogLevel::Info, "curves applied");
         } else {
             host_->Log(LogLevel::Error,
                        ("未知 adjust.kind: " + kind).c_str());
